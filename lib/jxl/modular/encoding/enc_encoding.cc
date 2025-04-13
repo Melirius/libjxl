@@ -670,14 +670,14 @@ Status ModularEncode(const Image &image, const ModularOptions &options,
     } */
 
     // Write tree
-    JXL_ASSIGN_OR_RETURN(size_t cost,
-                         BuildAndEncodeHistograms(
-                             memory_manager, options.histogram_params,
-                             kNumTreeContexts, tree_tokens, &code, &context_map,
-                             writer, LayerType::ModularTree, aux_out));
+    JXL_ASSIGN_OR_RETURN(
+        size_t cost,
+        BuildAndEncodeHistograms(memory_manager, options.histogram_params,
+                                 kNumTreeContexts, tree_tokens, &code, writer,
+                                 LayerType::ModularTree, aux_out));
     (void)cost;
-    JXL_RETURN_IF_ERROR(WriteTokens(tree_tokens[0], code, context_map, 0,
-                                    writer, LayerType::ModularTree, aux_out));
+    JXL_RETURN_IF_ERROR(WriteTokens(tree_tokens[0], code, 0, writer,
+                                    LayerType::ModularTree, aux_out));
   }
 
   size_t image_width = 0;
@@ -719,17 +719,15 @@ Status ModularEncode(const Image &image, const ModularOptions &options,
   // Write data if not using a global tree/ANS stream.
   if (!header->use_global_tree) {
     EntropyEncodingData code;
-    std::vector<uint8_t> context_map;
     HistogramParams histo_params = options.histogram_params;
     histo_params.image_widths.push_back(image_width);
     JXL_ASSIGN_OR_RETURN(
-        size_t cost,
-        BuildAndEncodeHistograms(memory_manager, histo_params,
-                                 (tree->size() + 1) / 2, tokens_storage, &code,
-                                 &context_map, writer, layer, aux_out));
+        size_t cost, BuildAndEncodeHistograms(
+                         memory_manager, histo_params, (tree->size() + 1) / 2,
+                         tokens_storage, &code, writer, layer, aux_out));
     (void)cost;
-    JXL_RETURN_IF_ERROR(WriteTokens(tokens_storage[0], code, context_map, 0,
-                                    writer, layer, aux_out));
+    JXL_RETURN_IF_ERROR(
+        WriteTokens(tokens_storage[0], code, 0, writer, layer, aux_out));
   } else {
     *width = image_width;
   }

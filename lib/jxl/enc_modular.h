@@ -113,7 +113,6 @@ class ModularFrameEncoder {
   std::vector<GroupHeader> stream_headers_;
   std::vector<std::vector<Token>> tokens_;
   EntropyEncodingData code_;
-  std::vector<uint8_t> context_map_;
   FrameDimensions frame_dim_;
   CompressParams cparams_;
   std::vector<size_t> tree_splits_;

@@ -55,7 +55,6 @@ struct PassesEncoderState {
 
   struct PassData {
     std::vector<std::vector<Token>> ac_tokens;
-    std::vector<uint8_t> context_map;
     EntropyEncodingData codes;
   };
 
