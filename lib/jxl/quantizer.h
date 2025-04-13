@@ -66,8 +66,8 @@ class Quantizer {
   static constexpr int32_t kQuantMax = 256;
 
   static JXL_INLINE int32_t ClampVal(float val) {
-    return static_cast<int32_t>(
-        std::max(1.0f, std::min<float>(val, kQuantMax)));
+    // `val` can be out of int32_t range
+    return static_cast<int32_t>(Clamp1<float>(val, 1, kQuantMax));
   }
 
   float ScaleGlobalScale(const float scale) {

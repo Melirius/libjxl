@@ -271,9 +271,9 @@ Status DecodeClliChunk(Bytes payload, float* max_content_light_level) {
   if (payload.size() != 8) return JXL_FAILURE("Wrong cLLi size");
   const uint8_t* data = payload.data();
   const uint32_t maxcll_png =
-      Clamp1(png_get_uint_32(data), uint32_t{0}, uint32_t{10000 * 10000});
+      Clamp1<uint32_t>(png_get_uint_32(data), 0, 10000 * 10000);
   // Ignore MaxFALL value.
-  *max_content_light_level = static_cast<float>(maxcll_png) / 10000.f;
+  *max_content_light_level = maxcll_png / 10000.f;
   return true;
 }
 

@@ -2130,7 +2130,11 @@ namespace {
 
 void ScoreToRgb(double score, double good_threshold, double bad_threshold,
                 float rgb[3]) {
-  double heatmap[12][3] = {
+  if (!std::isnormal(score)) {  // Handle NaN
+    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+    return;
+  }
+  double const heatmap[12][3] = {
       {0, 0, 0},       {0, 0, 1},
       {0, 1, 1},       {0, 1, 0},  // Good level
       {1, 1, 0},       {1, 0, 0},  // Bad level
@@ -2148,14 +2152,13 @@ void ScoreToRgb(double score, double good_threshold, double bad_threshold,
     score = 0.45 + (score - bad_threshold) / (bad_threshold * 12) * 0.5;
   }
   static const int kTableSize = sizeof(heatmap) / sizeof(heatmap[0]);
-  score = std::min<double>(std::max<double>(score * (kTableSize - 1), 0.0),
-                           kTableSize - 2);
-  int ix = static_cast<int>(score);
-  ix = std::min(std::max(0, ix), kTableSize - 2);  // Handle NaN
-  double mix = score - ix;
+  score = Clamp1<double>(score * (kTableSize - 1), 0, kTableSize - 2);
+  double d_ix;
+  double mix = std::modf(score, &d_ix);
+  int ix = static_cast<int>(d_ix);
   for (int i = 0; i < 3; ++i) {
     double v = mix * heatmap[ix + 1][i] + (1 - mix) * heatmap[ix][i];
-    rgb[i] = pow(v, 0.5);
+    rgb[i] = sqrt(v);
   }
 }
 

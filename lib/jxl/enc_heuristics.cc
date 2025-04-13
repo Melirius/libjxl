@@ -161,10 +161,9 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
   std::vector<uint8_t> remap((qft.size() + 1) * kNumOrders);
   std::iota(remap.begin(), remap.end(), 0);
   std::vector<uint8_t> clusters(remap);
-  size_t nb_clusters =
-      Clamp1(static_cast<int>(tot / size_for_ctx_model / 2), 2, 9);
+  size_t nb_clusters = Clamp1<size_t>(tot / size_for_ctx_model / 2, 2, 9);
   size_t nb_clusters_chroma =
-      Clamp1(static_cast<int>(tot / size_for_ctx_model / 3), 1, 5);
+      Clamp1<size_t>(tot / size_for_ctx_model / 3, 1, 5);
   // This is O(n^2 log n), but n is small.
   while (clusters.size() > nb_clusters) {
     std::sort(clusters.begin(), clusters.end(),
@@ -195,8 +194,8 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
   // for chroma, only use up to nb_clusters_chroma separate block contexts
   // (those for the biggest clusters)
   for (size_t i = remap.size(); i < remap.size() * 3; i++) {
-    ctx_map[i] = num + Clamp1(static_cast<int>(remap[i % remap.size()]), 0,
-                              static_cast<int>(nb_clusters_chroma) - 1);
+    ctx_map[i] =
+        num + Clamp1<int>(remap[i % remap.size()], 0, nb_clusters_chroma - 1);
   }
   block_ctx_map->num_ctxs =
       *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;

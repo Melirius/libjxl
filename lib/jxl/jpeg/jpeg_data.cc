@@ -370,7 +370,7 @@ Status JPEGData::VisitFields(Visitor* visitor) {
     JXL_RETURN_IF_ERROR(visitor->Bits(24, 0, &nbit));
     if (visitor->IsReading()) {
       JXL_RETURN_IF_ERROR(CheckHasEnoughBits(visitor, nbit));
-      padding_bits.reserve(std::min<uint32_t>(1024u, nbit));
+      padding_bits.reserve(std::min<uint32_t>(1024, nbit));
       for (uint32_t i = 0; i < nbit; i++) {
         bool bbit = false;
         JXL_RETURN_IF_ERROR(visitor->Bool(false, &bbit));

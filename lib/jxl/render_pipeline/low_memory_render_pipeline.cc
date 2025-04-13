@@ -434,8 +434,7 @@ Status LowMemoryRenderPipeline::PrepareForThreadsInternal(size_t num,
     size_t middle_padding = group_dim;
     size_t right_padding = full_image_xsize_ - image_rect.x1();
     size_t out_of_frame_xsize =
-        padding +
-        std::max(left_padding, std::max(middle_padding, right_padding));
+        padding + std::max({left_padding, middle_padding, right_padding});
     out_of_frame_data_.resize(num);
     for (size_t t = 0; t < num; t++) {
       JXL_ASSIGN_OR_RETURN(

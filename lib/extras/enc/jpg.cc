@@ -446,7 +446,7 @@ struct MySearchHook : public sjpeg::SearchHook {
     if (pass == 0) {
       q += first_iter_slope *
            (for_size ? 0.1 * std::log(target / value) : (target - value));
-      q = std::max(qmin, std::min(qmax, q));
+      q = Clamp1(q, qmin, qmax);
     } else {
       q = (qmin + qmax) / 2.;
     }

@@ -541,8 +541,7 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
       }
       JXL_RETURN_IF_ERROR(
           ac_strategy.SetNoBoundsCheck(x, y, AcStrategyType(row_in_1[num])));
-      row_qf[ix] = 1 + std::max<int32_t>(0, std::min(Quantizer::kQuantMax - 1,
-                                                     row_in_2[num]));
+      row_qf[ix] = 1 + Clamp1(row_in_2[num], 0, Quantizer::kQuantMax - 1);
       num++;
     }
   }

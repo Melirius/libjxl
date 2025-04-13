@@ -195,9 +195,9 @@ Status DecodeImageEXR(Span<const uint8_t> bytes, const ColorHints& color_hints,
        std::min(input.dataWindow().max.y, input.displayWindow().max.y);
        start_y += y_chunk_size) {
     // Inclusive.
-    const int end_y = std::min(
-        start_y + y_chunk_size - 1,
-        std::min(input.dataWindow().max.y, input.displayWindow().max.y));
+    const int end_y =
+        std::min({start_y + y_chunk_size - 1, input.dataWindow().max.y,
+                  input.displayWindow().max.y});
     input.setFrameBuffer(
         input_rows.data() - input.dataWindow().min.x - start_y * row_size,
         /*xStride=*/1, /*yStride=*/row_size);

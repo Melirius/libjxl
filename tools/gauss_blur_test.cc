@@ -56,8 +56,7 @@ ImageF ConvolveXAndTranspose(const ImageF& in,
     for (; x < static_cast<uint32_t>(r) && x < in.xsize(); ++x) {
       float sum = 0.0f;
       for (int i = -r; i <= r; ++i) {
-        sum += rowp[std::max<int>(
-                   0, std::min<int>(static_cast<int>(x) + i, in.xsize()))] *
+        sum += rowp[Clamp1<int>(static_cast<int>(x) + i, 0, in.xsize())] *
                kernelp[i];
       }
       out.Row(x)[y] = sum;
@@ -72,8 +71,7 @@ ImageF ConvolveXAndTranspose(const ImageF& in,
     for (; x < in.xsize(); ++x) {
       float sum = 0.0f;
       for (int i = -r; i <= r; ++i) {
-        sum += rowp[std::max<int>(
-                   0, std::min<int>(static_cast<int>(x) + i, in.xsize()))] *
+        sum += rowp[Clamp1<int>(static_cast<int>(x) + i, 0, in.xsize())] *
                kernelp[i];
       }
       out.Row(x)[y] = sum;
@@ -173,8 +171,7 @@ ImageF ConvolveAndTransposeF64(const ImageF& in,
     for (size_t x = 0, ox = 0; x < in.xsize(); ++x, ++ox) {
       double sum = 0.0;
       for (int i = -r; i <= r; ++i) {
-        sum += rowp[std::max<int>(
-                   0, std::min<int>(static_cast<int>(x) + i, in.xsize()))] *
+        sum += rowp[Clamp1<int>(static_cast<int>(x) + i, 0, in.xsize())] *
                kernelp[i];
       }
       out.Row(ox)[y] = static_cast<float>(sum);

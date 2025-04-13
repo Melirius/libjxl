@@ -214,10 +214,10 @@ void SplitImageRenderer::updateMinimumSize() {
   const QSizeF leftSize = leftImage_.deviceIndependentSize();
   const QSizeF rightSize = rightImage_.deviceIndependentSize();
   const QSizeF middleSize = middleImage_.deviceIndependentSize();
-  const qreal imagesWidth = std::max(
-      std::max(leftSize.width(), rightSize.width()), middleSize.width());
-  const qreal imagesHeight = std::max(
-      std::max(leftSize.height(), rightSize.height()), middleSize.height());
+  const qreal imagesWidth =
+      std::max({leftSize.width(), rightSize.width(), middleSize.width()});
+  const qreal imagesHeight =
+      std::max({leftSize.height(), rightSize.height(), middleSize.height()});
   setMinimumSize((scale_ * QSizeF(imagesWidth, imagesHeight)).toSize());
 }
 

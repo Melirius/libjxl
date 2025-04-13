@@ -489,7 +489,7 @@ Status QuantizedSpline::Dequantize(const Spline::Point& starting_point,
   // that will need to be rendered.
   const uint64_t max_color = std::max({color[1], color[0], color[2]});
   uint64_t logcolor =
-      std::max(kOne, static_cast<uint64_t>(CeilLog2Nonzero(kOne + max_color)));
+      std::max<uint64_t>(kOne, CeilLog2Nonzero(kOne + max_color));
 
   const float weight_limit =
       std::ceil(std::sqrt((static_cast<float>(area_limit) / logcolor) /
@@ -504,8 +504,7 @@ Status QuantizedSpline::Dequantize(const Spline::Point& starting_point,
     // and understand that this way we underestimate the area by a factor of
     // 1/(0.3333*0.3333). This is taken into account in the limits below.
     float weight_f = std::ceil(inv_quant * std::abs(sigma_dct_[i]));
-    uint64_t weight =
-        static_cast<uint64_t>(std::min(weight_limit, std::max(1.0f, weight_f)));
+    uint64_t weight = Clamp1<uint64_t>(weight_f, 1, weight_limit);
     width_estimate += weight * weight * logcolor;
   }
   *total_estimated_area_reached += (width_estimate * manhattan_distance);

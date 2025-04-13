@@ -116,9 +116,9 @@ class NoiseHistogram {
  private:
   template <typename T>
   T ClampX(const T x) const {
-    return std::min(std::max(static_cast<T>(0), x), static_cast<T>(kBins - 1));
+    return Clamp1<T>(x, 0, kBins - 1);
   }
-  size_t Index(const float x) const { return ClampX(static_cast<int>(x)); }
+  size_t Index(const float x) const { return ClampX(x); }
 
   uint32_t bins[kBins];
 };

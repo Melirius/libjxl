@@ -89,7 +89,7 @@ struct TreeSamples {
   void AllSamplesDone() { dedup_table_ = std::vector<uint32_t>(); }
 
   uint32_t QuantizeProperty(uint32_t prop, pixel_type v) const {
-    v = std::min(std::max(v, -kPropertyRange), kPropertyRange) + kPropertyRange;
+    v = Clamp1(v, -kPropertyRange, kPropertyRange) + kPropertyRange;
     return property_mapping[prop][v];
   }
 

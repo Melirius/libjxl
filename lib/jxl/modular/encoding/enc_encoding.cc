@@ -121,8 +121,8 @@ Status GatherTreeData(const Image &image, pixel_type chan, size_t group_id,
   double pixel_fraction = std::min(1.0f, options.nb_repeats);
   // a fraction of 0 is used to disable learning entirely.
   if (pixel_fraction > 0) {
-    pixel_fraction = std::max(pixel_fraction,
-                              std::min(1.0, 1024.0 / (channel.w * channel.h)));
+    pixel_fraction =
+        Clamp1(1024.0 / (channel.w * channel.h), pixel_fraction, 1.0);
   }
   uint64_t threshold =
       (std::numeric_limits<uint64_t>::max() >> 32) * pixel_fraction;
@@ -390,9 +390,8 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
         int32_t guess = wp_state.Predict</*compute_properties=*/true>(
             x, y, channel.w, top, left, topright, topleft, toptop, &properties,
             offset);
-        uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+        uint32_t pos = kPropRangeFast + Clamp1(properties[0], -kPropRangeFast,
+                                               kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut->context_lookup[pos];
         int32_t residual = r[x] - guess;
         *tokenp++ = Token(ctx_id, PackSigned(residual));
@@ -432,10 +431,9 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
         pixel_type_w topleft = (x && y ? *(r + x - 1 - onerow) : left);
         int32_t guess = ClampedGradient(top, left, topleft);
         uint32_t pos =
-            kPropRangeFast +
-            std::min<pixel_type_w>(
-                std::max<pixel_type_w>(-kPropRangeFast, top + left - topleft),
-                kPropRangeFast - 1);
+            kPropRangeFast + Clamp1<pixel_type_w>(top + left - topleft,
+                                                  -kPropRangeFast,
+                                                  kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut->context_lookup[pos];
         int32_t residual = r[x] - guess;
         *tokenp++ = Token(ctx_id, PackSigned(residual));

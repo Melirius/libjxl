@@ -134,8 +134,7 @@ int main(int argc, const char** argv) {
         fprintf(stderr,
                 "WARNING: found colors outside of the Rec. 2020 gamut.\n");
       }
-      max_value = std::max(
-          max_value, std::max(rows[0][x], std::max(rows[1][x], rows[2][x])));
+      max_value = std::max({max_value, rows[0][x], rows[1][x], rows[2][x]});
       const float luminance = primaries_xyz[0][1] * rows[0][x] +
                               primaries_xyz[1][1] * rows[1][x] +
                               primaries_xyz[2][1] * rows[2][x];

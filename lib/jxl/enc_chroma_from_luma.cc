@@ -163,7 +163,7 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
       float ddf = (dfpeps - dfmeps) / (2 * eps);
       float kExperimentalInsignificantStabilizer = 0.85;
       float step = d_f / (ddf + kExperimentalInsignificantStabilizer);
-      x -= std::min(kClamp, std::max(-kClamp, step));
+      x -= Clamp1(step, -kClamp, kClamp);
       if (std::abs(step) < 3e-3) break;
     }
   }
@@ -181,7 +181,7 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   } else {
     x = 0;
   }
-  return std::max(-128.0f, std::min(127.0f, roundf(x)));
+  return Clamp1(roundf(x), -128.0f, 127.0f);
 }
 
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,

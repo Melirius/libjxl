@@ -302,10 +302,9 @@ Status DecodeModularChannelMAANS(
         pixel_type_w topleft = (x && y ? *(r + x - 1 - onerow) : left);
         int32_t guess = ClampedGradient(top, left, topleft);
         uint32_t pos =
-            kPropRangeFast +
-            std::min<pixel_type_w>(
-                std::max<pixel_type_w>(-kPropRangeFast, top + left - topleft),
-                kPropRangeFast - 1);
+            kPropRangeFast + Clamp1<pixel_type_w>(top + left - topleft,
+                                                  -kPropRangeFast,
+                                                  kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v =
             reader.ReadHybridUintClusteredMaybeInlined<uses_lz77>(ctx_id);
@@ -334,9 +333,8 @@ Status DecodeModularChannelMAANS(
         int32_t guess = wp_state.Predict</*compute_properties=*/true>(
             x, y, channel.w, left, left, topright, left, toptop, &properties,
             offset);
-        uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+        uint32_t pos = kPropRangeFast + Clamp1(properties[0], -kPropRangeFast,
+                                               kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v = reader.ReadHybridUintClusteredInlined<uses_lz77>(ctx_id);
         r[x] = make_pixel(v, 1, guess);
@@ -347,9 +345,8 @@ Status DecodeModularChannelMAANS(
         int32_t guess = wp_state.Predict</*compute_properties=*/true>(
             x, y, channel.w, rtop[x], r[x - 1], rtopright[x], rtopleft[x],
             rtoptop[x], &properties, offset);
-        uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+        uint32_t pos = kPropRangeFast + Clamp1(properties[0], -kPropRangeFast,
+                                               kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v = reader.ReadHybridUintClusteredInlined<uses_lz77>(ctx_id);
         r[x] = make_pixel(v, 1, guess);
@@ -360,9 +357,8 @@ Status DecodeModularChannelMAANS(
         int32_t guess = wp_state.Predict</*compute_properties=*/true>(
             x, y, channel.w, rtop[x], r[x - 1], rtop[x], rtopleft[x],
             rtoptop[x], &properties, offset);
-        uint32_t pos =
-            kPropRangeFast + std::min(std::max(-kPropRangeFast, properties[0]),
-                                      kPropRangeFast - 1);
+        uint32_t pos = kPropRangeFast + Clamp1(properties[0], -kPropRangeFast,
+                                               kPropRangeFast - 1);
         uint32_t ctx_id = tree_lut.context_lookup[pos];
         uint64_t v = reader.ReadHybridUintClusteredInlined<uses_lz77>(ctx_id);
         r[x] = make_pixel(v, 1, guess);
@@ -593,7 +589,7 @@ Status ModularDecode(BitReader &br, Image &image, GroupHeader &header,
       uint64_t pixels = channel.w * channel.h;
       max_tree_size += pixels;
     }
-    max_tree_size = std::min(static_cast<uint64_t>(1 << 20), max_tree_size);
+    max_tree_size = std::min<uint64_t>(1 << 20, max_tree_size);
     JXL_RETURN_IF_ERROR(
         DecodeTree(memory_manager, br, tree_storage, max_tree_size));
     JXL_ASSIGN_OR_RETURN(
