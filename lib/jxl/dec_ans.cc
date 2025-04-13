@@ -122,14 +122,22 @@ StatusOr<std::vector<int32_t>> ReadHistogram(int precision_bits,
         {3, 10}, {4, 4},  {3, 7}, {4, 1}, {3, 6}, {3, 8}, {3, 9}, {4, 2},
     };
 
-    std::vector<int> logcounts(counts.size());
-    int omit_log = -1;
-    int omit_pos = -1;
+    std::vector<uint8_t> logcounts(counts.size());
     // This array remembers which symbols have an RLE length.
     std::vector<int> same(counts.size(), 0);
-    for (size_t i = 0; i < logcounts.size(); ++i) {
+    input.Refill();  // for PeekFixedBits + Advance
+    int idx = input.PeekFixedBits<7>();
+    input.Consume(huff[idx][0]);
+    logcounts[0] = huff[idx][1];
+    // The RLE symbol.
+    if (logcounts[0] == ANS_LOG_TAB_SIZE + 1) {
+      return JXL_FAILURE("Invalid histogram.");
+    }
+    uint8_t omit_log = logcounts[0];
+    uint8_t omit_pos = 0;
+    for (size_t i = 1; i < logcounts.size(); ++i) {
       input.Refill();  // for PeekFixedBits + Advance
-      int idx = input.PeekFixedBits<7>();
+      idx = input.PeekFixedBits<7>();
       input.Consume(huff[idx][0]);
       logcounts[i] = huff[idx][1];
       // The RLE symbol.
@@ -145,9 +153,8 @@ StatusOr<std::vector<int32_t>> ReadHistogram(int precision_bits,
       }
     }
     // Invalid input, e.g. due to invalid usage of RLE.
-    if (omit_pos < 0) return JXL_FAILURE("Invalid histogram.");
     if (static_cast<size_t>(omit_pos) + 1 < logcounts.size() &&
-        logcounts[omit_pos + 1] == ANS_TAB_SIZE + 1) {
+        logcounts[omit_pos + 1] == ANS_LOG_TAB_SIZE + 1) {
       return JXL_FAILURE("Invalid histogram.");
     }
     int prev = 0;
@@ -163,7 +170,7 @@ StatusOr<std::vector<int32_t>> ReadHistogram(int precision_bits,
         counts[i] = prev;
         numsame--;
       } else {
-        unsigned int code = logcounts[i];
+        int code = logcounts[i];
         // omit_pos may not be negative at this point (checked before).
         if (i == static_cast<size_t>(omit_pos)) {
           continue;

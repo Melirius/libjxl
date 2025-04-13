@@ -387,9 +387,8 @@ class ANSEncodingHistogram {
   // smaller than "count" and smallest representable count larger than "count".
   static uint32_t SmallestIncrementLog(uint32_t count, uint32_t shift) {
     if (count == 0) return 0;
-    uint32_t bits = FloorLog2Nonzero(count);
-    uint32_t drop_bits = bits - GetPopulationCountPrecision(bits, shift);
-    return drop_bits;
+    int bits = FloorLog2Nonzero(count);
+    return bits - GetPopulationCountPrecision(bits, shift);
   }
   // We are growing/reducing histogram step by step trying to maximize total
   // entropy i.e. sum of `freq[n] * log[counts[n]]` with a given sum of

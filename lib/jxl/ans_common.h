@@ -23,13 +23,9 @@ namespace jxl {
 
 // Returns the precision (number of bits) that should be used to store
 // a histogram count such that Log2Floor(count) == logcount.
-static JXL_MAYBE_UNUSED JXL_INLINE uint32_t
-GetPopulationCountPrecision(uint32_t logcount, uint32_t shift) {
-  int32_t r = std::min<int>(
-      logcount, static_cast<int>(shift) -
-                    static_cast<int>((ANS_LOG_TAB_SIZE - logcount) >> 1));
-  if (r < 0) return 0;
-  return r;
+static JXL_MAYBE_UNUSED JXL_INLINE int GetPopulationCountPrecision(int logcount,
+                                                                   int shift) {
+  return Clamp1(shift - ((int(ANS_LOG_TAB_SIZE) - logcount) >> 1), 0, logcount);
 }
 
 // Returns a histogram where the counts are positive, differ by at most 1,
