@@ -324,8 +324,9 @@ Status UnpredictICC(const uint8_t* enc, size_t size, PaddedBytes* result) {
   return true;
 }
 
-Status ICCReader::Init(BitReader* reader) {
-  JXL_RETURN_IF_ERROR(CheckEOI(reader));
+Status ICCReader::Init(BitReader* reader_) {
+  reader = reader_;
+  JXL_RETURN_IF_ERROR(CheckEOI());
   JxlMemoryManager* memory_manager = decompressed_.memory_manager();
   used_bits_base_ = reader->TotalBitsConsumed();
   if (bits_to_skip_ == 0) {
@@ -334,35 +335,35 @@ Status ICCReader::Init(BitReader* reader) {
       // Avoid too large memory allocation for invalid file.
       return JXL_FAILURE("Too large encoded profile");
     }
-    JXL_RETURN_IF_ERROR(DecodeHistograms(
-        memory_manager, reader, kNumICCContexts, &code_, &context_map_));
-    JXL_ASSIGN_OR_RETURN(ans_reader_, ANSSymbolReader::Create(&code_, reader));
+    JXL_RETURN_IF_ERROR(
+        DecodeHistograms(memory_manager, reader, kNumICCContexts, &code_));
+    JXL_RETURN_IF_ERROR(ans_reader_.Init(&code_, reader));
     i_ = 0;
     JXL_RETURN_IF_ERROR(
         decompressed_.resize(std::min<size_t>(i_ + 0x400, enc_size_)));
     for (; i_ < std::min<size_t>(2, enc_size_); i_++) {
       decompressed_[i_] = ans_reader_.ReadHybridUint(
           ICCANSContext(i_, i_ > 0 ? decompressed_[i_ - 1] : 0,
-                        i_ > 1 ? decompressed_[i_ - 2] : 0),
-          reader, context_map_);
+                        i_ > 1 ? decompressed_[i_ - 2] : 0));
     }
     if (enc_size_ > kPreambleSize) {
       for (; i_ < kPreambleSize; i_++) {
         decompressed_[i_] = ans_reader_.ReadHybridUint(
-            ICCANSContext(i_, decompressed_[i_ - 1], decompressed_[i_ - 2]),
-            reader, context_map_);
+            ICCANSContext(i_, decompressed_[i_ - 1], decompressed_[i_ - 2]));
       }
-      JXL_RETURN_IF_ERROR(CheckEOI(reader));
+      JXL_RETURN_IF_ERROR(CheckEOI());
       JXL_RETURN_IF_ERROR(CheckPreamble(decompressed_, enc_size_));
     }
     bits_to_skip_ = reader->TotalBitsConsumed() - used_bits_base_;
   } else {
+    JXL_RETURN_IF_ERROR(ans_reader_.Init(&code_, reader));
     reader->SkipBits(bits_to_skip_);
   }
   return true;
 }
 
-Status ICCReader::Process(BitReader* reader, PaddedBytes* icc) {
+Status ICCReader::Process(PaddedBytes* icc) {
+  if (reader == nullptr) return JXL_FAILURE("ICCReader not initialized");
   ANSSymbolReader::Checkpoint checkpoint;
   size_t saved_i = 0;
   auto save = [&]() {
@@ -372,7 +373,7 @@ Status ICCReader::Process(BitReader* reader, PaddedBytes* icc) {
   };
   save();
   auto check_and_restore = [&]() -> Status {
-    Status status = CheckEOI(reader);
+    Status status = CheckEOI();
     if (!status) {
       // not enough bytes.
       ans_reader_.Restore(checkpoint);
@@ -395,8 +396,7 @@ Status ICCReader::Process(BitReader* reader, PaddedBytes* icc) {
     }
     JXL_ENSURE(i_ >= 2);
     decompressed_[i_] = ans_reader_.ReadHybridUint(
-        ICCANSContext(i_, decompressed_[i_ - 1], decompressed_[i_ - 2]), reader,
-        context_map_);
+        ICCANSContext(i_, decompressed_[i_ - 1], decompressed_[i_ - 2]));
   }
   JXL_RETURN_IF_ERROR(check_and_restore());
   bits_to_skip_ = reader->TotalBitsConsumed() - used_bits_base_;
@@ -408,7 +408,8 @@ Status ICCReader::Process(BitReader* reader, PaddedBytes* icc) {
   return UnpredictICC(decompressed_.data(), decompressed_.size(), icc);
 }
 
-Status ICCReader::CheckEOI(BitReader* reader) {
+Status ICCReader::CheckEOI() {
+  if (reader == nullptr) return JXL_FAILURE("ICCReader not initialized");
   if (reader->AllReadsWithinBounds()) return true;
   return JXL_NOT_ENOUGH_BYTES("Not enough bytes for reading ICC profile");
 }

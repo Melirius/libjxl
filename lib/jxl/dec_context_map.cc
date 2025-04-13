@@ -45,39 +45,38 @@ Status VerifyContextMap(const std::vector<uint8_t>& context_map,
 
 }  // namespace
 
-Status DecodeContextMap(JxlMemoryManager* memory_manager,
-                        std::vector<uint8_t>* context_map, size_t* num_htrees,
-                        BitReader* input) {
+StatusOr<std::vector<uint8_t>> DecodeContextMap(
+    JxlMemoryManager* memory_manager, size_t num_contexts, size_t* num_htrees,
+    BitReader* input) {
+  std::vector<uint8_t> context_map;
+  context_map.reserve(num_contexts);
   bool is_simple = static_cast<bool>(input->ReadFixedBits<1>());
   if (is_simple) {
     int bits_per_entry = input->ReadFixedBits<2>();
     if (bits_per_entry != 0) {
-      for (uint8_t& entry : *context_map) {
-        entry = input->ReadBits(bits_per_entry);
+      for (size_t i = 0; i < num_contexts; ++i) {
+        context_map.push_back(input->ReadBits(bits_per_entry));
       }
     } else {
-      std::fill(context_map->begin(), context_map->end(), 0);
+      context_map.assign(num_contexts, 0);
     }
   } else {
     bool use_mtf = static_cast<bool>(input->ReadFixedBits<1>());
     ANSCode code;
-    std::vector<uint8_t> sink_ctx_map;
     // Usage of LZ77 is disallowed if decoding only two symbols. This doesn't
     // make sense in non-malicious bitstreams, and could cause a stack overflow
     // in malicious bitstreams by making every context map require its own
     // context map.
-    JXL_RETURN_IF_ERROR(
-        DecodeHistograms(memory_manager, input, 1, &code, &sink_ctx_map,
-                         /*disallow_lz77=*/context_map->size() <= 2));
-    JXL_ASSIGN_OR_RETURN(ANSSymbolReader reader,
-                         ANSSymbolReader::Create(&code, input));
+    JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, input, 1, &code,
+                                         /*disallow_lz77=*/num_contexts <= 2));
+    ANSSymbolReader reader;
+    JXL_RETURN_IF_ERROR(reader.Init(&code, input));
     size_t i = 0;
     uint32_t maxsym = 0;
-    while (i < context_map->size()) {
-      uint32_t sym = reader.ReadHybridUintInlined</*uses_lz77=*/true>(
-          0, input, sink_ctx_map);
+    while (i < num_contexts) {
+      uint32_t sym = reader.ReadHybridUintInlined</*uses_lz77=*/true>(0);
       maxsym = sym > maxsym ? sym : maxsym;
-      (*context_map)[i] = sym;
+      context_map.push_back(sym);
       i++;
     }
     if (maxsym >= kMaxClusters) {
@@ -87,11 +86,12 @@ Status DecodeContextMap(JxlMemoryManager* memory_manager,
       return JXL_FAILURE("Invalid context map");
     }
     if (use_mtf) {
-      InverseMoveToFrontTransform(context_map->data(), context_map->size());
+      InverseMoveToFrontTransform(context_map.data(), context_map.size());
     }
   }
-  *num_htrees = *std::max_element(context_map->begin(), context_map->end()) + 1;
-  return VerifyContextMap(*context_map, *num_htrees);
+  *num_htrees = *std::max_element(context_map.begin(), context_map.end()) + 1;
+  JXL_RETURN_IF_ERROR(VerifyContextMap(context_map, *num_htrees));
+  return context_map;
 }
 
 }  // namespace jxl

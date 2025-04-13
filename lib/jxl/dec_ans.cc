@@ -341,7 +341,7 @@ void ANSCode::UpdateMaxNumBits(size_t ctx, size_t symbol) {
 
 Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
                         size_t num_contexts, ANSCode* code,
-                        std::vector<uint8_t>* context_map, bool disallow_lz77) {
+                        bool disallow_lz77) {
   JXL_RETURN_IF_ERROR(Bundle::Read(br, &code->lz77));
   if (code->lz77.enabled) {
     num_contexts++;
@@ -352,15 +352,17 @@ Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
     return JXL_FAILURE("Using LZ77 when explicitly disallowed");
   }
   size_t num_histograms = 1;
-  context_map->resize(num_contexts);
   if (num_contexts > 1) {
-    JXL_RETURN_IF_ERROR(
-        DecodeContextMap(memory_manager, context_map, &num_histograms, br));
+    JXL_ASSIGN_OR_RETURN(
+        code->context_map,
+        DecodeContextMap(memory_manager, num_contexts, &num_histograms, br));
+  } else {
+    code->context_map.assign(1, 0);
   }
   JXL_DEBUG_V(
       4, "Decoded context map of size %" PRIuS " and %" PRIuS " histograms",
       num_contexts, num_histograms);
-  code->lz77.nonserialized_distance_context = context_map->back();
+  code->lz77.nonserialized_distance_context = code->context_map.back();
   code->use_prefix_code = static_cast<bool>(br->ReadFixedBits<1>());
   if (code->use_prefix_code) {
     code->log_alpha_size = PREFIX_MAX_BITS;
@@ -376,29 +378,20 @@ Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
   return true;
 }
 
-StatusOr<ANSSymbolReader> ANSSymbolReader::Create(const ANSCode* code,
-                                                  BitReader* JXL_RESTRICT br,
-                                                  size_t distance_multiplier) {
-  AlignedMemory lz77_window_storage;
+Status ANSSymbolReader::Init(const ANSCode* code, BitReader* JXL_RESTRICT br_,
+                             size_t distance_multiplier) {
+  br = br_;
   if (code->lz77.enabled) {
     JxlMemoryManager* memory_manager = code->memory_manager;
     JXL_ASSIGN_OR_RETURN(
-        lz77_window_storage,
+        lz77_window_storage_,
         AlignedMemory::Create(memory_manager, kWindowSize * sizeof(uint32_t)));
   }
-  return ANSSymbolReader(code, br, distance_multiplier,
-                         std::move(lz77_window_storage));
-}
-
-ANSSymbolReader::ANSSymbolReader(const ANSCode* code,
-                                 BitReader* JXL_RESTRICT br,
-                                 size_t distance_multiplier,
-                                 AlignedMemory&& lz77_window_storage)
-    : alias_tables_(code->alias_tables.address<AliasTable::Entry>()),
-      huffman_data_(code->huffman_data.data()),
-      use_prefix_code_(code->use_prefix_code),
-      configs(code->uint_config.data()),
-      lz77_window_storage_(std::move(lz77_window_storage)) {
+  context_map_ = code->context_map.data();
+  alias_tables_ = code->alias_tables.address<AliasTable::Entry>();
+  huffman_data_ = code->huffman_data.data();
+  use_prefix_code_ = code->use_prefix_code;
+  configs = code->uint_config.data();
   if (!use_prefix_code_) {
     state_ = static_cast<uint32_t>(br->ReadFixedBits<32>());
     log_alpha_size_ = code->log_alpha_size;
@@ -407,7 +400,7 @@ ANSSymbolReader::ANSSymbolReader(const ANSCode* code,
   } else {
     state_ = (ANS_SIGNATURE << 16u);
   }
-  if (!code->lz77.enabled) return;
+  if (!code->lz77.enabled) return true;
   lz77_window_ = lz77_window_storage_.address<uint32_t>();
   lz77_ctx_ = code->lz77.nonserialized_distance_context;
   lz77_length_uint_ = code->lz77.length_uint_config;
@@ -417,6 +410,8 @@ ANSSymbolReader::ANSSymbolReader(const ANSCode* code,
   for (size_t i = 0; i < num_special_distances_; i++) {
     special_distances_[i] = SpecialDistance(i, distance_multiplier);
   }
+
+  return true;
 }
 
 }  // namespace jxl

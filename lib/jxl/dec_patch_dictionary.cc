@@ -34,15 +34,14 @@ Status PatchDictionary::Decode(JxlMemoryManager* memory_manager, BitReader* br,
                                bool* uses_extra_channels) {
   positions_.clear();
   blendings_stride_ = num_extra_channels + 1;
-  std::vector<uint8_t> context_map;
   ANSCode code;
-  JXL_RETURN_IF_ERROR(DecodeHistograms(
-      memory_manager, br, kNumPatchDictionaryContexts, &code, &context_map));
-  JXL_ASSIGN_OR_RETURN(ANSSymbolReader decoder,
-                       ANSSymbolReader::Create(&code, br));
+  JXL_RETURN_IF_ERROR(
+      DecodeHistograms(memory_manager, br, kNumPatchDictionaryContexts, &code));
+  ANSSymbolReader decoder;
+  JXL_RETURN_IF_ERROR(decoder.Init(&code, br));
 
   auto read_num = [&](size_t context) -> size_t {
-    size_t r = decoder.ReadHybridUint(context, br, context_map);
+    size_t r = decoder.ReadHybridUint(context);
     return r;
   };
 

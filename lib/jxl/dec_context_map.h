@@ -17,13 +17,12 @@
 
 namespace jxl {
 
-// Reads the context map from the bit stream. On calling this function,
-// context_map->size() must be the number of possible context ids.
+// Reads the context map from the bit stream.
 // Sets *num_htrees to the number of different histogram ids in
 // *context_map.
-Status DecodeContextMap(JxlMemoryManager* memory_manager,
-                        std::vector<uint8_t>* context_map, size_t* num_htrees,
-                        BitReader* input);
+StatusOr<std::vector<uint8_t>> DecodeContextMap(
+    JxlMemoryManager* memory_manager, size_t num_contexts, size_t* num_htrees,
+    BitReader* input);
 
 }  // namespace jxl
 

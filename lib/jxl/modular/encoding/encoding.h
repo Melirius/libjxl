@@ -145,7 +145,6 @@ Status ModularGenericDecompress(BitReader *br, Image &image,
                                 bool undo_transforms = true,
                                 const Tree *tree = nullptr,
                                 const ANSCode *code = nullptr,
-                                const std::vector<uint8_t> *ctx_map = nullptr,
                                 bool allow_truncated_group = false);
 }  // namespace jxl
 

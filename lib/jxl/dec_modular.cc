@@ -220,8 +220,8 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
                               (nb_chans + nb_extra) / 16);
       JXL_RETURN_IF_ERROR(
           DecodeTree(memory_manager, reader, &tree, tree_size_limit));
-      JXL_RETURN_IF_ERROR(DecodeHistograms(
-          memory_manager, reader, (tree.size() + 1) / 2, &code, &context_map));
+      JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, reader,
+                                           (tree.size() + 1) / 2, &code));
     }
   }
   if (!do_color) nb_chans = 0;
@@ -279,8 +279,7 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
   Status dec_status = ModularGenericDecompress(
       reader, gi, &global_header, ModularStreamId::Global().ID(frame_dim),
       &options,
-      /*undo_transforms=*/false, &tree, &code, &context_map,
-      allow_truncated_group);
+      /*undo_transforms=*/false, &tree, &code, allow_truncated_group);
   if (!allow_truncated_group) JXL_RETURN_IF_ERROR(dec_status);
   if (dec_status.IsFatalError()) {
     return JXL_FAILURE("Failed to decode global modular info");
@@ -381,7 +380,7 @@ Status ModularFrameDecoder::DecodeGroup(
   if (!zerofill) {
     auto status = ModularGenericDecompress(
         reader, gi, /*header=*/nullptr, stream.ID(frame_dim), &options,
-        /*undo_transforms=*/true, &tree, &code, &context_map, allow_truncated);
+        /*undo_transforms=*/true, &tree, &code, allow_truncated);
     if (!allow_truncated) JXL_RETURN_IF_ERROR(status);
     if (status.IsFatalError()) return status;
   }
@@ -441,9 +440,9 @@ Status ModularFrameDecoder::DecodeVarDCTDC(const FrameHeader& frame_header,
     ch.h >>= frame_header.chroma_subsampling.VShift(c);
     JXL_RETURN_IF_ERROR(ch.shrink());
   }
-  if (!ModularGenericDecompress(
-          reader, image, /*header=*/nullptr, stream_id, &options,
-          /*undo_transforms=*/true, &tree, &code, &context_map)) {
+  if (!ModularGenericDecompress(reader, image, /*header=*/nullptr, stream_id,
+                                &options,
+                                /*undo_transforms=*/true, &tree, &code)) {
     return JXL_FAILURE("Failed to decode VarDCT DC group (DC group id %d)",
                        static_cast<int>(group_id));
   }
@@ -480,9 +479,9 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
   JXL_ASSIGN_OR_RETURN(image.channel[2],
                        Channel::Create(memory_manager, count, 2, 0, 0));
   ModularOptions options;
-  if (!ModularGenericDecompress(
-          reader, image, /*header=*/nullptr, stream_id, &options,
-          /*undo_transforms=*/true, &tree, &code, &context_map)) {
+  if (!ModularGenericDecompress(reader, image, /*header=*/nullptr, stream_id,
+                                &options,
+                                /*undo_transforms=*/true, &tree, &code)) {
     return JXL_FAILURE("Failed to decode AC metadata");
   }
   JXL_RETURN_IF_ERROR(
@@ -802,7 +801,7 @@ Status ModularFrameDecoder::DecodeQuantTable(
     JXL_RETURN_IF_ERROR(ModularGenericDecompress(
         br, image, /*header=*/nullptr, qt.ID(modular_frame_decoder->frame_dim),
         &options, /*undo_transforms=*/true, &modular_frame_decoder->tree,
-        &modular_frame_decoder->code, &modular_frame_decoder->context_map));
+        &modular_frame_decoder->code));
   } else {
     JXL_RETURN_IF_ERROR(ModularGenericDecompress(br, image, /*header=*/nullptr,
                                                  0, &options,

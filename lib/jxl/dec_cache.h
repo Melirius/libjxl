@@ -97,7 +97,6 @@ struct PassesDecoderState {
 
   // For ANS decoding.
   std::vector<ANSCode> code;
-  std::vector<std::vector<uint8_t>> context_map;
 
   // Multiplier to be applied to the quant matrices of the x channel.
   float x_dm_multiplier;

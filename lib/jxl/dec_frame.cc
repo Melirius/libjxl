@@ -388,7 +388,6 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
                 dec_state_->shared_storage.num_histograms);
 
     dec_state_->code.resize(kMaxNumPasses);
-    dec_state_->context_map.resize(kMaxNumPasses);
     // Read coefficient orders and histograms.
     size_t max_num_bits_ac = 0;
     for (size_t i = 0; i < frame_header_.passes.num_passes; i++) {
@@ -402,10 +401,9 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
           dec_state_->shared->num_histograms *
           dec_state_->shared_storage.block_ctx_map.NumACContexts();
       JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, br, num_contexts,
-                                           &dec_state_->code[i],
-                                           &dec_state_->context_map[i]));
+                                           &dec_state_->code[i]));
       // Add extra values to enable the cheat in hot loop of DecodeACVarBlock.
-      dec_state_->context_map[i].resize(
+      dec_state_->code[i].context_map.resize(
           num_contexts + kZeroDensityContextLimit - kZeroDensityContextCount);
       max_num_bits_ac =
           std::max(max_num_bits_ac, dec_state_->code[i].max_num_bits);

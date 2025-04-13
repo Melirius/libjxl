@@ -73,9 +73,8 @@ class QuantizedSpline {
                     uint64_t image_size, uint64_t* total_estimated_area_reached,
                     Spline& result) const;
 
-  Status Decode(const std::vector<uint8_t>& context_map,
-                ANSSymbolReader* decoder, BitReader* br,
-                size_t max_control_points, size_t* total_num_control_points);
+  Status Decode(ANSSymbolReader* decoder, size_t max_control_points,
+                size_t* total_num_control_points);
 
  private:
   friend class QuantizedSplineEncoder;

@@ -237,18 +237,15 @@ float InvAdjustedQuant(const int32_t adjustment) {
 constexpr float kChannelWeight[] = {0.0042f, 0.075f, 0.07f, .3333f};
 
 Status DecodeAllStartingPoints(std::vector<Spline::Point>* const points,
-                               BitReader* const br, ANSSymbolReader* reader,
-                               const std::vector<uint8_t>& context_map,
+                               ANSSymbolReader* reader,
                                const size_t num_splines) {
   points->clear();
   points->reserve(num_splines);
   int64_t last_x = 0;
   int64_t last_y = 0;
   for (size_t i = 0; i < num_splines; i++) {
-    size_t dx =
-        reader->ReadHybridUint(kStartingPositionContext, br, context_map);
-    size_t dy =
-        reader->ReadHybridUint(kStartingPositionContext, br, context_map);
+    size_t dx = reader->ReadHybridUint(kStartingPositionContext);
+    size_t dy = reader->ReadHybridUint(kStartingPositionContext);
     int64_t x;
     int64_t y;
     if (i != 0) {
@@ -520,13 +517,11 @@ Status QuantizedSpline::Dequantize(const Spline::Point& starting_point,
   return true;
 }
 
-Status QuantizedSpline::Decode(const std::vector<uint8_t>& context_map,
-                               ANSSymbolReader* const decoder,
-                               BitReader* const br,
+Status QuantizedSpline::Decode(ANSSymbolReader* const decoder,
                                const size_t max_control_points,
                                size_t* total_num_control_points) {
   const size_t num_control_points =
-      decoder->ReadHybridUint(kNumControlPointsContext, br, context_map);
+      decoder->ReadHybridUint(kNumControlPointsContext);
   if (num_control_points > max_control_points) {
     return JXL_FAILURE("Too many control points: %" PRIuS, num_control_points);
   }
@@ -539,10 +534,10 @@ Status QuantizedSpline::Decode(const std::vector<uint8_t>& context_map,
   // Maximal image dimension.
   constexpr int64_t kDeltaLimit = 1u << 30;
   for (std::pair<int64_t, int64_t>& control_point : control_points_) {
-    control_point.first = UnpackSigned(
-        decoder->ReadHybridUint(kControlPointsContext, br, context_map));
-    control_point.second = UnpackSigned(
-        decoder->ReadHybridUint(kControlPointsContext, br, context_map));
+    control_point.first =
+        UnpackSigned(decoder->ReadHybridUint(kControlPointsContext));
+    control_point.second =
+        UnpackSigned(decoder->ReadHybridUint(kControlPointsContext));
     // Check delta-deltas are not outrageous; it is not in spec, but there is
     // no reason to allow larger values.
     if ((control_point.first >= kDeltaLimit) ||
@@ -553,11 +548,10 @@ Status QuantizedSpline::Decode(const std::vector<uint8_t>& context_map,
     }
   }
 
-  const auto decode_dct = [decoder, br, &context_map](int dct[32]) -> Status {
+  const auto decode_dct = [decoder](int dct[32]) -> Status {
     constexpr int kWeirdNumber = std::numeric_limits<int>::min();
     for (int i = 0; i < 32; ++i) {
-      dct[i] =
-          UnpackSigned(decoder->ReadHybridUint(kDCTContext, br, context_map));
+      dct[i] = UnpackSigned(decoder->ReadHybridUint(kDCTContext));
       if (dct[i] == kWeirdNumber) {
         return JXL_FAILURE("The weird number in spline DCT");
       }
@@ -580,16 +574,14 @@ void Splines::Clear() {
   segment_y_start_.clear();
 }
 
-Status Splines::Decode(JxlMemoryManager* memory_manager, jxl::BitReader* br,
+Status Splines::Decode(JxlMemoryManager* memory_manager, BitReader* br,
                        const size_t num_pixels) {
-  std::vector<uint8_t> context_map;
   ANSCode code;
-  JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, br, kNumSplineContexts,
-                                       &code, &context_map));
-  JXL_ASSIGN_OR_RETURN(ANSSymbolReader decoder,
-                       ANSSymbolReader::Create(&code, br));
-  size_t num_splines =
-      decoder.ReadHybridUint(kNumSplinesContext, br, context_map);
+  JXL_RETURN_IF_ERROR(
+      DecodeHistograms(memory_manager, br, kNumSplineContexts, &code));
+  ANSSymbolReader decoder;
+  JXL_RETURN_IF_ERROR(decoder.Init(&code, br));
+  size_t num_splines = decoder.ReadHybridUint(kNumSplinesContext);
   size_t max_control_points = std::min(
       kMaxNumControlPoints, num_pixels / kMaxNumControlPointsPerPixelRatio);
   if (num_splines > max_control_points ||
@@ -597,19 +589,19 @@ Status Splines::Decode(JxlMemoryManager* memory_manager, jxl::BitReader* br,
     return JXL_FAILURE("Too many splines: %" PRIuS, num_splines);
   }
   num_splines++;
-  JXL_RETURN_IF_ERROR(DecodeAllStartingPoints(&starting_points_, br, &decoder,
-                                              context_map, num_splines));
+  JXL_RETURN_IF_ERROR(
+      DecodeAllStartingPoints(&starting_points_, &decoder, num_splines));
 
-  quantization_adjustment_ = UnpackSigned(
-      decoder.ReadHybridUint(kQuantizationAdjustmentContext, br, context_map));
+  quantization_adjustment_ =
+      UnpackSigned(decoder.ReadHybridUint(kQuantizationAdjustmentContext));
 
   splines_.clear();
   splines_.reserve(num_splines);
   size_t num_control_points = num_splines;
   for (size_t i = 0; i < num_splines; ++i) {
     QuantizedSpline spline;
-    JXL_RETURN_IF_ERROR(spline.Decode(context_map, &decoder, br,
-                                      max_control_points, &num_control_points));
+    JXL_RETURN_IF_ERROR(
+        spline.Decode(&decoder, max_control_points, &num_control_points));
     splines_.push_back(std::move(spline));
   }
 

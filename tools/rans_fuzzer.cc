@@ -37,14 +37,13 @@ void Check(bool ok) {
 
 Status Run(const uint8_t* data, size_t size, JxlMemoryManager* memory_manager,
            size_t num_contexts) {
-  std::vector<uint8_t> context_map;
   Status ret = true;
   {
     BitReader br(Bytes(data, size));
     BitReaderScopedCloser br_closer(br, ret);
     ANSCode code;
-    JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, &br, num_contexts,
-                                         &code, &context_map));
+    JXL_RETURN_IF_ERROR(
+        DecodeHistograms(memory_manager, &br, num_contexts, &code));
     JXL_ASSIGN_OR_RETURN(ANSSymbolReader ansreader,
                          ANSSymbolReader::Create(&code, &br));
 
@@ -54,8 +53,8 @@ Status Run(const uint8_t* data, size_t size, JxlMemoryManager* memory_manager,
     int context = 0;
     while (jxl::DivCeil(br.TotalBitsConsumed(), jxl::kBitsPerByte) < size &&
            numreads <= maxreads) {
-      int code = ansreader.ReadHybridUint(context, &br, context_map);
-      context = code % num_contexts;
+      int hybr_uint = ansreader.ReadHybridUint(context, &br);
+      context = hybr_uint % num_contexts;
       numreads++;
     }
   }

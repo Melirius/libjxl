@@ -30,8 +30,6 @@
 
 namespace jxl {
 
-class ANSSymbolReader;
-
 // Experiments show that best performance is typically achieved for a
 // split-exponent of 3 or 4. Trend seems to be that '4' is better
 // for large-ish pictures, and '3' better for rather small-ish pictures.
@@ -154,6 +152,7 @@ struct ANSCode {
   // ReadHybridUint call done with this ANSCode.
   size_t max_num_bits = 0;
   JxlMemoryManager* memory_manager;
+  std::vector<uint8_t> context_map;
   void UpdateMaxNumBits(size_t ctx, size_t symbol);
 };
 
@@ -161,12 +160,12 @@ class ANSSymbolReader {
  public:
   // Invalid symbol reader, to be overwritten.
   ANSSymbolReader() = default;
-  static StatusOr<ANSSymbolReader> Create(const ANSCode* code,
-                                          BitReader* JXL_RESTRICT br,
-                                          size_t distance_multiplier = 0);
+  Status Init(const ANSCode* code, BitReader* JXL_RESTRICT br,
+              size_t distance_multiplier = 0);
 
-  JXL_INLINE size_t ReadSymbolANSWithoutRefill(const size_t histo_idx,
-                                               BitReader* JXL_RESTRICT br) {
+  Status AllReadsWithinBounds() { return br->AllReadsWithinBounds(); }
+
+  JXL_INLINE size_t ReadSymbolANSWithoutRefill(const size_t histo_idx) {
     const uint32_t res = state_ & (ANS_TAB_SIZE - 1u);
 
     const AliasTable::Entry* table =
@@ -194,24 +193,21 @@ class ANSSymbolReader {
     return symbol.value;
   }
 
-  JXL_INLINE size_t ReadSymbolHuffWithoutRefill(const size_t histo_idx,
-                                                BitReader* JXL_RESTRICT br) {
+  JXL_INLINE size_t ReadSymbolHuffWithoutRefill(const size_t histo_idx) {
     return huffman_data_[histo_idx].ReadSymbol(br);
   }
 
-  JXL_INLINE size_t ReadSymbolWithoutRefill(const size_t histo_idx,
-                                            BitReader* JXL_RESTRICT br) {
+  JXL_INLINE size_t ReadSymbolWithoutRefill(const size_t histo_idx) {
     // TODO(veluca): hoist if in hotter loops.
     if (JXL_UNLIKELY(use_prefix_code_)) {
-      return ReadSymbolHuffWithoutRefill(histo_idx, br);
+      return ReadSymbolHuffWithoutRefill(histo_idx);
     }
-    return ReadSymbolANSWithoutRefill(histo_idx, br);
+    return ReadSymbolANSWithoutRefill(histo_idx);
   }
 
-  JXL_INLINE size_t ReadSymbol(const size_t histo_idx,
-                               BitReader* JXL_RESTRICT br) {
+  JXL_INLINE size_t ReadSymbol(const size_t histo_idx) {
     br->Refill();
-    return ReadSymbolWithoutRefill(histo_idx, br);
+    return ReadSymbolWithoutRefill(histo_idx);
   }
 
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
@@ -256,12 +252,11 @@ class ANSSymbolReader {
 
   // Takes a *clustered* idx. Can only use if HuffRleOnly() is true.
   JXL_INLINE void ReadHybridUintClusteredHuffRleOnly(size_t ctx,
-                                                     BitReader* JXL_RESTRICT br,
                                                      uint32_t* value,
                                                      uint32_t* run) {
     JXL_DASSERT(IsHuffRleOnly());
     br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
-    size_t token = ReadSymbolHuffWithoutRefill(ctx, br);
+    size_t token = ReadSymbolHuffWithoutRefill(ctx);
     if (JXL_UNLIKELY(token >= lz77_threshold_)) {
       *run =
           ReadHybridUintConfig(lz77_length_uint_, token - lz77_threshold_, br) +
@@ -284,8 +279,7 @@ class ANSSymbolReader {
 
   // Takes a *clustered* idx. Inlined, for use in hot paths.
   template <bool uses_lz77>
-  JXL_INLINE size_t ReadHybridUintClusteredInlined(size_t ctx,
-                                                   BitReader* JXL_RESTRICT br) {
+  JXL_INLINE size_t ReadHybridUintClusteredInlined(size_t ctx) {
     if (uses_lz77) {
       if (JXL_UNLIKELY(num_to_copy_ > 0)) {
         size_t ret = lz77_window_[(copy_pos_++) & kWindowMask];
@@ -296,7 +290,7 @@ class ANSSymbolReader {
     }
 
     br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
-    size_t token = ReadSymbolWithoutRefill(ctx, br);
+    size_t token = ReadSymbolWithoutRefill(ctx);
     if (uses_lz77) {
       if (JXL_UNLIKELY(token >= lz77_threshold_)) {
         num_to_copy_ = ReadHybridUintConfig(lz77_length_uint_,
@@ -304,7 +298,7 @@ class ANSSymbolReader {
                        lz77_min_length_;
         br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
         // Distance code.
-        size_t d_token = ReadSymbolWithoutRefill(lz77_ctx_, br);
+        size_t d_token = ReadSymbolWithoutRefill(lz77_ctx_);
         size_t distance = ReadHybridUintConfig(configs[lz77_ctx_], d_token, br);
         if (JXL_LIKELY(distance < num_special_distances_)) {
           distance = special_distances_[distance];
@@ -344,33 +338,29 @@ class ANSSymbolReader {
 
   // same but not inlined
   template <bool uses_lz77>
-  size_t ReadHybridUintClustered(size_t ctx, BitReader* JXL_RESTRICT br) {
-    return ReadHybridUintClusteredInlined<uses_lz77>(ctx, br);
+  size_t ReadHybridUintClustered(size_t ctx) {
+    return ReadHybridUintClusteredInlined<uses_lz77>(ctx);
   }
 
   // inlined only in the no-lz77 case
   template <bool uses_lz77>
-  JXL_INLINE size_t
-  ReadHybridUintClusteredMaybeInlined(size_t ctx, BitReader* JXL_RESTRICT br) {
+  JXL_INLINE size_t ReadHybridUintClusteredMaybeInlined(size_t ctx) {
     if (uses_lz77) {
-      return ReadHybridUintClustered<uses_lz77>(ctx, br);
+      return ReadHybridUintClustered<uses_lz77>(ctx);
     } else {
-      return ReadHybridUintClusteredInlined<uses_lz77>(ctx, br);
+      return ReadHybridUintClusteredInlined<uses_lz77>(ctx);
     }
   }
 
   // inlined, for use in hot paths
   template <bool uses_lz77>
-  JXL_INLINE size_t
-  ReadHybridUintInlined(size_t ctx, BitReader* JXL_RESTRICT br,
-                        const std::vector<uint8_t>& context_map) {
-    return ReadHybridUintClustered<uses_lz77>(context_map[ctx], br);
+  JXL_INLINE size_t ReadHybridUintInlined(size_t ctx) {
+    return ReadHybridUintClustered<uses_lz77>(context_map_[ctx]);
   }
 
   // not inlined, for use in non-hot paths
-  size_t ReadHybridUint(size_t ctx, BitReader* JXL_RESTRICT br,
-                        const std::vector<uint8_t>& context_map) {
-    return ReadHybridUintClustered</*uses_lz77=*/true>(context_map[ctx], br);
+  size_t ReadHybridUint(size_t ctx) {
+    return ReadHybridUintClustered</*uses_lz77=*/true>(context_map_[ctx]);
   }
 
   // ctx is a *clustered* context!
@@ -446,10 +436,8 @@ class ANSSymbolReader {
   }
 
  private:
-  ANSSymbolReader(const ANSCode* code, BitReader* JXL_RESTRICT br,
-                  size_t distance_multiplier,
-                  AlignedMemory&& lz77_window_storage);
-
+  BitReader* JXL_RESTRICT br;
+  const uint8_t* JXL_RESTRICT context_map_;             // not owned
   const AliasTable::Entry* JXL_RESTRICT alias_tables_;  // not owned
   const HuffmanDecodingData* huffman_data_;
   bool use_prefix_code_;
@@ -478,7 +466,6 @@ class ANSSymbolReader {
 
 Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
                         size_t num_contexts, ANSCode* code,
-                        std::vector<uint8_t>* context_map,
                         bool disallow_lz77 = false);
 
 // Exposed for tests.

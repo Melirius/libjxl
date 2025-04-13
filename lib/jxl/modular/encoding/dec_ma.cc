@@ -72,38 +72,34 @@ Status ValidateTree(const Tree &tree) {
   return true;
 }
 
-Status DecodeTree(BitReader *br, ANSSymbolReader *reader,
-                  const std::vector<uint8_t> &context_map, Tree *tree,
-                  size_t tree_size_limit) {
+// TODO(Ivan) move to ANSSymbolReader methods to remove AllReadsWithinBounds?
+Status DecodeTree(ANSSymbolReader *reader, Tree *tree, size_t tree_size_limit) {
   size_t leaf_id = 0;
   size_t to_decode = 1;
   tree->clear();
   while (to_decode > 0) {
-    JXL_RETURN_IF_ERROR(br->AllReadsWithinBounds());
+    JXL_RETURN_IF_ERROR(reader->AllReadsWithinBounds());
     if (tree->size() > tree_size_limit) {
       return JXL_FAILURE("Tree is too large: %" PRIuS " nodes vs %" PRIuS
                          " max nodes",
                          tree->size(), tree_size_limit);
     }
     to_decode--;
-    uint32_t prop1 = reader->ReadHybridUint(kPropertyContext, br, context_map);
+    uint32_t prop1 = reader->ReadHybridUint(kPropertyContext);
     if (prop1 > 256) return JXL_FAILURE("Invalid tree property value");
     int property = prop1 - 1;
     if (property == -1) {
-      size_t predictor =
-          reader->ReadHybridUint(kPredictorContext, br, context_map);
+      size_t predictor = reader->ReadHybridUint(kPredictorContext);
       if (predictor >= kNumModularPredictors) {
         return JXL_FAILURE("Invalid predictor");
       }
       int64_t predictor_offset =
-          UnpackSigned(reader->ReadHybridUint(kOffsetContext, br, context_map));
-      uint32_t mul_log =
-          reader->ReadHybridUint(kMultiplierLogContext, br, context_map);
+          UnpackSigned(reader->ReadHybridUint(kOffsetContext));
+      uint32_t mul_log = reader->ReadHybridUint(kMultiplierLogContext);
       if (mul_log >= 31) {
         return JXL_FAILURE("Invalid multiplier logarithm");
       }
-      uint32_t mul_bits =
-          reader->ReadHybridUint(kMultiplierBitsContext, br, context_map);
+      uint32_t mul_bits = reader->ReadHybridUint(kMultiplierBitsContext);
       if (mul_bits >= (1u << (31u - mul_log)) - 1u) {
         return JXL_FAILURE("Invalid multiplier");
       }
@@ -112,8 +108,7 @@ Status DecodeTree(BitReader *br, ANSSymbolReader *reader,
                          predictor_offset, multiplier);
       continue;
     }
-    int splitval =
-        UnpackSigned(reader->ReadHybridUint(kSplitValContext, br, context_map));
+    int splitval = UnpackSigned(reader->ReadHybridUint(kSplitValContext));
     tree->emplace_back(property, splitval, tree->size() + to_decode + 1,
                        tree->size() + to_decode + 2, Predictor::Zero, 0, 1);
     to_decode += 2;
@@ -124,18 +119,18 @@ Status DecodeTree(BitReader *br, ANSSymbolReader *reader,
 
 Status DecodeTree(JxlMemoryManager *memory_manager, BitReader *br, Tree *tree,
                   size_t tree_size_limit) {
-  std::vector<uint8_t> tree_context_map;
   ANSCode tree_code;
-  JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, br, kNumTreeContexts,
-                                       &tree_code, &tree_context_map));
+  JXL_RETURN_IF_ERROR(
+      DecodeHistograms(memory_manager, br, kNumTreeContexts, &tree_code));
   // TODO(eustas): investigate more infinite tree cases.
-  if (tree_code.degenerate_symbols[tree_context_map[kPropertyContext]] > 0) {
+  if (tree_code.degenerate_symbols[tree_code.context_map[kPropertyContext]] >
+      0) {
     return JXL_FAILURE("Infinite tree");
   }
-  JXL_ASSIGN_OR_RETURN(ANSSymbolReader reader,
-                       ANSSymbolReader::Create(&tree_code, br));
-  JXL_RETURN_IF_ERROR(DecodeTree(br, &reader, tree_context_map, tree,
-                                 std::min(tree_size_limit, kMaxTreeSize)));
+  ANSSymbolReader reader;
+  JXL_RETURN_IF_ERROR(reader.Init(&tree_code, br));
+  JXL_RETURN_IF_ERROR(
+      DecodeTree(&reader, tree, std::min(tree_size_limit, kMaxTreeSize)));
   if (!reader.CheckANSFinalState()) {
     return JXL_FAILURE("ANS decode final state failed");
   }

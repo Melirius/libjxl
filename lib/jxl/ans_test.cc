@@ -63,17 +63,15 @@ void RoundtripTestcase(int n_histograms, int alphabet_size,
 
   ASSERT_EQ(br.ReadBits(16), kMagic1);
 
-  std::vector<uint8_t> dec_context_map;
   ANSCode decoded_codes;
-  ASSERT_TRUE(DecodeHistograms(memory_manager, &br, n_histograms,
-                               &decoded_codes, &dec_context_map));
-  ASSERT_EQ(dec_context_map, codes.context_map);
-  JXL_TEST_ASSIGN_OR_DIE(ANSSymbolReader reader,
-                         ANSSymbolReader::Create(&decoded_codes, &br));
+  ASSERT_TRUE(
+      DecodeHistograms(memory_manager, &br, n_histograms, &decoded_codes));
+  ASSERT_EQ(decoded_codes.context_map, codes.context_map);
+  ANSSymbolReader reader;
+  ASSERT_TRUE(reader.Init(&decoded_codes, &br));
 
   for (const Token& symbol : input_values) {
-    uint32_t read_symbol =
-        reader.ReadHybridUint(symbol.context, &br, dec_context_map);
+    uint32_t read_symbol = reader.ReadHybridUint(symbol.context);
     ASSERT_EQ(read_symbol, symbol.value);
   }
   ASSERT_TRUE(reader.CheckANSFinalState());
@@ -241,13 +239,11 @@ void TestCheckpointing(bool ans, bool lz77) {
   {
     BitReaderScopedCloser bc(br, status);
 
-    std::vector<uint8_t> dec_context_map;
     ANSCode decoded_codes;
-    ASSERT_TRUE(DecodeHistograms(memory_manager, &br, 1, &decoded_codes,
-                                 &dec_context_map));
-    ASSERT_EQ(dec_context_map, codes.context_map);
-    JXL_TEST_ASSIGN_OR_DIE(ANSSymbolReader reader,
-                           ANSSymbolReader::Create(&decoded_codes, &br));
+    ASSERT_TRUE(DecodeHistograms(memory_manager, &br, 1, &decoded_codes));
+    ASSERT_EQ(decoded_codes.context_map, codes.context_map);
+    ANSSymbolReader reader;
+    ASSERT_TRUE(reader.Init(&decoded_codes, &br));
 
     ANSSymbolReader::Checkpoint checkpoint;
     size_t br_pos = 0;
@@ -260,8 +256,7 @@ void TestCheckpointing(bool ans, bool lz77) {
         br.SkipBits(br_pos);
         for (size_t j = i - kInterval; j < i; j++) {
           Token symbol = input_values[0][j];
-          uint32_t read_symbol =
-              reader.ReadHybridUint(symbol.context, &br, dec_context_map);
+          uint32_t read_symbol = reader.ReadHybridUint(symbol.context);
           ASSERT_EQ(read_symbol, symbol.value) << "j = " << j;
         }
       }
@@ -270,8 +265,7 @@ void TestCheckpointing(bool ans, bool lz77) {
         br_pos = br.TotalBitsConsumed();
       }
       Token symbol = input_values[0][i];
-      uint32_t read_symbol =
-          reader.ReadHybridUint(symbol.context, &br, dec_context_map);
+      uint32_t read_symbol = reader.ReadHybridUint(symbol.context);
       ASSERT_EQ(read_symbol, symbol.value) << "i = " << i;
     }
     ASSERT_TRUE(reader.CheckANSFinalState());

@@ -26,19 +26,20 @@ struct ICCReader {
       : decompressed_(memory_manager) {}
 
   Status Init(BitReader* reader);
-  Status Process(BitReader* reader, PaddedBytes* icc);
+  Status Process(PaddedBytes* icc);
   void Reset() {
     bits_to_skip_ = 0;
     decompressed_.clear();
+    reader = nullptr;
   }
 
  private:
-  static Status CheckEOI(BitReader* reader);
+  Status CheckEOI();
+  BitReader* reader = nullptr;
   size_t i_ = 0;
   size_t bits_to_skip_ = 0;
   size_t used_bits_base_ = 0;
   uint64_t enc_size_ = 0;
-  std::vector<uint8_t> context_map_;
   ANSCode code_;
   ANSSymbolReader ans_reader_;
   PaddedBytes decompressed_;

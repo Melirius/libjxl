@@ -26,7 +26,6 @@ Status DecodeBlockCtxMap(JxlMemoryManager* memory_manager, BitReader* br,
                          BlockCtxMap* block_ctx_map) {
   auto& dct = block_ctx_map->dc_thresholds;
   auto& qft = block_ctx_map->qf_thresholds;
-  auto& ctx_map = block_ctx_map->ctx_map;
   bool is_default = static_cast<bool>(br->ReadFixedBits<1>());
   if (is_default) {
     *block_ctx_map = BlockCtxMap();
@@ -45,14 +44,15 @@ Status DecodeBlockCtxMap(JxlMemoryManager* memory_manager, BitReader* br,
     i = U32Coder::Read(kQFThresholdDist, br) + 1;
   }
 
-  if (block_ctx_map->num_dc_ctxs * (qft.size() + 1) > 64) {
+  size_t num_contexts =
+      3 * kNumOrders * block_ctx_map->num_dc_ctxs * (qft.size() + 1);
+  if (num_contexts > 3 * kNumOrders * 64) {
     return JXL_FAILURE("Invalid block context map: too big");
   }
 
-  ctx_map.resize(3 * kNumOrders * block_ctx_map->num_dc_ctxs *
-                 (qft.size() + 1));
-  JXL_RETURN_IF_ERROR(
-      DecodeContextMap(memory_manager, &ctx_map, &block_ctx_map->num_ctxs, br));
+  JXL_ASSIGN_OR_RETURN(block_ctx_map->ctx_map,
+                       DecodeContextMap(memory_manager, num_contexts,
+                                        &block_ctx_map->num_ctxs, br));
   if (block_ctx_map->num_ctxs > 16) {
     return JXL_FAILURE("Invalid block context map: too many distinct contexts");
   }

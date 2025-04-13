@@ -1055,7 +1055,7 @@ JxlDecoderStatus JxlDecoderReadAllHeaders(JxlDecoder* dec) {
       return JXL_DEC_ERROR;
     }
     PaddedBytes decoded_icc{&dec->memory_manager};
-    status = dec->icc_reader->Process(reader.get(), &decoded_icc);
+    status = dec->icc_reader->Process(&decoded_icc);
     if (status.code() == StatusCode::kNotEnoughBytes) {
       return dec->RequestMoreInput();
     }

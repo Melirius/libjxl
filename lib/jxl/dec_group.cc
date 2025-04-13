@@ -473,9 +473,7 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
                         size_t nzeros_stride, size_t c, size_t bx, size_t by,
                         size_t lbx, AcStrategy acs,
                         const coeff_order_t* JXL_RESTRICT coeff_order,
-                        BitReader* JXL_RESTRICT br,
                         ANSSymbolReader* JXL_RESTRICT decoder,
-                        const std::vector<uint8_t>& context_map,
                         const uint8_t* qdc_row, const int32_t* qf_row,
                         const BlockCtxMap& block_ctx_map, ACPtr block,
                         size_t shift = 0) {
@@ -493,8 +491,7 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
   const int32_t nzero_ctx =
       block_ctx_map.NonZeroContext(predicted_nzeros, block_ctx) + ctx_offset;
 
-  size_t nzeros =
-      decoder->ReadHybridUintInlined<uses_lz77>(nzero_ctx, br, context_map);
+  size_t nzeros = decoder->ReadHybridUintInlined<uses_lz77>(nzero_ctx);
   if (nzeros > size - covered_blocks) {
     return JXL_FAILURE("Invalid AC: nzeros %" PRIuS " too large for %" PRIuS
                        " 8x8 blocks",
@@ -515,8 +512,7 @@ Status DecodeACVarBlock(size_t ctx_offset, size_t log2_covered_blocks,
     const size_t ctx =
         histo_offset + ZeroDensityContext(nzeros, k, covered_blocks,
                                           log2_covered_blocks, prev);
-    const size_t u_coeff =
-        decoder->ReadHybridUintInlined<uses_lz77>(ctx, br, context_map);
+    const size_t u_coeff = decoder->ReadHybridUintInlined<uses_lz77>(ctx);
     // Hand-rolled version of UnpackSigned, shifting before the conversion to
     // signed integer to avoid undefined behavior of shifting negative numbers.
     const size_t magnitude = u_coeff >> 1;
@@ -583,9 +579,9 @@ struct GetBlockFromBitstream : public GetBlock {
         JXL_RETURN_IF_ERROR(decode_ac_varblock(
             ctx_offset[pass], log2_covered_blocks, row_nzeros[pass][c],
             row_nzeros_top[pass][c], nzeros_stride, c, sbx, sby, bx, acs,
-            &coeff_orders[pass * coeff_order_size], readers[pass],
-            &decoders[pass], context_map[pass], quant_dc_row, qf_row,
-            *block_ctx_map, block[c], shift_for_pass[pass]));
+            &coeff_orders[pass * coeff_order_size], &decoders[pass],
+            quant_dc_row, qf_row, *block_ctx_map, block[c],
+            shift_for_pass[pass]));
       }
     }
     return true;
@@ -603,7 +599,6 @@ struct GetBlockFromBitstream : public GetBlock {
     coeff_order_size = dec_state->shared->coeff_order_size;
     coeff_orders =
         dec_state->shared->coeff_orders.data() + first_pass * coeff_order_size;
-    context_map = dec_state->context_map.data() + first_pass;
     readers = readers_;
     num_passes = num_passes_;
     shift_for_pass = frame_header.passes.shift + first_pass;
@@ -624,10 +619,8 @@ struct GetBlockFromBitstream : public GetBlock {
       }
       ctx_offset[pass] = cur_histogram * block_ctx_map->NumACContexts();
 
-      JXL_ASSIGN_OR_RETURN(
-          decoders[pass],
-          ANSSymbolReader::Create(&dec_state->code[pass + first_pass],
-                                  readers[pass]));
+      JXL_RETURN_IF_ERROR(decoders[pass].Init(
+          &dec_state->code[pass + first_pass], readers[pass]));
     }
     nzeros_stride = group_dec_cache->num_nzeroes[0].PixelsPerRow();
     for (size_t i = 0; i < num_passes; i++) {
@@ -641,7 +634,6 @@ struct GetBlockFromBitstream : public GetBlock {
   const uint32_t* shift_for_pass = nullptr;  // not owned
   const coeff_order_t* JXL_RESTRICT coeff_orders;
   size_t coeff_order_size;
-  const std::vector<uint8_t>* JXL_RESTRICT context_map;
   ANSSymbolReader decoders[kMaxNumPasses];
   BitReader* JXL_RESTRICT* JXL_RESTRICT readers;
   size_t num_passes;
