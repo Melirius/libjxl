@@ -495,8 +495,7 @@ struct FrameHeader : public Fields {
   uint64_t extensions;
 };
 
-Status ReadFrameHeader(BitReader* JXL_RESTRICT reader,
-                       FrameHeader* JXL_RESTRICT frame);
+Status ReadFrameHeader(BitReader& reader, FrameHeader& frame);
 
 // Shared by enc/dec. 5F and 13 are by far the most common for d1/2/4/8, 0
 // ensures low overhead for small images.

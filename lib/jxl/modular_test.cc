@@ -266,7 +266,7 @@ TEST(ModularTest, RoundtripExtraProperties) {
   {
     BitReader reader(writer.GetSpan());
     BitReaderScopedCloser closer(reader, status);
-    ASSERT_TRUE(ModularGenericDecompress(&reader, decoded, /*header=*/nullptr,
+    ASSERT_TRUE(ModularGenericDecompress(reader, decoded, /*header=*/nullptr,
                                          /*group_id=*/0, &options));
   }
   ASSERT_TRUE(status);

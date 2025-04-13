@@ -160,10 +160,10 @@ class ANSSymbolReader {
  public:
   // Invalid symbol reader, to be overwritten.
   ANSSymbolReader() = default;
-  Status Init(const ANSCode* code, BitReader* JXL_RESTRICT br,
+  Status Init(const ANSCode& code, BitReader& br,
               size_t distance_multiplier = 0);
 
-  Status AllReadsWithinBounds() { return br->AllReadsWithinBounds(); }
+  Status AllReadsWithinBounds() { return br_->AllReadsWithinBounds(); }
 
   JXL_INLINE size_t ReadSymbolANSWithoutRefill(const size_t histo_idx) {
     const uint32_t res = state_ & (ANS_TAB_SIZE - 1u);
@@ -177,10 +177,10 @@ class ANSSymbolReader {
 #if JXL_TRUE
     // Branchless version is about equally fast on SKX.
     const uint32_t new_state =
-        (state_ << 16u) | static_cast<uint32_t>(br->PeekFixedBits<16>());
+        (state_ << 16u) | static_cast<uint32_t>(br_->PeekFixedBits<16>());
     const bool normalize = state_ < (1u << 16u);
     state_ = normalize ? new_state : state_;
-    br->Consume(normalize ? 16 : 0);
+    br_->Consume(normalize ? 16 : 0);
 #else
     if (JXL_UNLIKELY(state_ < (1u << 16u))) {
       state_ = (state_ << 16u) | br->PeekFixedBits<16>();
@@ -194,7 +194,7 @@ class ANSSymbolReader {
   }
 
   JXL_INLINE size_t ReadSymbolHuffWithoutRefill(const size_t histo_idx) {
-    return huffman_data_[histo_idx].ReadSymbol(br);
+    return huffman_data_[histo_idx].ReadSymbol(*br_);
   }
 
   JXL_INLINE size_t ReadSymbolWithoutRefill(const size_t histo_idx) {
@@ -206,7 +206,7 @@ class ANSSymbolReader {
   }
 
   JXL_INLINE size_t ReadSymbol(const size_t histo_idx) {
-    br->Refill();
+    br_->Refill();
     return ReadSymbolWithoutRefill(histo_idx);
   }
 
@@ -255,15 +255,15 @@ class ANSSymbolReader {
                                                      uint32_t* value,
                                                      uint32_t* run) {
     JXL_DASSERT(IsHuffRleOnly());
-    br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
+    br_->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
     size_t token = ReadSymbolHuffWithoutRefill(ctx);
     if (JXL_UNLIKELY(token >= lz77_threshold_)) {
-      *run =
-          ReadHybridUintConfig(lz77_length_uint_, token - lz77_threshold_, br) +
-          lz77_min_length_ - 1;
+      *run = ReadHybridUintConfig(lz77_length_uint_, token - lz77_threshold_,
+                                  br_) +
+             lz77_min_length_ - 1;
       return;
     }
-    *value = ReadHybridUintConfig(configs[ctx], token, br);
+    *value = ReadHybridUintConfig(configs_[ctx], token, br_);
   }
   bool IsHuffRleOnly() const {
     if (lz77_window_ == nullptr) return false;
@@ -272,7 +272,7 @@ class ANSSymbolReader {
       if (huffman_data_[lz77_ctx_].table_[i].bits) return false;
       if (huffman_data_[lz77_ctx_].table_[i].value != 1) return false;
     }
-    if (configs[lz77_ctx_].split_token > 1) return false;
+    if (configs_[lz77_ctx_].split_token > 1) return false;
     return true;
   }
   bool UsesLZ77() { return lz77_window_ != nullptr; }
@@ -289,17 +289,18 @@ class ANSSymbolReader {
       }
     }
 
-    br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
+    br_->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
     size_t token = ReadSymbolWithoutRefill(ctx);
     if (uses_lz77) {
       if (JXL_UNLIKELY(token >= lz77_threshold_)) {
         num_to_copy_ = ReadHybridUintConfig(lz77_length_uint_,
-                                            token - lz77_threshold_, br) +
+                                            token - lz77_threshold_, br_) +
                        lz77_min_length_;
-        br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
+        br_->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
         // Distance code.
         size_t d_token = ReadSymbolWithoutRefill(lz77_ctx_);
-        size_t distance = ReadHybridUintConfig(configs[lz77_ctx_], d_token, br);
+        size_t distance =
+            ReadHybridUintConfig(configs_[lz77_ctx_], d_token, br_);
         if (JXL_LIKELY(distance < num_special_distances_)) {
           distance = special_distances_[distance];
         } else {
@@ -330,7 +331,7 @@ class ANSSymbolReader {
         return ret;
       }
     }
-    size_t ret = ReadHybridUintConfig(configs[ctx], token, br);
+    size_t ret = ReadHybridUintConfig(configs_[ctx], token, br_);
     if (uses_lz77 && lz77_window_)
       lz77_window_[(num_decoded_++) & kWindowMask] = ret;
     return ret;
@@ -375,7 +376,7 @@ class ANSSymbolReader {
     AliasTable::Symbol symbol =
         AliasTable::Lookup(table, res, log_entry_size_, entry_size_minus_1_);
     if (symbol.freq != ANS_TAB_SIZE) return false;
-    if (configs[ctx].split_token <= symbol.value) return false;
+    if (configs_[ctx].split_token <= symbol.value) return false;
     if (symbol.value >= lz77_threshold_) return false;
     *value = symbol.value;
     if (lz77_window_) {
@@ -436,13 +437,13 @@ class ANSSymbolReader {
   }
 
  private:
-  BitReader* JXL_RESTRICT br;
+  BitReader* JXL_RESTRICT br_;
   const uint8_t* JXL_RESTRICT context_map_;             // not owned
   const AliasTable::Entry* JXL_RESTRICT alias_tables_;  // not owned
   const HuffmanDecodingData* huffman_data_;
   bool use_prefix_code_;
   uint32_t state_ = ANS_SIGNATURE << 16u;
-  const HybridUintConfig* JXL_RESTRICT configs;
+  const HybridUintConfig* JXL_RESTRICT configs_;
   uint32_t log_alpha_size_{};
   uint32_t log_entry_size_{};
   uint32_t entry_size_minus_1_{};
@@ -464,14 +465,14 @@ class ANSSymbolReader {
   uint32_t num_special_distances_{};
 };
 
-Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
-                        size_t num_contexts, ANSCode* code,
-                        bool disallow_lz77 = false);
+StatusOr<ANSCode> DecodeHistograms(JxlMemoryManager* memory_manager_,
+                                   BitReader& br, size_t num_contexts,
+                                   bool disallow_lz77 = false);
 
 // Exposed for tests.
 Status DecodeUintConfigs(size_t log_alpha_size,
-                         std::vector<HybridUintConfig>* uint_config,
-                         BitReader* br);
+                         std::vector<HybridUintConfig>& uint_config,
+                         BitReader& br);
 
 }  // namespace jxl
 

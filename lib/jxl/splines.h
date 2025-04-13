@@ -111,7 +111,7 @@ class Splines {
 
   void Clear();
 
-  Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
+  Status Decode(JxlMemoryManager* memory_manager, BitReader& br,
                 size_t num_pixels);
 
   void AddTo(Image3F* opsin, const Rect& opsin_rect) const;

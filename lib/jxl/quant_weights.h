@@ -399,9 +399,9 @@ class DequantMatrices {
     }
   }
 
-  Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
+  Status Decode(JxlMemoryManager* memory_manager, BitReader& br,
                 ModularFrameDecoder* modular_frame_decoder = nullptr);
-  Status DecodeDC(BitReader* br);
+  Status DecodeDC(BitReader& br);
 
   const std::vector<QuantEncoding>& encodings() const { return encodings_; }
 

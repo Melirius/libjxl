@@ -25,7 +25,7 @@ void PrepareNoiseInput(const PassesDecoderState& dec_state,
                        size_t thread);
 
 // Must only call if FrameHeader.flags.kNoise.
-Status DecodeNoise(BitReader* br, NoiseParams* noise_params);
+Status DecodeNoise(BitReader& br, NoiseParams* noise_params);
 
 }  // namespace jxl
 

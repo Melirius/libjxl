@@ -175,7 +175,7 @@ Status DequantMatricesSetCustomDC(JxlMemoryManager* memory_manager,
   writer.ZeroPadToByte();
   BitReader br(writer.GetSpan());
   // Called only in the encoder: should fail only for programmer errors.
-  JXL_RETURN_IF_ERROR(matrices->DecodeDC(&br));
+  JXL_RETURN_IF_ERROR(matrices->DecodeDC(br));
   JXL_RETURN_IF_ERROR(br.Close());
   return true;
 }
@@ -201,7 +201,7 @@ Status DequantMatricesRoundtrip(JxlMemoryManager* memory_manager,
   writer.ZeroPadToByte();
   BitReader br(writer.GetSpan());
   // Called only in the encoder: should fail only for programmer errors.
-  JXL_RETURN_IF_ERROR(matrices->Decode(memory_manager, &br));
+  JXL_RETURN_IF_ERROR(matrices->Decode(memory_manager, br));
   JXL_RETURN_IF_ERROR(br.Close());
   return true;
 }

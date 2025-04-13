@@ -25,8 +25,6 @@ namespace jxl {
 constexpr U32Enc kTocDist(Bits(10), BitsOffset(14, 1024), BitsOffset(22, 17408),
                           BitsOffset(30, 4211712));
 
-size_t MaxBits(size_t num_sizes);
-
 // TODO(veluca): move these to FrameDimensions.
 static JXL_INLINE size_t AcGroupIndex(size_t pass, size_t group,
                                       size_t num_groups, size_t num_dc_groups) {
@@ -41,15 +39,17 @@ static JXL_INLINE size_t NumTocEntries(size_t num_groups, size_t num_dc_groups,
 }
 
 Status ReadToc(JxlMemoryManager* memory_manager, size_t toc_entries,
-               BitReader* JXL_RESTRICT reader,
-               std::vector<uint32_t>* JXL_RESTRICT sizes,
-               std::vector<coeff_order_t>* JXL_RESTRICT permutation);
+               BitReader& reader, std::vector<uint32_t>& sizes,
+               std::vector<coeff_order_t>& permutation);
 
-Status ReadGroupOffsets(JxlMemoryManager* memory_manager, size_t toc_entries,
-                        BitReader* JXL_RESTRICT reader,
-                        std::vector<uint64_t>* JXL_RESTRICT offsets,
-                        std::vector<uint32_t>* JXL_RESTRICT sizes,
-                        uint64_t* total_size);
+struct GroupOffsets {
+  std::vector<uint64_t> offsets;
+  std::vector<uint32_t> sizes;
+  uint64_t total_size;
+};
+
+StatusOr<GroupOffsets> ReadGroupOffsets(JxlMemoryManager* memory_manager,
+                                        size_t toc_entries, BitReader& reader);
 
 }  // namespace jxl
 

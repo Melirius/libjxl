@@ -139,7 +139,7 @@ bool TreeToLookupTable(const FlatTree &tree,
 Status ValidateChannelDimensions(const Image &image,
                                  const ModularOptions &options);
 
-Status ModularGenericDecompress(BitReader *br, Image &image,
+Status ModularGenericDecompress(BitReader &br, Image &image,
                                 GroupHeader *header, size_t group_id,
                                 ModularOptions *options,
                                 bool undo_transforms = true,

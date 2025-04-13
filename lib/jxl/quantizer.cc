@@ -139,9 +139,9 @@ QuantizerParams Quantizer::GetParams() const {
   return params;
 }
 
-Status Quantizer::Decode(BitReader* reader) {
+Status Quantizer::Decode(BitReader& reader) {
   QuantizerParams params;
-  JXL_RETURN_IF_ERROR(Bundle::Read(reader, &params));
+  JXL_RETURN_IF_ERROR(Bundle::Read(&reader, &params));
   global_scale_ = static_cast<int>(params.global_scale);
   quant_dc_ = static_cast<int>(params.quant_dc);
   RecomputeFromGlobalScale();

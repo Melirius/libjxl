@@ -52,7 +52,7 @@ JXL_BOOL JxlICCProfileDecode(const JxlMemoryManager* memory_manager,
   jxl::PaddedBytes decompressed(&local_memory_manager);
   jxl::BitReader bit_reader(
       jxl::Span<const uint8_t>(compressed_icc, compressed_icc_size));
-  JXL_RETURN_IF_ERROR(icc_reader.Init(&bit_reader));
+  JXL_RETURN_IF_ERROR(icc_reader.Init(bit_reader));
   JXL_RETURN_IF_ERROR(icc_reader.Process(&decompressed));
   JXL_RETURN_IF_ERROR(bit_reader.Close());
   *icc_size = decompressed.size();

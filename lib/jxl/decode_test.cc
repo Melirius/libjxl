@@ -3906,27 +3906,23 @@ void AnalyzeCodestream(const std::vector<uint8_t>& data,
       frame_header.nonserialized_is_preview = true;
       has_preview = false;
     }
-    ASSERT_TRUE(ReadFrameHeader(&br, &frame_header));
+    ASSERT_TRUE(ReadFrameHeader(br, frame_header));
     p.header_end =
         add_offset(jxl::DivCeil(br.TotalBitsConsumed(), jxl::kBitsPerByte));
     jxl::FrameDimensions frame_dim = frame_header.ToFrameDimensions();
-    uint64_t groups_total_size;
     const size_t toc_entries =
         jxl::NumTocEntries(frame_dim.num_groups, frame_dim.num_dc_groups,
                            frame_header.passes.num_passes);
-    std::vector<uint64_t> section_offsets;
-    std::vector<uint32_t> section_sizes;
-    ASSERT_TRUE(ReadGroupOffsets(memory_manager, toc_entries, &br,
-                                 &section_offsets, &section_sizes,
-                                 &groups_total_size));
+    JXL_TEST_ASSIGN_OR_DIE(jxl::GroupOffsets groups,
+                           ReadGroupOffsets(memory_manager, toc_entries, br));
     EXPECT_EQ(br.TotalBitsConsumed() % jxl::kBitsPerByte, 0);
     size_t sections_start = br.TotalBitsConsumed() / jxl::kBitsPerByte;
     p.toc_end = add_offset(sections_start);
     for (size_t i = 0; i < toc_entries; ++i) {
-      size_t end = sections_start + section_offsets[i] + section_sizes[i];
+      size_t end = sections_start + groups.offsets[i] + groups.sizes[i];
       p.section_end.push_back(add_offset(end));
     }
-    br.SkipBits(groups_total_size * jxl::kBitsPerByte);
+    br.SkipBits(groups.total_size * jxl::kBitsPerByte);
     streampos->frames.push_back(p);
   }
   streampos->codestream_end = add_offset(codestream.size());

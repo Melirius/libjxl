@@ -115,7 +115,7 @@ class Quantizer {
 
   QuantizerParams GetParams() const;
 
-  Status Decode(BitReader* reader);
+  Status Decode(BitReader& reader);
 
   void DumpQuantizationMap(const ImageI& raw_quant_field) const;
 

@@ -150,12 +150,12 @@ void PrepareNoiseInput(const PassesDecoderState& dec_state,
   }
 }
 
-void DecodeFloatParam(float precision, float* val, BitReader* br) {
-  const int absval_quant = br->ReadFixedBits<10>();
+void DecodeFloatParam(float precision, float* val, BitReader& br) {
+  const int absval_quant = br.ReadFixedBits<10>();
   *val = absval_quant / precision;
 }
 
-Status DecodeNoise(BitReader* br, NoiseParams* noise_params) {
+Status DecodeNoise(BitReader& br, NoiseParams* noise_params) {
   for (float& i : noise_params->lut) {
     DecodeFloatParam(kNoisePrecision, &i, br);
   }

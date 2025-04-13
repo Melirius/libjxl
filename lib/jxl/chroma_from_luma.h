@@ -54,7 +54,7 @@ struct ColorCorrelation {
     return base_correlation_b_ + b_factor * color_scale_;
   }
 
-  Status DecodeDC(BitReader* br);
+  Status DecodeDC(BitReader& br);
 
   // We consider a CfL map to be JPEG-reconstruction-compatible if base
   // correlation is 0, no DC correlation is used, and we use the default color
@@ -128,7 +128,7 @@ struct ColorCorrelationMap {
                                               bool XYB = true);
 
   const ColorCorrelation& base() const { return base_; }
-  Status DecodeDC(BitReader* br) { return base_.DecodeDC(br); }
+  Status DecodeDC(BitReader& br) { return base_.DecodeDC(br); }
 
   ImageSB ytox_map;
   ImageSB ytob_map;

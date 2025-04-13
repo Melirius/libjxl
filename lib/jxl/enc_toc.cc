@@ -20,6 +20,17 @@
 #include "lib/jxl/toc.h"
 
 namespace jxl {
+
+namespace {
+
+size_t MaxBits(const size_t num_sizes) {
+  const size_t entry_bits = U32Coder::MaxEncodedBits(kTocDist) * num_sizes;
+  // permutation bit (not its tokens!), padding, entries, padding.
+  return 1 + kBitsPerByte + entry_bits + kBitsPerByte;
+}
+
+}  // namespace
+
 Status WriteGroupOffsets(
     const std::vector<std::unique_ptr<BitWriter>>& group_codes,
     const std::vector<coeff_order_t>& permutation,

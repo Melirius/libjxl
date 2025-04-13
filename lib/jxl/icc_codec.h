@@ -21,21 +21,22 @@
 
 namespace jxl {
 
-struct ICCReader {
+class ICCReader {
+ public:
   explicit ICCReader(JxlMemoryManager* memory_manager)
       : decompressed_(memory_manager) {}
 
-  Status Init(BitReader* reader);
+  Status Init(BitReader& reader);
   Status Process(PaddedBytes* icc);
   void Reset() {
     bits_to_skip_ = 0;
     decompressed_.clear();
-    reader = nullptr;
+    reader_ = nullptr;
   }
 
  private:
   Status CheckEOI();
-  BitReader* reader = nullptr;
+  BitReader* reader_ = nullptr;
   size_t i_ = 0;
   size_t bits_to_skip_ = 0;
   size_t used_bits_base_ = 0;

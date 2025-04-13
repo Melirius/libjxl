@@ -197,7 +197,7 @@ std::string ModularStreamId::DebugString() const {
 }
 #endif
 
-Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
+Status ModularFrameDecoder::DecodeGlobalInfo(BitReader& reader,
                                              const FrameHeader& frame_header,
                                              bool allow_truncated_group) {
   JxlMemoryManager* memory_manager = this->memory_manager();
@@ -210,18 +210,18 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
   }
   do_color = decode_color;
   size_t nb_extra = metadata.extra_channel_info.size();
-  bool has_tree = static_cast<bool>(reader->ReadBits(1));
+  bool has_tree = static_cast<bool>(reader.ReadBits(1));
   if (!allow_truncated_group ||
-      reader->TotalBitsConsumed() < reader->TotalBytes() * kBitsPerByte) {
+      reader.TotalBitsConsumed() < reader.TotalBytes() * kBitsPerByte) {
     if (has_tree) {
       size_t tree_size_limit =
           std::min(static_cast<size_t>(1 << 22),
                    1024 + frame_dim.xsize * frame_dim.ysize *
                               (nb_chans + nb_extra) / 16);
       JXL_RETURN_IF_ERROR(
-          DecodeTree(memory_manager, reader, &tree, tree_size_limit));
-      JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, reader,
-                                           (tree.size() + 1) / 2, &code));
+          DecodeTree(memory_manager, reader, tree, tree_size_limit));
+      JXL_ASSIGN_OR_RETURN(code, DecodeHistograms(memory_manager, reader,
+                                                  (tree.size() + 1) / 2));
     }
   }
   if (!do_color) nb_chans = 0;
@@ -318,6 +318,8 @@ void ModularFrameDecoder::MaybeDropFullImage() {
   }
 }
 
+// Here reader can be nullptr if zerofill is true.
+// TODO(Ivan) : make cleaner interface
 Status ModularFrameDecoder::DecodeGroup(
     const FrameHeader& frame_header, const Rect& rect, BitReader* reader,
     int minShift, int maxShift, const ModularStreamId& stream, bool zerofill,
@@ -379,7 +381,7 @@ Status ModularFrameDecoder::DecodeGroup(
   ModularOptions options;
   if (!zerofill) {
     auto status = ModularGenericDecompress(
-        reader, gi, /*header=*/nullptr, stream.ID(frame_dim), &options,
+        *reader, gi, /*header=*/nullptr, stream.ID(frame_dim), &options,
         /*undo_transforms=*/true, &tree, &code, allow_truncated);
     if (!allow_truncated) JXL_RETURN_IF_ERROR(status);
     if (status.IsFatalError()) return status;
@@ -415,7 +417,7 @@ Status ModularFrameDecoder::DecodeGroup(
 }
 
 Status ModularFrameDecoder::DecodeVarDCTDC(const FrameHeader& frame_header,
-                                           size_t group_id, BitReader* reader,
+                                           size_t group_id, BitReader& reader,
                                            PassesDecoderState* dec_state) {
   JxlMemoryManager* memory_manager = dec_state->memory_manager();
   const Rect r = dec_state->shared->frame_dim.DCGroupRect(group_id);
@@ -430,8 +432,8 @@ Status ModularFrameDecoder::DecodeVarDCTDC(const FrameHeader& frame_header,
                        Image::Create(memory_manager, r.xsize(), r.ysize(),
                                      full_image.bitdepth, 3));
   size_t stream_id = ModularStreamId::VarDCTDC(group_id).ID(frame_dim);
-  reader->Refill();
-  size_t extra_precision = reader->ReadFixedBits<2>();
+  reader.Refill();
+  size_t extra_precision = reader.ReadFixedBits<2>();
   float mul = 1.0f / (1 << extra_precision);
   ModularOptions options;
   for (size_t c = 0; c < 3; c++) {
@@ -455,14 +457,14 @@ Status ModularFrameDecoder::DecodeVarDCTDC(const FrameHeader& frame_header,
 }
 
 Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
-                                             size_t group_id, BitReader* reader,
+                                             size_t group_id, BitReader& reader,
                                              PassesDecoderState* dec_state) {
   JxlMemoryManager* memory_manager = dec_state->memory_manager();
   const Rect r = dec_state->shared->frame_dim.DCGroupRect(group_id);
   JXL_DEBUG_V(6, "Decoding AcMetadata with rect %s", Description(r).c_str());
   size_t upper_bound = r.xsize() * r.ysize();
-  reader->Refill();
-  size_t count = reader->ReadBits(CeilLog2Nonzero(upper_bound)) + 1;
+  reader.Refill();
+  size_t count = reader.ReadBits(CeilLog2Nonzero(upper_bound)) + 1;
   size_t stream_id = ModularStreamId::ACMetadata(group_id).ID(frame_dim);
   // YToX, YToB, ACS + QF, EPF
   JXL_ASSIGN_OR_RETURN(Image image,
@@ -784,10 +786,10 @@ static constexpr const float kAlmostZero = 1e-8f;
 
 Status ModularFrameDecoder::DecodeQuantTable(
     JxlMemoryManager* memory_manager, size_t required_size_x,
-    size_t required_size_y, BitReader* br, QuantEncoding* encoding, size_t idx,
+    size_t required_size_y, BitReader& br, QuantEncoding& encoding, size_t idx,
     ModularFrameDecoder* modular_frame_decoder) {
-  JXL_RETURN_IF_ERROR(F16Coder::Read(br, &encoding->qraw.qtable_den));
-  if (encoding->qraw.qtable_den < kAlmostZero) {
+  JXL_RETURN_IF_ERROR(F16Coder::Read(&br, &encoding.qraw.qtable_den));
+  if (encoding.qraw.qtable_den < kAlmostZero) {
     // qtable[] values are already checked for <= 0 so the denominator may not
     // be negative.
     return JXL_FAILURE("Invalid qtable_den: value too small");
@@ -807,14 +809,14 @@ Status ModularFrameDecoder::DecodeQuantTable(
                                                  0, &options,
                                                  /*undo_transforms=*/true));
   }
-  if (!encoding->qraw.qtable) {
-    encoding->qraw.qtable =
+  if (!encoding.qraw.qtable) {
+    encoding.qraw.qtable =
         new std::vector<int>(required_size_x * required_size_y * 3);
   } else {
-    JXL_ENSURE(encoding->qraw.qtable->size() ==
+    JXL_ENSURE(encoding.qraw.qtable->size() ==
                required_size_x * required_size_y * 3);
   }
-  int* qtable = encoding->qraw.qtable->data();
+  int* qtable = encoding.qraw.qtable->data();
   for (size_t c = 0; c < 3; c++) {
     for (size_t y = 0; y < required_size_y; y++) {
       int32_t* JXL_RESTRICT row = image.channel[c].Row(y);

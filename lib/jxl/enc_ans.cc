@@ -695,7 +695,6 @@ Status EntropyEncodingData::ChooseUintConfigs(
     const HistogramParams& params,
     const std::vector<std::vector<Token>>& tokens,
     std::vector<Histogram>& clustered_histograms) {
-
   log_alpha_size = lz77.enabled ? 8 : 7;  // Sane default.
   if (ans_fuzzer_friendly_) {
     uint_config.assign(1, HybridUintConfig(7, 0, 0));
@@ -914,11 +913,10 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
       histo_writer = &encoded_histograms.back();
     }
     const auto& body = [&]() -> Status {
-      JXL_ASSIGN_OR_RETURN(
-          size_t ans_cost,
-          BuildAndStoreANSEncodingData(
-              memory_manager, params.ans_histogram_strategy,
-              clustered_histograms[c], histo_writer));
+      JXL_ASSIGN_OR_RETURN(size_t ans_cost,
+                           BuildAndStoreANSEncodingData(
+                               memory_manager, params.ans_histogram_strategy,
+                               clustered_histograms[c], histo_writer));
       cost += ans_cost;
       return true;
     };

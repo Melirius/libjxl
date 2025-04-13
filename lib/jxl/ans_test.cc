@@ -63,12 +63,11 @@ void RoundtripTestcase(int n_histograms, int alphabet_size,
 
   ASSERT_EQ(br.ReadBits(16), kMagic1);
 
-  ANSCode decoded_codes;
-  ASSERT_TRUE(
-      DecodeHistograms(memory_manager, &br, n_histograms, &decoded_codes));
+  JXL_TEST_ASSIGN_OR_DIE(ANSCode decoded_codes,
+                         DecodeHistograms(memory_manager, br, n_histograms));
   ASSERT_EQ(decoded_codes.context_map, codes.context_map);
   ANSSymbolReader reader;
-  ASSERT_TRUE(reader.Init(&decoded_codes, &br));
+  ASSERT_TRUE(reader.Init(decoded_codes, br));
 
   for (const Token& symbol : input_values) {
     uint32_t read_symbol = reader.ReadHybridUint(symbol.context);
@@ -187,7 +186,7 @@ TEST(ANSTest, UintConfigRoundtrip) {
         }));
     writer.ZeroPadToByte();
     BitReader br(writer.GetSpan());
-    EXPECT_TRUE(DecodeUintConfigs(log_alpha_size, &uint_config_dec, &br));
+    EXPECT_TRUE(DecodeUintConfigs(log_alpha_size, uint_config_dec, br));
     EXPECT_TRUE(br.Close());
     for (size_t i = 0; i < uint_config.size(); i++) {
       EXPECT_EQ(uint_config[i].split_token, uint_config_dec[i].split_token);
@@ -239,11 +238,11 @@ void TestCheckpointing(bool ans, bool lz77) {
   {
     BitReaderScopedCloser bc(br, status);
 
-    ANSCode decoded_codes;
-    ASSERT_TRUE(DecodeHistograms(memory_manager, &br, 1, &decoded_codes));
+    JXL_TEST_ASSIGN_OR_DIE(ANSCode decoded_codes,
+                           DecodeHistograms(memory_manager, br, 1));
     ASSERT_EQ(decoded_codes.context_map, codes.context_map);
     ANSSymbolReader reader;
-    ASSERT_TRUE(reader.Init(&decoded_codes, &br));
+    ASSERT_TRUE(reader.Init(decoded_codes, br));
 
     ANSSymbolReader::Checkpoint checkpoint;
     size_t br_pos = 0;

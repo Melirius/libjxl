@@ -184,7 +184,7 @@ TEST(SplinesTest, Serialization) {
   BitReader reader(writer.GetSpan());
   Splines decoded_splines;
   ASSERT_TRUE(
-      decoded_splines.Decode(memory_manager, &reader, /*num_pixels=*/1000));
+      decoded_splines.Decode(memory_manager, reader, /*num_pixels=*/1000));
   ASSERT_TRUE(reader.JumpToByteBoundary());
   EXPECT_EQ(reader.TotalBitsConsumed(), bits_written);
   ASSERT_TRUE(reader.Close());
@@ -249,7 +249,7 @@ TEST(SplinesTest, TooManySplinesTest) {
   BitReader reader(writer.GetSpan());
   Splines decoded_splines;
   EXPECT_FALSE(
-      decoded_splines.Decode(memory_manager, &reader, /*num_pixels=*/1000));
+      decoded_splines.Decode(memory_manager, reader, /*num_pixels=*/1000));
   EXPECT_TRUE(reader.Close());
 }
 

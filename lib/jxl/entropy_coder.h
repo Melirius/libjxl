@@ -41,9 +41,6 @@ static constexpr U32Enc kDCThresholdDist(Bits(4), BitsOffset(8, 16),
 static constexpr U32Enc kQFThresholdDist(Bits(2), BitsOffset(3, 4),
                                          BitsOffset(5, 12), BitsOffset(8, 44));
 
-Status DecodeBlockCtxMap(JxlMemoryManager* memory_manager, BitReader* br,
-                         BlockCtxMap* block_ctx_map);
-
 }  // namespace jxl
 
 #endif  // LIB_JXL_ENTROPY_CODER_H_

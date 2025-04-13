@@ -96,7 +96,7 @@ class ModularFrameDecoder {
   explicit ModularFrameDecoder(JxlMemoryManager* memory_manager)
       : memory_manager_(memory_manager), full_image(memory_manager) {}
   void Init(const FrameDimensions& new_frame_dim) { frame_dim = new_frame_dim; }
-  Status DecodeGlobalInfo(BitReader* reader, const FrameHeader& frame_header,
+  Status DecodeGlobalInfo(BitReader& reader, const FrameHeader& frame_header,
                           bool allow_truncated_group);
   Status DecodeGroup(const FrameHeader& frame_header, const Rect& rect,
                      BitReader* reader, int minShift, int maxShift,
@@ -106,16 +106,16 @@ class ModularFrameDecoder {
                      bool allow_truncated, bool* should_run_pipeline = nullptr);
   // Decodes a VarDCT DC group (`group_id`) from the given `reader`.
   Status DecodeVarDCTDC(const FrameHeader& frame_header, size_t group_id,
-                        BitReader* reader, PassesDecoderState* dec_state);
+                        BitReader& reader, PassesDecoderState* dec_state);
   // Decodes a VarDCT AC Metadata group (`group_id`) from the given `reader`.
   Status DecodeAcMetadata(const FrameHeader& frame_header, size_t group_id,
-                          BitReader* reader, PassesDecoderState* dec_state);
+                          BitReader& reader, PassesDecoderState* dec_state);
   // Decodes a RAW quant table from `br` into the given `encoding`, of size
   // `required_size_x x required_size_y`. If `modular_frame_decoder` is passed,
   // its global tree is used, otherwise no global tree is used.
   static Status DecodeQuantTable(JxlMemoryManager* memory_manager,
                                  size_t required_size_x, size_t required_size_y,
-                                 BitReader* br, QuantEncoding* encoding,
+                                 BitReader& br, QuantEncoding& encoding,
                                  size_t idx,
                                  ModularFrameDecoder* modular_frame_decoder);
   // if inplace is true, this can only be called once

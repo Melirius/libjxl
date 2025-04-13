@@ -56,8 +56,7 @@ class FrameDecoder {
   void SetCoalescing(bool c) { coalescing_ = c; }
 
   // Read FrameHeader and table of contents from the given BitReader.
-  Status InitFrame(BitReader* JXL_RESTRICT br, ImageBundle* decoded,
-                   bool is_preview);
+  Status InitFrame(BitReader& br, ImageBundle* decoded, bool is_preview);
 
   // Checks frame dimensions for their limits, and sets the output
   // image buffer.
@@ -241,12 +240,12 @@ class FrameDecoder {
   }
 
  private:
-  Status ProcessDCGlobal(BitReader* br);
-  Status ProcessDCGroup(size_t dc_group_id, BitReader* br);
+  Status ProcessDCGlobal(BitReader& br);
+  Status ProcessDCGroup(size_t dc_group_id, BitReader& br);
   Status FinalizeDC();
   Status AllocateOutput();
-  Status ProcessACGlobal(BitReader* br);
-  Status ProcessACGroup(size_t ac_group_id, BitReader* JXL_RESTRICT* br,
+  Status ProcessACGlobal(BitReader& br);
+  Status ProcessACGroup(size_t ac_group_id, BitReader* JXL_RESTRICT* readers,
                         size_t num_passes, size_t thread, bool force_draw,
                         bool dc_only);
   void MarkSections(const SectionInfo* sections, size_t num,

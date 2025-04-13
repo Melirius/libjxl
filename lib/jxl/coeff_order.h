@@ -52,10 +52,10 @@ uint32_t CoeffOrderContext(uint32_t val);
 
 Status DecodeCoeffOrders(JxlMemoryManager* memory_manager, uint16_t used_orders,
                          uint32_t used_acs, coeff_order_t* order,
-                         BitReader* br);
+                         BitReader& br);
 
 Status DecodePermutation(JxlMemoryManager* memory_manager, size_t skip,
-                         size_t size, coeff_order_t* order, BitReader* br);
+                         size_t size, coeff_order_t* order, BitReader& br);
 
 }  // namespace jxl
 

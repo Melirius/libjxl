@@ -620,7 +620,7 @@ struct GetBlockFromBitstream : public GetBlock {
       ctx_offset[pass] = cur_histogram * block_ctx_map->NumACContexts();
 
       JXL_RETURN_IF_ERROR(decoders[pass].Init(
-          &dec_state->code[pass + first_pass], readers[pass]));
+          dec_state->code[pass + first_pass], *(readers[pass])));
     }
     nzeros_stride = group_dec_cache->num_nzeroes[0].PixelsPerRow();
     for (size_t i = 0; i < num_passes; i++) {

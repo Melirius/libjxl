@@ -1041,7 +1041,8 @@ JxlDecoderStatus JxlDecoderReadAllHeaders(JxlDecoder* dec) {
   reader->SkipBits(dec->codestream_bits_ahead);
 
   if (dec->metadata.m.color_encoding.WantICC()) {
-    jxl::Status status = dec->icc_reader->Init(reader.get());
+    // TODO(Ivan) : make less clumsy
+    jxl::Status status = dec->icc_reader->Init(*(reader.get()));
     // Always check AllReadsWithinBounds, not all the C++ decoder implementation
     // handles reader out of bounds correctly  yet (e.g. context map). Not
     // checking AllReadsWithinBounds can cause reader->Close() to trigger an
@@ -1249,8 +1250,9 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       Span<const uint8_t> span;
       JXL_API_RETURN_IF_ERROR(dec->GetCodestreamInput(&span));
       auto reader = GetBitReader(span);
+      // TODO(Ivan) : make less clumsy
       jxl::Status status = dec->frame_dec->InitFrame(
-          reader.get(), dec->ib.get(), dec->preview_frame);
+          *(reader.get()), dec->ib.get(), dec->preview_frame);
       if (!reader->AllReadsWithinBounds() ||
           status.code() == StatusCode::kNotEnoughBytes) {
         return dec->RequestMoreInput();

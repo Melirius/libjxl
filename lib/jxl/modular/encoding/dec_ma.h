@@ -60,7 +60,7 @@ struct PropertyDecisionNode {
 
 using Tree = std::vector<PropertyDecisionNode>;
 
-Status DecodeTree(JxlMemoryManager *memory_manager, BitReader *br, Tree *tree,
+Status DecodeTree(JxlMemoryManager *memory_manager, BitReader &br, Tree &tree,
                   size_t tree_size_limit);
 
 }  // namespace jxl

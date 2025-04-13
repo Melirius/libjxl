@@ -324,20 +324,20 @@ Status UnpredictICC(const uint8_t* enc, size_t size, PaddedBytes* result) {
   return true;
 }
 
-Status ICCReader::Init(BitReader* reader_) {
-  reader = reader_;
+Status ICCReader::Init(BitReader& reader) {
+  reader_ = &reader;
   JXL_RETURN_IF_ERROR(CheckEOI());
   JxlMemoryManager* memory_manager = decompressed_.memory_manager();
-  used_bits_base_ = reader->TotalBitsConsumed();
+  used_bits_base_ = reader.TotalBitsConsumed();
   if (bits_to_skip_ == 0) {
-    enc_size_ = U64Coder::Read(reader);
+    enc_size_ = U64Coder::Read(&reader);
     if (enc_size_ > 268435456) {
       // Avoid too large memory allocation for invalid file.
       return JXL_FAILURE("Too large encoded profile");
     }
-    JXL_RETURN_IF_ERROR(
-        DecodeHistograms(memory_manager, reader, kNumICCContexts, &code_));
-    JXL_RETURN_IF_ERROR(ans_reader_.Init(&code_, reader));
+    JXL_ASSIGN_OR_RETURN(
+        code_, DecodeHistograms(memory_manager, reader, kNumICCContexts));
+    JXL_RETURN_IF_ERROR(ans_reader_.Init(code_, reader));
     i_ = 0;
     JXL_RETURN_IF_ERROR(
         decompressed_.resize(std::min<size_t>(i_ + 0x400, enc_size_)));
@@ -354,21 +354,21 @@ Status ICCReader::Init(BitReader* reader_) {
       JXL_RETURN_IF_ERROR(CheckEOI());
       JXL_RETURN_IF_ERROR(CheckPreamble(decompressed_, enc_size_));
     }
-    bits_to_skip_ = reader->TotalBitsConsumed() - used_bits_base_;
+    bits_to_skip_ = reader.TotalBitsConsumed() - used_bits_base_;
   } else {
-    JXL_RETURN_IF_ERROR(ans_reader_.Init(&code_, reader));
-    reader->SkipBits(bits_to_skip_);
+    JXL_RETURN_IF_ERROR(ans_reader_.Init(code_, reader));
+    reader.SkipBits(bits_to_skip_);
   }
   return true;
 }
 
 Status ICCReader::Process(PaddedBytes* icc) {
-  if (reader == nullptr) return JXL_FAILURE("ICCReader not initialized");
+  if (reader_ == nullptr) return JXL_FAILURE("ICCReader not initialized");
   ANSSymbolReader::Checkpoint checkpoint;
   size_t saved_i = 0;
   auto save = [&]() {
     ans_reader_.Save(&checkpoint);
-    bits_to_skip_ = reader->TotalBitsConsumed() - used_bits_base_;
+    bits_to_skip_ = reader_->TotalBitsConsumed() - used_bits_base_;
     saved_i = i_;
   };
   save();
@@ -388,7 +388,7 @@ Status ICCReader::Process(PaddedBytes* icc) {
       save();
       if ((i_ > 0) && (((i_ & 0xFFFF) == 0))) {
         float used_bytes =
-            (reader->TotalBitsConsumed() - used_bits_base_) / 8.0f;
+            (reader_->TotalBitsConsumed() - used_bits_base_) / 8.0f;
         if (i_ > used_bytes * 256) return JXL_FAILURE("Corrupted stream");
       }
       JXL_RETURN_IF_ERROR(
@@ -399,7 +399,7 @@ Status ICCReader::Process(PaddedBytes* icc) {
         ICCANSContext(i_, decompressed_[i_ - 1], decompressed_[i_ - 2]));
   }
   JXL_RETURN_IF_ERROR(check_and_restore());
-  bits_to_skip_ = reader->TotalBitsConsumed() - used_bits_base_;
+  bits_to_skip_ = reader_->TotalBitsConsumed() - used_bits_base_;
   if (!ans_reader_.CheckANSFinalState()) {
     return JXL_FAILURE("Corrupted ICC profile");
   }
@@ -409,8 +409,8 @@ Status ICCReader::Process(PaddedBytes* icc) {
 }
 
 Status ICCReader::CheckEOI() {
-  if (reader == nullptr) return JXL_FAILURE("ICCReader not initialized");
-  if (reader->AllReadsWithinBounds()) return true;
+  if (reader_ == nullptr) return JXL_FAILURE("ICCReader not initialized");
+  if (reader_->AllReadsWithinBounds()) return true;
   return JXL_NOT_ENOUGH_BYTES("Not enough bytes for reading ICC profile");
 }
 

@@ -688,14 +688,14 @@ std::vector<std::vector<Token>> ApplyLZ77(
     const HistogramParams& params, size_t num_contexts,
     const std::vector<std::vector<Token>>& tokens, const LZ77Params& lz77) {
   switch (params.lz77_method) {
-    case HistogramParams::LZ77Method::kNone:
-      return {};
     case HistogramParams::LZ77Method::kRLE:
       return ApplyLZ77_RLE(params, num_contexts, tokens, lz77);
     case HistogramParams::LZ77Method::kLZ77:
       return ApplyLZ77_LZ77(params, num_contexts, tokens, lz77);
     case HistogramParams::LZ77Method::kOptimal:
       return ApplyLZ77_Optimal(params, num_contexts, tokens, lz77);
+    default:  // case HistogramParams::LZ77Method::kNone:
+      return {};
   }
 }
 

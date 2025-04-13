@@ -22,7 +22,7 @@ namespace jxl {
 // *context_map.
 StatusOr<std::vector<uint8_t>> DecodeContextMap(
     JxlMemoryManager* memory_manager, size_t num_contexts, size_t* num_htrees,
-    BitReader* input);
+    BitReader& input);
 
 }  // namespace jxl
 

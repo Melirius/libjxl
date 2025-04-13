@@ -113,7 +113,7 @@ class PatchDictionary {
 
   bool HasAny() const { return !positions_.empty(); }
 
-  Status Decode(JxlMemoryManager* memory_manager, BitReader* br, size_t xsize,
+  Status Decode(JxlMemoryManager* memory_manager, BitReader& br, size_t xsize,
                 size_t ysize, size_t num_extra_channels,
                 bool* uses_extra_channels);
 

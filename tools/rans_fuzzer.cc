@@ -41,11 +41,10 @@ Status Run(const uint8_t* data, size_t size, JxlMemoryManager* memory_manager,
   {
     BitReader br(Bytes(data, size));
     BitReaderScopedCloser br_closer(br, ret);
-    ANSCode code;
-    JXL_RETURN_IF_ERROR(
-        DecodeHistograms(memory_manager, &br, num_contexts, &code));
-    JXL_ASSIGN_OR_RETURN(ANSSymbolReader ansreader,
-                         ANSSymbolReader::Create(&code, &br));
+    JXL_ASSIGN_OR_RETURN(ANSCode code,
+                         DecodeHistograms(memory_manager, br, num_contexts));
+    ANSSymbolReader ansreader;
+    JXL_RETURN_IF_ERROR(ansreader.Init(code, br));
 
     // Limit the maximum amount of reads to avoid (valid) infinite loops.
     const size_t maxreads = size * 8;

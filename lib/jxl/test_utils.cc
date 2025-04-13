@@ -779,7 +779,7 @@ Status ReadICC(BitReader* JXL_RESTRICT reader,
   icc->clear();
   ICCReader icc_reader{memort_manager};
   PaddedBytes icc_buffer{memort_manager};
-  JXL_RETURN_IF_ERROR(icc_reader.Init(reader));
+  JXL_RETURN_IF_ERROR(icc_reader.Init(*reader));
   JXL_RETURN_IF_ERROR(icc_reader.Process(&icc_buffer));
   Bytes(icc_buffer).AppendTo(*icc);
   return true;

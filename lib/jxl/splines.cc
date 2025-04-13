@@ -574,13 +574,12 @@ void Splines::Clear() {
   segment_y_start_.clear();
 }
 
-Status Splines::Decode(JxlMemoryManager* memory_manager, BitReader* br,
+Status Splines::Decode(JxlMemoryManager* memory_manager, BitReader& br,
                        const size_t num_pixels) {
-  ANSCode code;
-  JXL_RETURN_IF_ERROR(
-      DecodeHistograms(memory_manager, br, kNumSplineContexts, &code));
+  JXL_ASSIGN_OR_RETURN(
+      ANSCode code, DecodeHistograms(memory_manager, br, kNumSplineContexts));
   ANSSymbolReader decoder;
-  JXL_RETURN_IF_ERROR(decoder.Init(&code, br));
+  JXL_RETURN_IF_ERROR(decoder.Init(code, br));
   size_t num_splines = decoder.ReadHybridUint(kNumSplinesContext);
   size_t max_control_points = std::min(
       kMaxNumControlPoints, num_pixels / kMaxNumControlPointsPerPixelRatio);

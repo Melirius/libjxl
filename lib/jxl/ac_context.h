@@ -6,6 +6,8 @@
 #ifndef LIB_JXL_AC_CONTEXT_H_
 #define LIB_JXL_AC_CONTEXT_H_
 
+#include <jxl/memory_manager.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/coeff_order_fwd.h"
+#include "lib/jxl/dec_bit_reader.h"
 
 namespace jxl {
 
@@ -98,6 +101,12 @@ struct BlockCtxMap {
                     sizeof(kDefaultCtxMap) / sizeof *kDefaultCtxMap,
                 "Update default context map");
 
+  BlockCtxMap() {
+    ctx_map.assign(std::begin(kDefaultCtxMap), std::end(kDefaultCtxMap));
+    num_ctxs = *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;
+    num_dc_ctxs = 1;
+  }
+
   size_t Context(int dc_idx, uint32_t qf, size_t ord, size_t c) const {
     size_t qf_idx = 0;
     for (uint32_t t : qf_thresholds) {
@@ -142,11 +151,7 @@ struct BlockCtxMap {
     return static_cast<uint32_t>(ctx * num_ctxs + block_ctx);
   }
 
-  BlockCtxMap() {
-    ctx_map.assign(std::begin(kDefaultCtxMap), std::end(kDefaultCtxMap));
-    num_ctxs = *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;
-    num_dc_ctxs = 1;
-  }
+  Status Decode(JxlMemoryManager* memory_manager, BitReader& br);
 };
 
 }  // namespace jxl

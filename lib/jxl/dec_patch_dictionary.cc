@@ -28,17 +28,17 @@
 
 namespace jxl {
 
-Status PatchDictionary::Decode(JxlMemoryManager* memory_manager, BitReader* br,
+Status PatchDictionary::Decode(JxlMemoryManager* memory_manager, BitReader& br,
                                size_t xsize, size_t ysize,
                                size_t num_extra_channels,
                                bool* uses_extra_channels) {
   positions_.clear();
   blendings_stride_ = num_extra_channels + 1;
-  ANSCode code;
-  JXL_RETURN_IF_ERROR(
-      DecodeHistograms(memory_manager, br, kNumPatchDictionaryContexts, &code));
+  JXL_ASSIGN_OR_RETURN(
+      ANSCode code,
+      DecodeHistograms(memory_manager, br, kNumPatchDictionaryContexts));
   ANSSymbolReader decoder;
-  JXL_RETURN_IF_ERROR(decoder.Init(&code, br));
+  JXL_RETURN_IF_ERROR(decoder.Init(code, br));
 
   auto read_num = [&](size_t context) -> size_t {
     size_t r = decoder.ReadHybridUint(context);

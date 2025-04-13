@@ -41,7 +41,7 @@ void RoundtripPermutation(coeff_order_t* perm, coeff_order_t* out, size_t len,
   {
     BitReader reader(bytes);
     BitReaderScopedCloser closer(reader, status);
-    ASSERT_TRUE(DecodePermutation(memory_manager, 0, len, out, &reader));
+    ASSERT_TRUE(DecodePermutation(memory_manager, 0, len, out, reader));
   }
   ASSERT_TRUE(status);
   *size = bytes.size();

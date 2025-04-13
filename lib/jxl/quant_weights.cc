@@ -370,33 +370,33 @@ HWY_EXPORT(ComputeQuantTable);
 
 constexpr const float kAlmostZero = 1e-8f;
 
-Status DecodeDctParams(BitReader* br, DctQuantWeightParams* params) {
-  params->num_distance_bands =
-      br->ReadFixedBits<DctQuantWeightParams::kLog2MaxDistanceBands>() + 1;
+Status DecodeDctParams(BitReader& br, DctQuantWeightParams& params) {
+  params.num_distance_bands =
+      br.ReadFixedBits<DctQuantWeightParams::kLog2MaxDistanceBands>() + 1;
   for (size_t c = 0; c < 3; c++) {
-    for (size_t i = 0; i < params->num_distance_bands; i++) {
-      JXL_RETURN_IF_ERROR(F16Coder::Read(br, &params->distance_bands[c][i]));
+    for (size_t i = 0; i < params.num_distance_bands; i++) {
+      JXL_RETURN_IF_ERROR(F16Coder::Read(&br, &params.distance_bands[c][i]));
     }
-    if (params->distance_bands[c][0] < kAlmostZero) {
+    if (params.distance_bands[c][0] < kAlmostZero) {
       return JXL_FAILURE("Distance band seed is too small");
     }
-    params->distance_bands[c][0] *= 64.0f;
+    params.distance_bands[c][0] *= 64.0f;
   }
   return true;
 }
 
-Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
-              QuantEncoding* encoding, size_t required_size_x,
+Status Decode(JxlMemoryManager* memory_manager, BitReader& br,
+              QuantEncoding& encoding, size_t required_size_x,
               size_t required_size_y, size_t idx,
               ModularFrameDecoder* modular_frame_decoder) {
   size_t required_size = required_size_x * required_size_y;
   required_size_x *= kBlockDim;
   required_size_y *= kBlockDim;
-  int mode = br->ReadFixedBits<kLog2NumQuantModes>();
+  int mode = br.ReadFixedBits<kLog2NumQuantModes>();
   switch (mode) {
     case QuantEncoding::kQuantModeLibrary: {
-      encoding->predefined = br->ReadFixedBits<kCeilLog2NumPredefinedTables>();
-      if (encoding->predefined >= kNumPredefinedTables) {
+      encoding.predefined = br.ReadFixedBits<kCeilLog2NumPredefinedTables>();
+      if (encoding.predefined >= kNumPredefinedTables) {
         return JXL_FAILURE("Invalid predefined table");
       }
       break;
@@ -405,11 +405,11 @@ Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
       if (required_size != 1) return JXL_FAILURE("Invalid mode");
       for (size_t c = 0; c < 3; c++) {
         for (size_t i = 0; i < 3; i++) {
-          JXL_RETURN_IF_ERROR(F16Coder::Read(br, &encoding->idweights[c][i]));
-          if (std::abs(encoding->idweights[c][i]) < kAlmostZero) {
+          JXL_RETURN_IF_ERROR(F16Coder::Read(&br, &encoding.idweights[c][i]));
+          if (std::abs(encoding.idweights[c][i]) < kAlmostZero) {
             return JXL_FAILURE("ID Quantizer is too small");
           }
-          encoding->idweights[c][i] *= 64;
+          encoding.idweights[c][i] *= 64;
         }
       }
       break;
@@ -418,11 +418,11 @@ Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
       if (required_size != 1) return JXL_FAILURE("Invalid mode");
       for (size_t c = 0; c < 3; c++) {
         for (size_t i = 0; i < 6; i++) {
-          JXL_RETURN_IF_ERROR(F16Coder::Read(br, &encoding->dct2weights[c][i]));
-          if (std::abs(encoding->dct2weights[c][i]) < kAlmostZero) {
+          JXL_RETURN_IF_ERROR(F16Coder::Read(&br, &encoding.dct2weights[c][i]));
+          if (std::abs(encoding.dct2weights[c][i]) < kAlmostZero) {
             return JXL_FAILURE("Quantizer is too small");
           }
-          encoding->dct2weights[c][i] *= 64;
+          encoding.dct2weights[c][i] *= 64;
         }
       }
       break;
@@ -431,12 +431,12 @@ Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
       if (required_size != 1) return JXL_FAILURE("Invalid mode");
       for (size_t c = 0; c < 3; c++) {
         JXL_RETURN_IF_ERROR(
-            F16Coder::Read(br, &encoding->dct4x8multipliers[c]));
-        if (std::abs(encoding->dct4x8multipliers[c]) < kAlmostZero) {
+            F16Coder::Read(&br, &encoding.dct4x8multipliers[c]));
+        if (std::abs(encoding.dct4x8multipliers[c]) < kAlmostZero) {
           return JXL_FAILURE("DCT4X8 multiplier is too small");
         }
       }
-      JXL_RETURN_IF_ERROR(DecodeDctParams(br, &encoding->dct_params));
+      JXL_RETURN_IF_ERROR(DecodeDctParams(br, encoding.dct_params));
       break;
     }
     case QuantEncoding::kQuantModeDCT4: {
@@ -444,36 +444,36 @@ Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
       for (size_t c = 0; c < 3; c++) {
         for (size_t i = 0; i < 2; i++) {
           JXL_RETURN_IF_ERROR(
-              F16Coder::Read(br, &encoding->dct4multipliers[c][i]));
-          if (std::abs(encoding->dct4multipliers[c][i]) < kAlmostZero) {
+              F16Coder::Read(&br, &encoding.dct4multipliers[c][i]));
+          if (std::abs(encoding.dct4multipliers[c][i]) < kAlmostZero) {
             return JXL_FAILURE("DCT4 multiplier is too small");
           }
         }
       }
-      JXL_RETURN_IF_ERROR(DecodeDctParams(br, &encoding->dct_params));
+      JXL_RETURN_IF_ERROR(DecodeDctParams(br, encoding.dct_params));
       break;
     }
     case QuantEncoding::kQuantModeAFV: {
       if (required_size != 1) return JXL_FAILURE("Invalid mode");
       for (size_t c = 0; c < 3; c++) {
         for (size_t i = 0; i < 9; i++) {
-          JXL_RETURN_IF_ERROR(F16Coder::Read(br, &encoding->afv_weights[c][i]));
+          JXL_RETURN_IF_ERROR(F16Coder::Read(&br, &encoding.afv_weights[c][i]));
         }
         for (size_t i = 0; i < 6; i++) {
-          encoding->afv_weights[c][i] *= 64;
+          encoding.afv_weights[c][i] *= 64;
         }
       }
-      JXL_RETURN_IF_ERROR(DecodeDctParams(br, &encoding->dct_params));
-      JXL_RETURN_IF_ERROR(DecodeDctParams(br, &encoding->dct_params_afv_4x4));
+      JXL_RETURN_IF_ERROR(DecodeDctParams(br, encoding.dct_params));
+      JXL_RETURN_IF_ERROR(DecodeDctParams(br, encoding.dct_params_afv_4x4));
       break;
     }
     case QuantEncoding::kQuantModeDCT: {
-      JXL_RETURN_IF_ERROR(DecodeDctParams(br, &encoding->dct_params));
+      JXL_RETURN_IF_ERROR(DecodeDctParams(br, encoding.dct_params));
       break;
     }
     case QuantEncoding::kQuantModeRAW: {
       // Set mode early, to avoid mem-leak.
-      encoding->mode = QuantEncoding::kQuantModeRAW;
+      encoding.mode = QuantEncoding::kQuantModeRAW;
       JXL_RETURN_IF_ERROR(ModularFrameDecoder::DecodeQuantTable(
           memory_manager, required_size_x, required_size_y, br, encoding, idx,
           modular_frame_decoder));
@@ -482,7 +482,7 @@ Status Decode(JxlMemoryManager* memory_manager, BitReader* br,
     default:
       return JXL_FAILURE("Invalid quantization table encoding");
   }
-  encoding->mode = static_cast<QuantEncoding::Mode>(mode);
+  encoding.mode = static_cast<QuantEncoding::Mode>(mode);
   return true;
 }
 
@@ -494,28 +494,27 @@ constexpr const std::array<int, 17> DequantMatrices::required_size_y;
 constexpr const size_t DequantMatrices::kSumRequiredXy;
 #endif
 
-Status DequantMatrices::Decode(JxlMemoryManager* memory_manager, BitReader* br,
+Status DequantMatrices::Decode(JxlMemoryManager* memory_manager, BitReader& br,
                                ModularFrameDecoder* modular_frame_decoder) {
-  size_t all_default = br->ReadBits(1);
+  size_t all_default = br.ReadBits(1);
   size_t num_tables = all_default ? 0 : static_cast<size_t>(kNumQuantTables);
   encodings_.clear();
   encodings_.resize(kNumQuantTables, QuantEncoding::Library<0>());
   for (size_t i = 0; i < num_tables; i++) {
-    JXL_RETURN_IF_ERROR(jxl::Decode(memory_manager, br, &encodings_[i],
-                                    required_size_x[i % kNumQuantTables],
-                                    required_size_y[i % kNumQuantTables], i,
-                                    modular_frame_decoder));
+    JXL_RETURN_IF_ERROR(jxl::Decode(
+        memory_manager, br, encodings_[i], required_size_x[i % kNumQuantTables],
+        required_size_y[i % kNumQuantTables], i, modular_frame_decoder));
   }
   computed_mask_ = 0;
   return true;
 }
 
-Status DequantMatrices::DecodeDC(BitReader* br) {
-  bool all_default = static_cast<bool>(br->ReadBits(1));
-  if (!br->AllReadsWithinBounds()) return JXL_FAILURE("EOS during DecodeDC");
+Status DequantMatrices::DecodeDC(BitReader& br) {
+  bool all_default = static_cast<bool>(br.ReadBits(1));
+  if (!br.AllReadsWithinBounds()) return JXL_FAILURE("EOS during DecodeDC");
   if (!all_default) {
     for (size_t c = 0; c < 3; c++) {
-      JXL_RETURN_IF_ERROR(F16Coder::Read(br, &dc_quant_[c]));
+      JXL_RETURN_IF_ERROR(F16Coder::Read(&br, &dc_quant_[c]));
       dc_quant_[c] *= 1.0f / 128.0f;
       // Negative values and nearly zero are invalid values.
       if (dc_quant_[c] < kAlmostZero) {

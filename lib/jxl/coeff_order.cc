@@ -35,18 +35,18 @@ uint32_t CoeffOrderContext(uint32_t val) {
 
 namespace {
 Status ReadPermutation(size_t skip, size_t size, coeff_order_t* order,
-                       ANSSymbolReader* reader) {
+                       ANSSymbolReader& reader) {
   std::vector<LehmerT> lehmer(size);
   // temp space needs to be as large as the next power of 2, so doubling the
   // allocated size is enough.
   std::vector<uint32_t> temp(size * 2);
-  uint32_t end = reader->ReadHybridUint(CoeffOrderContext(size)) + skip;
+  uint32_t end = reader.ReadHybridUint(CoeffOrderContext(size)) + skip;
   if (end > size) {
     return JXL_FAILURE("Invalid permutation size");
   }
   uint32_t last = 0;
   for (size_t i = skip; i < end; ++i) {
-    lehmer[i] = reader->ReadHybridUint(CoeffOrderContext(last));
+    lehmer[i] = reader.ReadHybridUint(CoeffOrderContext(last));
     last = lehmer[i];
     if (lehmer[i] >= size - i) {
       return JXL_FAILURE("Invalid lehmer code");
@@ -61,13 +61,12 @@ Status ReadPermutation(size_t skip, size_t size, coeff_order_t* order,
 }  // namespace
 
 Status DecodePermutation(JxlMemoryManager* memory_manager, size_t skip,
-                         size_t size, coeff_order_t* order, BitReader* br) {
-  ANSCode code;
-  JXL_RETURN_IF_ERROR(
-      DecodeHistograms(memory_manager, br, kPermutationContexts, &code));
+                         size_t size, coeff_order_t* order, BitReader& br) {
+  JXL_ASSIGN_OR_RETURN(
+      ANSCode code, DecodeHistograms(memory_manager, br, kPermutationContexts));
   ANSSymbolReader reader;
-  JXL_RETURN_IF_ERROR(reader.Init(&code, br));
-  JXL_RETURN_IF_ERROR(ReadPermutation(skip, size, order, &reader));
+  JXL_RETURN_IF_ERROR(reader.Init(code, br));
+  JXL_RETURN_IF_ERROR(ReadPermutation(skip, size, order, reader));
   if (!reader.CheckANSFinalState()) {
     return JXL_FAILURE("Invalid ANS stream");
   }
@@ -77,7 +76,7 @@ Status DecodePermutation(JxlMemoryManager* memory_manager, size_t skip,
 namespace {
 
 Status DecodeCoeffOrder(AcStrategy acs, coeff_order_t* order,
-                        ANSSymbolReader* reader,
+                        ANSSymbolReader& reader,
                         std::vector<coeff_order_t>& natural_order) {
   const size_t llf = acs.covered_blocks_x() * acs.covered_blocks_y();
   const size_t size = kDCTBlockSize * llf;
@@ -94,16 +93,16 @@ Status DecodeCoeffOrder(AcStrategy acs, coeff_order_t* order,
 
 Status DecodeCoeffOrders(JxlMemoryManager* memory_manager, uint16_t used_orders,
                          uint32_t used_acs, coeff_order_t* order,
-                         BitReader* br) {
+                         BitReader& br) {
   uint16_t computed = 0;
   ANSCode code;
   ANSSymbolReader reader;
   std::vector<coeff_order_t> natural_order;
   // Bitstream does not have histograms if no coefficient order is used.
   if (used_orders != 0) {
-    JXL_RETURN_IF_ERROR(
-        DecodeHistograms(memory_manager, br, kPermutationContexts, &code));
-    JXL_RETURN_IF_ERROR(reader.Init(&code, br));
+    JXL_ASSIGN_OR_RETURN(
+        code, DecodeHistograms(memory_manager, br, kPermutationContexts));
+    JXL_RETURN_IF_ERROR(reader.Init(code, br));
   }
   uint32_t acs_mask = 0;
   for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
@@ -136,8 +135,7 @@ Status DecodeCoeffOrders(JxlMemoryManager* memory_manager, uint16_t used_orders,
     } else {
       for (size_t c = 0; c < 3; c++) {
         coeff_order_t* dest = used ? &order[CoeffOrderOffset(ord, c)] : nullptr;
-        JXL_RETURN_IF_ERROR(
-            DecodeCoeffOrder(acs, dest, &reader, natural_order));
+        JXL_RETURN_IF_ERROR(DecodeCoeffOrder(acs, dest, reader, natural_order));
       }
     }
   }

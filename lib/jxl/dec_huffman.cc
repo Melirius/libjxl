@@ -28,7 +28,7 @@ static const uint8_t kCodeLengthRepeatCode = 16;
 
 JXL_BOOL ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
                                 int num_symbols, uint8_t* code_lengths,
-                                BitReader* br) {
+                                BitReader& br) {
   int symbol = 0;
   uint8_t prev_code_len = kDefaultCodeLength;
   int repeat = 0;
@@ -48,9 +48,9 @@ JXL_BOOL ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
   while (symbol < num_symbols && space > 0) {
     const HuffmanCode* p = table;
     uint8_t code_len;
-    br->Refill();
-    p += br->PeekFixedBits<5>();
-    br->Consume(p->bits);
+    br.Refill();
+    p += br.PeekFixedBits<5>();
+    br.Consume(p->bits);
     code_len = static_cast<uint8_t>(p->value);
     if (code_len < kCodeLengthRepeatCode) {
       repeat = 0;
@@ -76,7 +76,7 @@ JXL_BOOL ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
         repeat -= 2;
         repeat <<= extra_bits;
       }
-      repeat += static_cast<int>(br->ReadBits(extra_bits) + 3);
+      repeat += static_cast<int>(br.ReadBits(extra_bits) + 3);
       repeat_delta = repeat - old_repeat;
       if (symbol + repeat_delta > num_symbols) {
         return 0;
@@ -96,16 +96,16 @@ JXL_BOOL ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
   return JXL_TRUE;
 }
 
-static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
+static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader& br,
                                       HuffmanCode* table) {
   size_t max_bits =
       (alphabet_size > 1u) ? FloorLog2Nonzero(alphabet_size - 1u) + 1 : 0;
 
-  size_t num_symbols = br->ReadFixedBits<2>() + 1;
+  size_t num_symbols = br.ReadFixedBits<2>() + 1;
 
   uint16_t symbols[4] = {0};
   for (size_t i = 0; i < num_symbols; ++i) {
-    uint16_t symbol = br->ReadBits(max_bits);
+    uint16_t symbol = br.ReadBits(max_bits);
     if (symbol >= alphabet_size) {
       return false;
     }
@@ -119,7 +119,7 @@ static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
   }
 
   // 4 symbols have to option to encode.
-  if (num_symbols == 4) num_symbols += br->ReadFixedBits<1>();
+  if (num_symbols == 4) num_symbols += br.ReadFixedBits<1>();
 
   const auto swap_symbols = [&symbols](size_t i, size_t j) {
     uint16_t t = symbols[j];
@@ -189,13 +189,13 @@ static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
 }
 
 bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
-                                            BitReader* br) {
+                                            BitReader& br) {
   if (alphabet_size > (1 << PREFIX_MAX_BITS)) return false;
 
   /* simple_code_or_skip is used as follows:
      1 for simple code;
      0 for no skipping, 2 skips 2 code lengths, 3 skips 3 code lengths */
-  uint32_t simple_code_or_skip = br->ReadFixedBits<2>();
+  uint32_t simple_code_or_skip = br.ReadFixedBits<2>();
   if (simple_code_or_skip == 1u) {
     table_.resize(1u << kHuffmanTableBits);
     return ReadSimpleCode(alphabet_size, br, table_.data());
@@ -214,9 +214,9 @@ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
     const int code_len_idx = kCodeLengthCodeOrder[i];
     const HuffmanCode* p = huff;
     uint8_t v;
-    br->Refill();
-    p += br->PeekFixedBits<4>();
-    br->Consume(p->bits);
+    br.Refill();
+    p += br.PeekFixedBits<4>();
+    br.Consume(p->bits);
     v = static_cast<uint8_t>(p->value);
     code_length_code_lengths[code_len_idx] = v;
     if (v != 0) {
@@ -243,18 +243,18 @@ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
 }
 
 // Decodes the next Huffman coded symbol from the bit-stream.
-uint16_t HuffmanDecodingData::ReadSymbol(BitReader* br) const {
+uint16_t HuffmanDecodingData::ReadSymbol(BitReader& br) const {
   size_t n_bits;
   const HuffmanCode* table = table_.data();
-  table += br->PeekBits(kHuffmanTableBits);
+  table += br.PeekBits(kHuffmanTableBits);
   n_bits = table->bits;
   if (n_bits > kHuffmanTableBits) {
-    br->Consume(kHuffmanTableBits);
+    br.Consume(kHuffmanTableBits);
     n_bits -= kHuffmanTableBits;
     table += table->value;
-    table += br->PeekBits(n_bits);
+    table += br.PeekBits(n_bits);
   }
-  br->Consume(table->bits);
+  br.Consume(table->bits);
   return table->value;
 }
 

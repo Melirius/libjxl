@@ -282,7 +282,7 @@ TEST(FieldsTest, TestRoundtripFrame) {
 
   FrameHeader h2(&metadata);
   BitReader reader(writer.GetSpan());
-  ASSERT_TRUE(ReadFrameHeader(&reader, &h2));
+  ASSERT_TRUE(ReadFrameHeader(reader, h2));
   EXPECT_EQ(total_bits, reader.TotalBitsConsumed());
   EXPECT_TRUE(reader.Close());
 

@@ -198,7 +198,7 @@ Status DecodeModularChannelMAANS(
     if (predictor == Predictor::Zero) {
       uint32_t value;
       if (reader.IsSingleValueAndAdvance(ctx_id, &value,
-                                          channel.w * channel.h)) {
+                                         channel.w * channel.h)) {
         // Special-case: histogram has a single symbol, with no extra bits, and
         // we use ANS mode.
         JXL_DEBUG_V(8, "Fastest track.");
@@ -223,8 +223,7 @@ Status DecodeModularChannelMAANS(
             pixel_type *JXL_RESTRICT r = channel.Row(y);
             for (size_t x = 0; x < channel.w; x++) {
               uint32_t v =
-                  reader.ReadHybridUintClusteredMaybeInlined<uses_lz77>(
-                      ctx_id);
+                  reader.ReadHybridUintClusteredMaybeInlined<uses_lz77>(ctx_id);
               r[x] = make_pixel(v, multiplier, offset);
             }
           }
@@ -517,7 +516,7 @@ Status ValidateChannelDimensions(const Image &image,
   return true;
 }
 
-Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
+Status ModularDecode(BitReader &br, Image &image, GroupHeader &header,
                      size_t group_id, ModularOptions *options,
                      const Tree *global_tree, const ANSCode *global_code,
                      const bool allow_truncated_group) {
@@ -525,10 +524,10 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
   JxlMemoryManager *memory_manager = image.memory_manager();
 
   // decode transforms
-  Status status = Bundle::Read(br, &header);
+  Status status = Bundle::Read(&br, &header);
   if (!allow_truncated_group) JXL_RETURN_IF_ERROR(status);
   if (status.IsFatalError()) return status;
-  if (!br->AllReadsWithinBounds()) {
+  if (!br.AllReadsWithinBounds()) {
     // Don't do/undo transforms if header is incomplete.
     header.transforms.clear();
     image.transform = header.transforms;
@@ -596,9 +595,10 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
     }
     max_tree_size = std::min(static_cast<uint64_t>(1 << 20), max_tree_size);
     JXL_RETURN_IF_ERROR(
-        DecodeTree(memory_manager, br, &tree_storage, max_tree_size));
-    JXL_RETURN_IF_ERROR(DecodeHistograms(
-        memory_manager, br, (tree_storage.size() + 1) / 2, &code_storage));
+        DecodeTree(memory_manager, br, tree_storage, max_tree_size));
+    JXL_ASSIGN_OR_RETURN(
+        code_storage,
+        DecodeHistograms(memory_manager, br, (tree_storage.size() + 1) / 2));
   } else {
     if (!global_tree || !global_code || global_tree->empty()) {
       return JXL_FAILURE("No global tree available but one was requested");
@@ -609,7 +609,7 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
 
   // Read channels
   ANSSymbolReader reader;
-  JXL_RETURN_IF_ERROR(reader.Init(code, br, distance_multiplier));
+  JXL_RETURN_IF_ERROR(reader.Init(*code, br, distance_multiplier));
   auto tree_lut = jxl::make_unique<TreeLut<uint8_t, false, false>>();
   uint32_t fl_run = 0;
   uint32_t fl_v = 0;
@@ -628,7 +628,7 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
         group_id, *tree_lut, &image, fl_run, fl_v));
 
     // Truncated group.
-    if (!br->AllReadsWithinBounds()) {
+    if (!br.AllReadsWithinBounds()) {
       if (!allow_truncated_group) return JXL_FAILURE("Truncated input");
       return JXL_NOT_ENOUGH_BYTES("Read overrun in ModularDecode");
     }
@@ -643,7 +643,7 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
   return true;
 }
 
-Status ModularGenericDecompress(BitReader *br, Image &image,
+Status ModularGenericDecompress(BitReader &br, Image &image,
                                 GroupHeader *header, size_t group_id,
                                 ModularOptions *options, bool undo_transforms,
                                 const Tree *tree, const ANSCode *code,
@@ -655,7 +655,7 @@ Status ModularGenericDecompress(BitReader *br, Image &image,
   }
   GroupHeader local_header;
   if (header == nullptr) header = &local_header;
-  size_t bit_pos = br->TotalBitsConsumed();
+  size_t bit_pos = br.TotalBitsConsumed();
   auto dec_status = ModularDecode(br, image, *header, group_id, options, tree,
                                   code, allow_truncated_group);
   if (!allow_truncated_group) JXL_RETURN_IF_ERROR(dec_status);
@@ -666,7 +666,7 @@ Status ModularGenericDecompress(BitReader *br, Image &image,
               "Modular-decoded a %" PRIuS "x%" PRIuS " nbchans=%" PRIuS
               " image from %" PRIuS " bytes",
               image.w, image.h, image.channel.size(),
-              (br->TotalBitsConsumed() - bit_pos) / 8);
+              (br.TotalBitsConsumed() - bit_pos) / 8);
   JXL_DEBUG_V(5, "Modular image: %s", image.DebugString().c_str());
   (void)bit_pos;
   // Check that after applying all transforms we are back to the requested
