@@ -69,8 +69,7 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
                          uint32_t current_used_acs,
                          uint32_t current_used_orders,
                          coeff_order_t* JXL_RESTRICT order) {
-  JxlMemoryManager* memory_manager = ac_strategy.memory_manager();
-  std::vector<int32_t> num_zeros(kCoeffOrderMaxSize);
+  std::vector<uint64_t> num_zeros(kCoeffOrderMaxSize);
   // If compressing at high speed and only using 8x8 DCTs, only consider a
   // subset of blocks.
   double block_fraction = 1.0f;
@@ -97,6 +96,8 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
       s[1] = s1;
       return (bits >> 32) <= threshold;
     };
+    uint32_t skip_orders = ~current_used_orders | all_used_orders |
+                           prev_used_acs | ~current_used_acs;
 
     // Count number of zero coefficients, separately for each DCT band.
     // TODO(veluca): precompute when doing DCT.
@@ -122,6 +123,12 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
           if (!acs.IsFirstBlock()) continue;
           if (!use_sample()) continue;
           size_t size = kDCTBlockSize << acs.log2_covered_blocks();
+          uint8_t ord = kStrategyOrder[acs.RawStrategy()];
+          if ((1 << ord) & skip_orders) {
+            ac_offset += size;
+            continue;
+          }
+
           for (size_t c = 0; c < 3; ++c) {
             const size_t order_offset =
                 CoeffOrderOffset(kStrategyOrder[acs.RawStrategy()], c);
@@ -136,51 +143,36 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
                 num_zeros[order_offset + k] += is_zero ? 1 : 0;
               }
             }
-            // Ensure LLFs are first in the order.
-            size_t cx = acs.covered_blocks_x();
-            size_t cy = acs.covered_blocks_y();
-            CoefficientLayout(&cy, &cx);
-            for (size_t iy = 0; iy < cy; iy++) {
-              for (size_t ix = 0; ix < cx; ix++) {
-                num_zeros[order_offset + iy * kBlockDim * cx + ix] = -1;
-              }
-            }
           }
           ac_offset += size;
         }
       }
     }
   }
-  struct PosAndCount {
-    uint32_t pos;
-    // Saving index breaks the ties for non-stable sort
-    uint32_t count_and_idx;
-  };
-  size_t mem_bytes = AcStrategy::kMaxCoeffArea * sizeof(PosAndCount);
-  JXL_ASSIGN_OR_RETURN(auto mem,
-                       AlignedMemory::Create(memory_manager, mem_bytes));
+  using PosAndCount = uint64_t;
 
-  std::vector<coeff_order_t> natural_order_buffer;
+  std::vector<PosAndCount> pos_and_val(AcStrategy::kMaxCoeffArea);
+  std::vector<coeff_order_t> natural_order(AcStrategy::kMaxCoeffArea);
 
   uint16_t computed = 0;
   for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
     uint8_t ord = kStrategyOrder[o];
     if (computed & (1 << ord)) continue;
     computed |= 1 << ord;
-    AcStrategy acs = AcStrategy::FromRawStrategy(o);
-    size_t sz = kDCTBlockSize * acs.covered_blocks_x() * acs.covered_blocks_y();
-    // Expected maximal size is 256 x 256.
-    JXL_DASSERT(sz <= (1 << 16));
-
     // Do nothing for transforms that don't appear.
     if ((1 << ord) & ~current_used_acs) continue;
-
     // Do nothing if we already committed to this custom order previously.
     if ((1 << ord) & prev_used_acs) continue;
     if ((1 << ord) & all_used_orders) continue;
 
-    if (natural_order_buffer.size() < sz) natural_order_buffer.resize(sz);
-    acs.ComputeNaturalCoeffOrder(natural_order_buffer.data());
+    AcStrategy acs = AcStrategy::FromRawStrategy(o);
+    size_t cx = acs.covered_blocks_x();
+    size_t cy = acs.covered_blocks_y();
+    CoefficientLayout(&cy, &cx);
+    size_t sz = kDCTBlockSize * cx * cy;
+    // Expected maximal size is 256 x 256.
+    JXL_DASSERT(sz <= (1 << 16));
+    acs.ComputeNaturalCoeffOrder(natural_order.data());
 
     // Ensure natural coefficient order is not permuted if the order is
     // not transmitted.
@@ -188,41 +180,40 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
       for (size_t c = 0; c < 3; c++) {
         size_t offset = CoeffOrderOffset(ord, c);
         JXL_ENSURE(CoeffOrderOffset(ord, c + 1) - offset == sz);
-        memcpy(&order[offset], natural_order_buffer.data(),
-               sz * sizeof(*order));
+        memcpy(&order[offset], natural_order.data(), sz * sizeof(*order));
       }
       continue;
     }
 
     bool is_nondefault = false;
+    float inv_sqrt_sz = 1.0f / sqrtf(sz);
     for (uint8_t c = 0; c < 3; c++) {
-      // Apply zig-zag order.
-      PosAndCount* pos_and_val = mem.address<PosAndCount>();
       size_t offset = CoeffOrderOffset(ord, c);
       JXL_ENSURE(CoeffOrderOffset(ord, c + 1) - offset == sz);
-      float inv_sqrt_sz = 1.0f / std::sqrt(sz);
+      // Apply zig-zag order.
       for (size_t i = 0; i < sz; ++i) {
-        size_t pos = natural_order_buffer[i];
-        pos_and_val[i].pos = pos;
+        size_t pos = natural_order[i];
+        // Ensure LLFs are first in the order.
+        bool LLF = pos / (kBlockDim * cx) < cy && pos % (kBlockDim * cx) < cx;
         // We don't care for the exact number -> quantize number of zeros,
-        // to get less permuted order.
-        uint32_t count = num_zeros[offset + pos] * inv_sqrt_sz + 0.1f;
-        // Actually, limit is sqrt(1<<16), but we don't care
-        JXL_DASSERT(count < (1u << 16));
-        pos_and_val[i].count_and_idx = (count << 16) | i;
+        // to get less permuted order. Add 1 to put AC coefs after LLFs.
+        PosAndCount count =
+            LLF ? 0 : num_zeros[offset + pos] * inv_sqrt_sz + 1.1f;
+        // Worst case: all dct8x8, all zeroes: count <= nb_pixels/64/8
+        // nb_pixels is limited to 2^40 (Level 10 limit)
+        // so count is limited to 2^31
+        JXL_DASSERT(count < (1ull << 48));
+        // Stable-sort -> elements with same number of zeros will preserve
+        // their order.
+        pos_and_val[i] = (count << 16) | i;
       }
-
-      // Stable-sort -> elements with same number of zeros will preserve their
-      // order.
-      auto comparator = [](const PosAndCount& a, const PosAndCount& b) -> bool {
-        return a.count_and_idx < b.count_and_idx;
-      };
-      std::sort(pos_and_val, pos_and_val + sz, comparator);
+      std::sort(&pos_and_val[0], &pos_and_val[sz]);
 
       // Grab indices.
-      for (size_t i = 0; i < sz; ++i) {
-        order[offset + i] = pos_and_val[i].pos;
-        is_nondefault |= natural_order_buffer[i] != pos_and_val[i].pos;
+      for (size_t pos = 0; pos < sz; ++pos) {
+        size_t i = pos_and_val[pos] & 0xFFFF;
+        order[offset + pos] = natural_order[i];
+        is_nondefault |= (i != pos);
       }
     }
     if (!is_nondefault) {

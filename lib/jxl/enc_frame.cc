@@ -745,6 +745,45 @@ void FindIndexOfSumMaximum(const V* array, R* idx, V* sum) {
   *sum = maxval;
 }
 
+void SetVarDCTContexts(BlockCtxMap& block_ctx_map, const size_t (&total_dc)[3],
+                       const std::vector<size_t> (&dc_counts)[3]) {
+  auto& dct = block_ctx_map.dc_thresholds;
+  auto& num_dc_ctxs = block_ctx_map.num_dc_ctxs;
+  num_dc_ctxs = 1;
+  for (size_t i = 0; i < 3; i++) {
+    dct[i].clear();
+    int num_thresholds = (CeilLog2Nonzero(total_dc[i]) - 12) / 2;
+    // up to 3 buckets per channel:
+    // dark/medium/bright, yellow/unsat/blue, green/unsat/red
+    num_thresholds = Clamp1(num_thresholds, 0, 2);
+    size_t cumsum = 0;
+    size_t cut = total_dc[i] / (num_thresholds + 1);
+    for (int j = 0; j < 2048; j++) {
+      cumsum += dc_counts[i][j];
+      if (cumsum > cut) {
+        dct[i].push_back(j - 1025);
+        cut = total_dc[i] * (dct[i].size() + 1) / (num_thresholds + 1);
+      }
+    }
+    num_dc_ctxs *= dct[i].size() + 1;
+  }
+
+  auto& ctx_map = block_ctx_map.ctx_map;
+  ctx_map.assign(3 * kNumOrders * num_dc_ctxs, 0);
+
+  size_t lbuckets = dct[1].size() + 1;
+  for (size_t i = 0; i < num_dc_ctxs; i++) {
+    // up to 9 contexts for luma
+    ctx_map[i] = i / lbuckets;
+    // up to 3 contexts for chroma
+    ctx_map[kNumOrders * num_dc_ctxs + i] =
+        ctx_map[2 * kNumOrders * num_dc_ctxs + i] =
+            num_dc_ctxs / lbuckets + (i % lbuckets);
+  }
+  block_ctx_map.num_ctxs =
+      *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;
+}
+
 Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
                                   const FrameHeader& frame_header,
                                   ThreadPool* pool,
@@ -1017,42 +1056,7 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
     }
   }
 
-  auto& dct = enc_state->shared.block_ctx_map.dc_thresholds;
-  auto& num_dc_ctxs = enc_state->shared.block_ctx_map.num_dc_ctxs;
-  num_dc_ctxs = 1;
-  for (size_t i = 0; i < 3; i++) {
-    dct[i].clear();
-    int num_thresholds = (CeilLog2Nonzero(total_dc[i]) - 12) / 2;
-    // up to 3 buckets per channel:
-    // dark/medium/bright, yellow/unsat/blue, green/unsat/red
-    num_thresholds = std::min(std::max(num_thresholds, 0), 2);
-    size_t cumsum = 0;
-    size_t cut = total_dc[i] / (num_thresholds + 1);
-    for (int j = 0; j < 2048; j++) {
-      cumsum += dc_counts[i][j];
-      if (cumsum > cut) {
-        dct[i].push_back(j - 1025);
-        cut = total_dc[i] * (dct[i].size() + 1) / (num_thresholds + 1);
-      }
-    }
-    num_dc_ctxs *= dct[i].size() + 1;
-  }
-
-  auto& ctx_map = enc_state->shared.block_ctx_map.ctx_map;
-  ctx_map.clear();
-  ctx_map.resize(3 * kNumOrders * num_dc_ctxs, 0);
-
-  int lbuckets = (dct[1].size() + 1);
-  for (size_t i = 0; i < num_dc_ctxs; i++) {
-    // up to 9 contexts for luma
-    ctx_map[i] = i / lbuckets;
-    // up to 3 contexts for chroma
-    ctx_map[kNumOrders * num_dc_ctxs + i] =
-        ctx_map[2 * kNumOrders * num_dc_ctxs + i] =
-            num_dc_ctxs / lbuckets + (i % lbuckets);
-  }
-  enc_state->shared.block_ctx_map.num_ctxs =
-      *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;
+  SetVarDCTContexts(enc_state->shared.block_ctx_map, total_dc, dc_counts);
 
   // disable DC frame for now
   auto compute_dc_coeffs = [&](const uint32_t group_index,

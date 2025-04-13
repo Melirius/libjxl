@@ -16,7 +16,7 @@ namespace jxl {
 
 #if JXL_CXX_LANG < JXL_CXX_17
 // TODO(Ivan) find better place for this
-constexpr ThreadPoolNoInit NoInit;                // from data_parallel.h
+constexpr ThreadPoolNoInit ThreadPool::NoInit;    // from data_parallel.h
 constexpr uint8_t BlockCtxMap::kDefaultCtxMap[];  // from ac_context.h
 #endif
 

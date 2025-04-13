@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// #define NO_PIXEL_NUMBER_FIX
+
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
@@ -316,7 +318,7 @@ StatusOr<Tree> LearnTree(
     return tree;
   }
   float pixel_fraction = tree_samples.NumSamples() * 1.0f / total_pixels;
-  float required_cost = pixel_fraction * 0.9 + 0.1;
+  float required_cost = (pixel_fraction * 0.9f + 0.1f) * 1.0f;
   tree_samples.AllSamplesDone();
   JXL_RETURN_IF_ERROR(ComputeBestTree(
       tree_samples, options.splitting_heuristics_node_threshold * required_cost,
@@ -587,6 +589,7 @@ Status ModularEncode(const Image &image, const ModularOptions &options,
   TreeSamples tree_samples_storage;
   size_t total_pixels_storage = 0;
   if (!total_pixels) total_pixels = &total_pixels_storage;
+#ifdef NO_PIXEL_NUMBER_FIX
   if (*total_pixels == 0) {
     for (size_t i = 0; i < nb_channels; i++) {
       if (i >= image.nb_meta_channels &&
@@ -598,6 +601,7 @@ Status ModularEncode(const Image &image, const ModularOptions &options,
     }
     *total_pixels = std::max<size_t>(*total_pixels, 1);
   }
+#endif  // NO_PIXEL_NUMBER_FIX
   // If there's no tree, compute one (or gather data to).
   if (tree == nullptr &&
       options.tree_kind == ModularOptions::TreeKind::kLearn) {
@@ -651,6 +655,19 @@ Status ModularEncode(const Image &image, const ModularOptions &options,
           tree_storage,
           LearnTree(std::move(tree_samples_storage), *total_pixels, options));
     } else {
+#ifndef NO_PIXEL_NUMBER_FIX
+      if (*total_pixels == 0) {
+        for (size_t i = 0; i < nb_channels; i++) {
+          if (i >= image.nb_meta_channels &&
+              (image.channel[i].w > options.max_chan_size ||
+              image.channel[i].h > options.max_chan_size)) {
+            break;
+          }
+          *total_pixels += image.channel[i].w * image.channel[i].h;
+        }
+        *total_pixels = std::max<size_t>(*total_pixels, 1);
+      }
+#endif  // NO_PIXEL_NUMBER_FIX
       tree_storage = PredefinedTree(options.tree_kind, *total_pixels,
                                     image.bitdepth, options.max_properties);
     }

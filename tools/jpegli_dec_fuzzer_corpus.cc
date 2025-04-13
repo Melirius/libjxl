@@ -364,7 +364,8 @@ int main(int argc, const char** argv) {
     JXL_RETURN_IF_ERROR(GenerateFile(dest_dir, spec, regenerate, quiet));
     return true;
   };
-  if (!RunOnPool(pool.get(), 0, specs.size(), jxl::ThreadPool::NoInit, generate,
+  if (!RunOnPool(pool.get(), 0, specs.size(),
+                 /*jxl::ThreadPool::NoInit*/ jxl::ThreadPoolNoInit{}, generate,
                  "FuzzerCorpus")) {
     std::cerr << "Error generating fuzzer corpus\n";
     return EXIT_FAILURE;

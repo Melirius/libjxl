@@ -355,9 +355,8 @@ class ANSEncodingHistogram {
   static const Lg2LUT lg2;
 
   float EstimateDataBits(const Histogram& histo) {
-    int64_t sum = 0;
+    int64_t sum = 0;  // summing (histogram[i] * -log(counts[i]/total_counts))
     for (size_t i = 0; i < alphabet_size_; ++i) {
-      // += histogram[i] * -log(counts[i]/total_counts)
       sum += histo.counts_[i] * int64_t{lg2[counts_[i]]};
     }
     return (histo.total_count_ - ldexpf(sum, -31)) * ANS_LOG_TAB_SIZE;

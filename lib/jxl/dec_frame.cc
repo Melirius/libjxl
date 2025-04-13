@@ -60,20 +60,15 @@ namespace jxl {
 
 namespace {
 Status DecodeGlobalDCInfo(BitReader& reader, bool is_jpeg,
-                          PassesDecoderState* state, ThreadPool* pool) {
-  JXL_RETURN_IF_ERROR(state->shared_storage.quantizer.Decode(reader));
-
-  JXL_RETURN_IF_ERROR(state->shared_storage.block_ctx_map.Decode(
-      state->memory_manager(), reader));
-
-  JXL_RETURN_IF_ERROR(state->shared_storage.cmap.DecodeDC(reader));
-
+                          PassesSharedState& state) {
+  JXL_RETURN_IF_ERROR(state.quantizer.Decode(reader));
+  JXL_RETURN_IF_ERROR(state.block_ctx_map.Decode(state.memory_manager, reader));
+  JXL_RETURN_IF_ERROR(state.cmap.DecodeDC(reader));
   // Pre-compute info for decoding a group.
   if (is_jpeg) {
-    state->shared_storage.quantizer.ClearDCMul();  // Don't dequant DC
+    state.quantizer.ClearDCMul();  // Don't dequant DC
   }
-
-  state->shared_storage.ac_strategy.FillInvalid();
+  state.ac_strategy.FillInvalid();
   return true;
 }
 }  // namespace
@@ -296,7 +291,7 @@ Status FrameDecoder::ProcessDCGlobal(BitReader& br) {
 
   if (frame_header_.encoding == FrameEncoding::kVarDCT) {
     JXL_RETURN_IF_ERROR(
-        jxl::DecodeGlobalDCInfo(br, decoded_->IsJPEG(), dec_state_, pool_));
+        DecodeGlobalDCInfo(br, decoded_->IsJPEG(), dec_state_->shared_storage));
   }
   // Splines' draw cache uses the color correlation map.
   if (frame_header_.flags & FrameHeader::kSplines) {
