@@ -556,29 +556,15 @@ StatusOr<Tree> LearnTree(
     const Image *images, const ModularOptions *options, const uint32_t start,
     const uint32_t stop,
     const std::vector<ModularMultiplierInfo> &multiplier_info = {}) {
-  TreeSamples tree_samples;
-  JXL_RETURN_IF_ERROR(tree_samples.SetPredictor(options[start].predictor,
-                                                options[start].wp_tree_mode));
-  JXL_RETURN_IF_ERROR(
-      tree_samples.SetProperties(options[start].splitting_heuristics_properties,
-                                 options[start].wp_tree_mode));
-  uint32_t max_c = 0;
-  std::vector<pixel_type> pixel_samples;
-  std::vector<pixel_type> diff_samples;
-  std::vector<uint32_t> group_pixel_count;
-  std::vector<uint32_t> channel_pixel_count;
-  for (uint32_t i = start; i < stop; i++) {
-    max_c = std::max<uint32_t>(images[i].channel.size(), max_c);
-    CollectPixelSamples(images[i], options[i], i, group_pixel_count,
-                        channel_pixel_count, pixel_samples, diff_samples);
-  }
-  StaticPropRange range;
-  range[0] = {{0, max_c}};
-  range[1] = {{start, stop}};
+  JXL_ASSIGN_OR_RETURN(
+      TreeSamples tree_samples,
+      TreeSamples::Create(options[start]));
+
+  tree_samples.CollectPixelSamples(images, options, start, stop);
+  StaticPropRange range = {{{0, tree_samples.NumChannels()}, {start, stop}}};
 
   tree_samples.PreQuantizeProperties(
-      range, multiplier_info, group_pixel_count, channel_pixel_count,
-      pixel_samples, diff_samples, options[start].max_property_values);
+      range, multiplier_info, options[start].max_property_values);
 
   size_t total_pixels = 0;
   for (size_t i = 0; i < images[start].channel.size(); i++) {

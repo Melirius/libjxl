@@ -1085,7 +1085,7 @@ JXL_SLOW_TEST(JxlTest, RoundtripLossless8) {
   PackedPixelFile ppf_out;
   size_t compressed_size =
       Roundtrip(t.ppf(), cparams, dparams, pool.get(), &ppf_out);
-  EXPECT_EQ(compressed_size, 218429u);
+  EXPECT_EQ(compressed_size, 218443u);
   EXPECT_EQ(ComputeDistance2(t.ppf(), ppf_out), 0.0);
 }
 
@@ -1341,7 +1341,7 @@ TEST(JxlTest, RoundtripLossless8Gray) {
   dparams.accepted_formats.push_back(t.ppf().frames[0].color.format);
 
   PackedPixelFile ppf_out;
-  EXPECT_EQ(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out), 92588u);
+  EXPECT_EQ(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out), 92546u);
   EXPECT_EQ(ComputeDistance2(t.ppf(), ppf_out), 0.0);
   EXPECT_EQ(ppf_out.color_encoding.color_space, JXL_COLOR_SPACE_GRAY);
   EXPECT_EQ(ppf_out.info.bits_per_sample, 8u);

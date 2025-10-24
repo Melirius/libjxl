@@ -819,10 +819,7 @@ void QuantMap(const std::vector<int32_t> &from, std::vector<T> &to,
 void TreeSamples::PreQuantizeProperties(
     const StaticPropRange &range,
     const std::vector<ModularMultiplierInfo> &multiplier_info,
-    const std::vector<uint32_t> &group_pixel_count,
-    const std::vector<uint32_t> &channel_pixel_count,
-    std::vector<pixel_type> &pixel_samples,
-    std::vector<pixel_type> &diff_samples, size_t max_property_values) {
+    size_t max_property_values) {
   // If we have forced splits because of multipliers, choose channel and group
   // thresholds accordingly.
   std::vector<int32_t> group_multiplier_thresholds;
@@ -859,13 +856,13 @@ void TreeSamples::PreQuantizeProperties(
     if (!channel_multiplier_thresholds.empty()) {
       return channel_multiplier_thresholds;
     }
-    return QuantizeHistogram(channel_pixel_count, max_property_values);
+    return QuantizeHistogram(samples.channel_pixel_count, max_property_values);
   };
   auto quantize_group_id = [&]() {
     if (!group_multiplier_thresholds.empty()) {
       return group_multiplier_thresholds;
     }
-    return QuantizeHistogram(group_pixel_count, max_property_values);
+    return QuantizeHistogram(samples.group_pixel_count, max_property_values);
   };
   auto quantize_coordinate = [&]() {
     std::vector<int32_t> quantized;
@@ -879,16 +876,16 @@ void TreeSamples::PreQuantizeProperties(
   std::vector<int32_t> pixel_thresholds;
   auto quantize_pixel_property = [&]() {
     if (pixel_thresholds.empty()) {
-      pixel_thresholds = QuantizeSamples(pixel_samples, max_property_values);
+      pixel_thresholds = QuantizeSamples(samples.pixel, max_property_values);
     }
     return pixel_thresholds;
   };
   auto quantize_abs_pixel_property = [&]() {
     if (abs_pixel_thresholds.empty()) {
       quantize_pixel_property();  // Compute the non-abs thresholds.
-      for (auto &v : pixel_samples) v = std::abs(v);
+      for (auto &v : samples.pixel) v = std::abs(v);
       abs_pixel_thresholds =
-          QuantizeSamples(pixel_samples, max_property_values);
+          QuantizeSamples(samples.pixel, max_property_values);
     }
     return abs_pixel_thresholds;
   };
@@ -896,15 +893,15 @@ void TreeSamples::PreQuantizeProperties(
   std::vector<int32_t> diff_thresholds;
   auto quantize_diff_property = [&]() {
     if (diff_thresholds.empty()) {
-      diff_thresholds = QuantizeSamples(diff_samples, max_property_values);
+      diff_thresholds = QuantizeSamples(samples.diff, max_property_values);
     }
     return diff_thresholds;
   };
   auto quantize_abs_diff_property = [&]() {
     if (abs_diff_thresholds.empty()) {
       quantize_diff_property();  // Compute the non-abs thresholds.
-      for (auto &v : diff_samples) v = std::abs(v);
-      abs_diff_thresholds = QuantizeSamples(diff_samples, max_property_values);
+      for (auto &v : samples.diff) v = std::abs(v);
+      abs_diff_thresholds = QuantizeSamples(samples.diff, max_property_values);
     }
     return abs_diff_thresholds;
   };
@@ -959,70 +956,6 @@ void TreeSamples::PreQuantizeProperties(
       QuantMap(compact_properties[i], property_mapping[i - num_static_props],
                kPropertyRange * 2 + 1, kPropertyRange);
     }
-  }
-}
-
-void CollectPixelSamples(const Image &image, const ModularOptions &options,
-                         uint32_t group_id,
-                         std::vector<uint32_t> &group_pixel_count,
-                         std::vector<uint32_t> &channel_pixel_count,
-                         std::vector<pixel_type> &pixel_samples,
-                         std::vector<pixel_type> &diff_samples) {
-  if (options.nb_repeats == 0) return;
-  if (group_pixel_count.size() <= group_id) {
-    group_pixel_count.resize(group_id + 1);
-  }
-  if (channel_pixel_count.size() < image.channel.size()) {
-    channel_pixel_count.resize(image.channel.size());
-  }
-  Rng rng(group_id);
-  // Sample 10% of the final number of samples for property quantization.
-  float fraction = std::min(options.nb_repeats * 0.1, 0.99);
-  Rng::GeometricDistribution dist = Rng::MakeGeometric(fraction);
-  size_t total_pixels = 0;
-  std::vector<size_t> channel_ids;
-  for (size_t i = 0; i < image.channel.size(); i++) {
-    if (i >= image.nb_meta_channels &&
-        (image.channel[i].w > options.max_chan_size ||
-         image.channel[i].h > options.max_chan_size)) {
-      break;
-    }
-    if (image.channel[i].w <= 1 || image.channel[i].h == 0) {
-      continue;  // skip empty or width-1 channels.
-    }
-    channel_ids.push_back(i);
-    group_pixel_count[group_id] += image.channel[i].w * image.channel[i].h;
-    channel_pixel_count[i] += image.channel[i].w * image.channel[i].h;
-    total_pixels += image.channel[i].w * image.channel[i].h;
-  }
-  if (channel_ids.empty()) return;
-  pixel_samples.reserve(pixel_samples.size() + fraction * total_pixels);
-  diff_samples.reserve(diff_samples.size() + fraction * total_pixels);
-  size_t i = 0;
-  size_t y = 0;
-  size_t x = 0;
-  auto advance = [&](size_t amount) {
-    x += amount;
-    // Detect row overflow (rare).
-    while (x >= image.channel[channel_ids[i]].w) {
-      x -= image.channel[channel_ids[i]].w;
-      y++;
-      // Detect end-of-channel (even rarer).
-      if (y == image.channel[channel_ids[i]].h) {
-        i++;
-        y = 0;
-        if (i >= channel_ids.size()) {
-          return;
-        }
-      }
-    }
-  };
-  advance(rng.Geometric(dist));
-  for (; i < channel_ids.size(); advance(rng.Geometric(dist) + 1)) {
-    const pixel_type *row = image.channel[channel_ids[i]].Row(y);
-    pixel_samples.push_back(row[x]);
-    size_t xp = x == 0 ? 1 : x - 1;
-    diff_samples.push_back(static_cast<int64_t>(row[x]) - row[xp]);
   }
 }
 
