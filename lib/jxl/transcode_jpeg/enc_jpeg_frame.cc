@@ -365,6 +365,7 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
   fflush(stderr);
   // Force the sophisticated search path: clamp `speed_tier` to at most
   // `kKitten` so that `FromSpeedTier` returns meaningful effort params.
+  auto start_setup = std::chrono::high_resolution_clock::now();
   SpeedTier effective_tier = std::min(speed_tier, SpeedTier::kKitten);
   const JPEGCtxEffortParams effort =
       JPEGCtxEffortParams::FromSpeedTier(effective_tier);
@@ -378,6 +379,13 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
 
   bool cfl_possible = !is_gray && (jpeg_data.components.size() == 3);
   bool cfl_enabled = cfl_ctx.enabled && cfl_possible;
+  auto end_setup = std::chrono::high_resolution_clock::now();
+  fprintf(stderr,
+          "PLANNER: Setup took %.2f ms (gray=%d cfl_possible=%d cfl_enabled=%d)\n",
+          std::chrono::duration<double, std::milli>(end_setup - start_setup).count(),
+          static_cast<int>(is_gray), static_cast<int>(cfl_possible),
+          static_cast<int>(cfl_enabled));
+  fflush(stderr);
 
   // Build CfL context for the optimizer.  When CfL is active we compute
   // the CfL maps ourselves so the optimizer can model residual coefficients.
@@ -412,6 +420,8 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
   auto start_search = std::chrono::high_resolution_clock::now();
   PassSearchResult result;
   if (effort.use_bicluster_search) {
+    fprintf(stderr, "PLANNER: Running biclustered search path\n");
+    fflush(stderr);
     JXL_ASSIGN_OR_RETURN(BiclusterSearchResult bicluster_result,
                          SearchBiclusteredContextModel(opt_data, effort, pool));
     result.thresholds = std::move(bicluster_result.thresholds);
@@ -424,12 +434,15 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
     result.signalling_overhead = bicluster_result.signalling_overhead;
     result.total_cost = bicluster_result.total_cost;
   } else {
+    fprintf(stderr, "PLANNER: Running pass-aware search path\n");
+    fflush(stderr);
     JXL_ASSIGN_OR_RETURN(result, SearchPassAwareContextModel(opt_data, effort, pool));
   }
   auto end_search = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "PLANNER: SearchPassAwareContextModel took %.2f ms (%u passes)\n",
+  fprintf(stderr, "PLANNER: Search stage took %.2f ms (%u passes)\n",
           std::chrono::duration<double, std::milli>(end_search - start_search).count(),
           result.num_passes);
+  fflush(stderr);
 
   JXL_DEBUG_V(2,
               "Pass-aware search: %u passes, %u clusters, "
@@ -440,26 +453,46 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
               bit_cost(result.total_cost));
 
   // Build Passes struct: all zero-shift spatial passes, no downsampling.
+  auto start_plan_setup = std::chrono::high_resolution_clock::now();
   plan.num_passes = result.num_passes;
   plan.passes.num_passes = result.num_passes;
   plan.passes.num_downsample = 0;
   for (uint32_t i = 0; i < result.num_passes; ++i) {
     plan.passes.shift[i] = 0;
   }
+  auto end_plan_setup = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "PLANNER: Pass plan setup took %.2f ms\n",
+          std::chrono::duration<double, std::milli>(end_plan_setup - start_plan_setup)
+              .count());
+  fflush(stderr);
 
   // Convert thresholds + ctx_map into BlockCtxMap.
+  auto start_block_ctx = std::chrono::high_resolution_clock::now();
   JXL_RETURN_IF_ERROR(ConvertToBlockCtxMap(result.thresholds, result.ctx_map,
                                            *opt_data, planner_cfl,
                                            plan.block_ctx_map));
+  auto end_block_ctx = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "PLANNER: ConvertToBlockCtxMap took %.2f ms\n",
+          std::chrono::duration<double, std::milli>(end_block_ctx - start_block_ctx)
+              .count());
+  fflush(stderr);
 
   // Copy pass assignment.
+  auto start_assignment_copy = std::chrono::high_resolution_clock::now();
   for (size_t c = 0; c < 3; ++c) {
     plan.pass_assignment[c] = std::move(result.pass_assignment[c]);
   }
+  auto end_assignment_copy = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "PLANNER: Pass assignment copy took %.2f ms\n",
+          std::chrono::duration<double, std::milli>(end_assignment_copy -
+                                                    start_assignment_copy)
+              .count());
+  fflush(stderr);
 
   auto end_total = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "PLANNER: Total integration planning took %.2f ms\n",
           std::chrono::duration<double, std::milli>(end_total - start_total).count());
+  fflush(stderr);
   return true;
 }
 

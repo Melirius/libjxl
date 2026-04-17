@@ -3,10 +3,45 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Experimental pass-aware context-model search for JPEG lossless
+// recompression.
+//
+// The classic optimizer in `enc_jpeg_frame.cc` searches one global context map
+// over the canonical AC stream. This file implements two related experimental
+// planner lanes that instead reason about multiple progressive AC passes:
+//
+// `SearchPassAwareContextModel`
+//   Assigns blocks to passes, rebuilds a pass-local AC stream, clusters the
+//   resulting `(cell, pass)` contexts, and evaluates thresholds on that
+//   pass-aware model.
+//
+// `SearchBiclusteredContextModel`
+//   Reuses the same pass assignment and threshold search, but also materializes
+//   a fixed `(row, pass, slice)` histogram lattice used to score an initial
+//   biclustering-style objective. In the current prototype this still reuses
+//   the pass-aware row clustering path; it is the scaffolding for the more
+//   ambitious hierarchical biclustering experiment described in
+//   `plans/Passes_histo_clustering.md`.
+//
+// Internal helpers are grouped into four layers:
+//
+// `ActiveRawBins`, `AssignPassesGreedy`, `BuildPassStream`
+//   Build the pass-local view of the AC stream and the block->pass assignment.
+//
+// `ClusterContextsPassAware`, `EvaluatePassAwareModel`
+//   Cluster and score the pass-aware `(cell, pass)` contexts.
+//
+// `RowSliceHistograms`, `BuildRowSliceHistograms`, `EvaluateBiclusterState`
+//   Materialize and score the richer `(row, pass, zdc/pb)` biclustering state.
+//
+// `SearchPassAwareContextModel`, `SearchBiclusteredContextModel`
+//   Drive the candidate search over thresholds and pick the best-scoring model.
+
 #include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,19 +63,42 @@ namespace jxl {
 
 namespace {
 
+using PlannerClock = std::chrono::high_resolution_clock;
+
+// Tiny timing helpers used only for the planner debug prints. We keep them
+// file-local so the instrumentation stays lightweight and does not leak into
+// the public search API.
+int64_t ElapsedNanos(const PlannerClock::time_point& start,
+                     const PlannerClock::time_point& end) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+      .count();
+}
+
+double NanosToMs(int64_t ns) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::nanoseconds(ns))
+      .count();
+}
+
 using SparseHistogram = std::vector<std::unordered_map<uint32_t, uint32_t>>;
 
+// Dense remapping of the AC bins that are actually present in the image.
+// `raw_to_compact` maps raw `ACBin` ids to a compact active-bin index, and
+// `compact_to_czdc` stores the corresponding `(channel, zdc)` selector used by
+// pass assignment.
 struct ActiveRawBins {
   std::vector<ACBin> active_bins;
   std::vector<uint32_t> raw_to_compact;
   std::vector<uint16_t> compact_to_czdc;
 };
 
+// Result of clustering pass-aware `(cell, pass)` contexts.
 struct ClusterResult {
   ContextMap ctx_map;
   uint32_t num_clusters = 0;
 };
 
+// Cost decomposition shared by both experimental search paths.
 struct ModelEvaluation {
   FixedPointCost ac_cost = 0;
   FixedPointCost nz_cost = 0;
@@ -56,33 +114,33 @@ void BlockDCIndices(const JPEGOptData& d, uint32_t c, uint32_t b, uint32_t* dc0,
 uint32_t BlockCell(const JPEGOptData& d, const AxisMaps& axis_maps,
                    const ThresholdSet& thresholds, uint32_t c, uint32_t b);
 
+// Fixed-threshold histogram lattice for the biclustering prototype.
+// Each original row is one `(channel, cell)` pair; within that row we store
+// pass-local AC token histograms for every `zdc` slice and pass-local nz-count
+// histograms for every predictor bucket.
 struct RowSliceHistograms {
   uint32_t num_channels = 0;
   uint32_t num_cells = 0;
   uint32_t num_passes = 1;
-  std::vector<CompactHistogram> ac_hist;
+  std::vector<DenseHistogram<kACTokenCount>> ac_hist;
   std::vector<uint32_t> ac_total;
   std::vector<DenseHistogram<kJPEGNonZeroRange>> nz_hist;
   std::vector<uint32_t> nz_total;
 };
 
-CompactHistogram& EnsureACEntry(RowSliceHistograms* rows, uint32_t row,
-                                uint32_t pass, uint32_t zdc,
-                                uint32_t ac_alphabet_size) {
-  const size_t idx =
-      (static_cast<size_t>(row) * rows->num_passes + pass) *
-          kZeroDensityContextCount +
-      zdc;
-  CompactHistogram& hist = rows->ac_hist[idx];
-  if (hist.counts.empty()) {
-    hist = CompactHistogram(ac_alphabet_size);
-  }
-  return hist;
-}
+// --- Biclustering-state helpers ------------------------------------------------
 
+// Builds the fixed `(row, pass, slice)` histogram lattice for one threshold
+// set and one block-to-pass assignment. AC slices are stored already regrouped
+// by signalling token within a fixed `zdc`, so the per-slice alphabet stays
+// small (`kACTokenCount`) and memory use stays bounded.
 StatusOr<RowSliceHistograms> BuildRowSliceHistograms(
     const JPEGOptData& d, const ThresholdSet& thresholds,
     const PassAssignment& pass_assignment, uint32_t num_passes) {
+  if (d.AC_hist_model != JPEGTranscodeACModel::kToken420) {
+    return JXL_FAILURE(
+        "Biclustered search currently supports only kToken420 AC histograms");
+  }
   AxisMaps axis_maps(d);
   axis_maps.Update(thresholds);
   const uint32_t n0 = static_cast<uint32_t>(thresholds.TY().size() + 1);
@@ -121,13 +179,14 @@ StatusOr<RowSliceHistograms> BuildRowSliceHistograms(
       for (uint32_t pi = d.block_offsets[c][b]; pi < d.block_offsets[c][b + 1];
            ++pi) {
         const CompactACEvent ac_event = d.FromBin(d.block_bins[c][pi]);
-        CompactHistogram& hist =
-            EnsureACEntry(&rows, row, pass, ac_event.zdc, d.ACHistogramSize());
-        hist.Add(ac_event.hist_bin);
         const size_t idx =
             (static_cast<size_t>(row) * num_passes + pass) *
                 kZeroDensityContextCount +
             ac_event.zdc;
+        const SignallingHistSymbol hist_symbol =
+            d.SignallingHistSymbolFromSymbol(
+                d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
+        rows.ac_hist[idx].Add(hist_symbol.token);
         ++rows.ac_total[idx];
       }
     }
@@ -174,6 +233,13 @@ StatusOr<RowSliceHistograms> BuildRowSliceHistograms(
   return rows;
 }
 
+// Scores a biclustering prototype state by first collapsing original rows into
+// the provided `ctx_map` clusters, then summing entropy and histogram-header
+// cost over the resulting pass-local AC and nz slice histograms.
+//
+// The current prototype does not yet perform the full alternating row/prototype
+// agglomeration from the design doc; it uses this evaluator on top of the
+// pass-aware row clustering result to estimate the richer objective.
 StatusOr<ModelEvaluation> EvaluateBiclusterState(
     const JPEGOptData& d, const ThresholdSet& thresholds, const ContextMap& ctx_map,
     uint32_t num_row_clusters, const PassAssignment& pass_assignment,
@@ -185,8 +251,7 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
       static_cast<size_t>(num_row_clusters) * num_passes * kZeroDensityContextCount;
   const size_t nz_slots =
       static_cast<size_t>(num_row_clusters) * num_passes * kJPEGNonZeroBuckets;
-  std::vector<CompactHistogram> ac_cluster_hist(ac_slots,
-                                                CompactHistogram(d.ACHistogramSize()));
+  std::vector<DenseHistogram<kACTokenCount>> ac_cluster_hist(ac_slots);
   std::vector<uint32_t> ac_cluster_total(ac_slots, 0);
   std::vector<DenseHistogram<kJPEGNonZeroRange>> nz_cluster_hist(nz_slots);
   std::vector<uint32_t> nz_cluster_total(nz_slots, 0);
@@ -201,7 +266,7 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
         const size_t dst = (static_cast<size_t>(cluster) * num_passes + pass) *
                                kZeroDensityContextCount +
                            zdc;
-        if (!rows.ac_hist[src].counts.empty()) {
+        if (!rows.ac_hist[src].empty()) {
           ac_cluster_hist[dst].AddHistogram(rows.ac_hist[src]);
           ac_cluster_total[dst] += rows.ac_total[src];
         }
@@ -231,21 +296,15 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
         if (ac_cluster_total[idx] == 0) continue;
         ++(*num_prototypes_per_pass)[pass];
         eval.ac_cost += d.ftab[ac_cluster_total[idx]];
-        ac_cluster_hist[idx].ForEachNonZero(
-            [&](uint32_t, uint32_t freq) { eval.ac_cost -= d.ftab[freq]; });
         std::array<uint32_t, kACTokenCount> token_counts = {};
-        const auto& dense_to_zdcvalue = d.ACHistogram().dense_to_zdcvalue;
-        ac_cluster_hist[idx].ForEachNonZero([&](uint32_t id, uint32_t freq) {
-          const SignallingHistSymbol hist_symbol =
-              d.SignallingHistSymbolFromSymbol(dense_to_zdcvalue[id]);
-          token_counts[hist_symbol.token] += freq;
-        });
         uint32_t max_token = 0;
         size_t total = 0;
         for (uint32_t t = 0; t < kACTokenCount; ++t) {
+          token_counts[t] = ac_cluster_hist[idx][t];
           if (token_counts[t] == 0) continue;
           max_token = t;
           total += token_counts[t];
+          eval.ac_cost -= d.ftab[token_counts[t]];
         }
         if (total != 0) {
           Histogram h(max_token + 1);
@@ -287,12 +346,17 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
   return eval;
 }
 
+// --- Pass-aware stream construction --------------------------------------------
+
 struct EmitBin {
   ACBin raw_bin;
   uint32_t hist_key;
   uint32_t compact_id;
 };
 
+// Scans the JPEG AC stream and compacts the raw `ACBin` space down to only the
+// bins that actually occur in the image. The resulting active-bin tables drive
+// both greedy pass assignment and pass-stream construction.
 ActiveRawBins BuildActiveRawBins(const JPEGOptData& d) {
   ActiveRawBins out;
   const size_t raw_bin_count = static_cast<size_t>(d.channels) * kMaxACSymbolCount;
@@ -321,6 +385,9 @@ void ForEachBlockBin(const JPEGOptData& d, uint32_t c, uint32_t b, Func&& fn) {
   }
 }
 
+// Returns the top-left-anchored DC bucket indices for the current block in all
+// components. This mirrors the coordinate convention used by the main
+// clustering path and lets pass-aware code rebuild the same cell ids.
 void BlockDCIndices(const JPEGOptData& d, uint32_t c, uint32_t b, uint32_t* dc0,
                     uint32_t* dc1, uint32_t* dc2) {
   const uint32_t y = b / d.block_grid_w[c];
@@ -338,6 +405,8 @@ void BlockDCIndices(const JPEGOptData& d, uint32_t c, uint32_t b, uint32_t* dc0,
   *dc2 = d.block_DC_idx[2][b2];
 }
 
+// Maps one block to its threshold cell id for the given threshold set. This is
+// shared by the pass-aware evaluator and the biclustering lattice builder.
 uint32_t BlockCell(const JPEGOptData& d, const AxisMaps& axis_maps,
                    const ThresholdSet& thresholds, uint32_t c, uint32_t b) {
   if (d.channels == 1) {
@@ -355,6 +424,9 @@ uint32_t BlockCell(const JPEGOptData& d, const AxisMaps& axis_maps,
          axis_maps.ax0_to_k[d.block_DC_idx[0][b0]];
 }
 
+// Greedy local-search assignment of image blocks to progressive AC passes.
+// The objective is the same `ftab`-based entropy proxy used elsewhere in the
+// planner, but applied to pass-local AC and `zdc` counts.
 PassAssignment AssignPassesGreedy(const JPEGOptData& d, const ActiveRawBins& active,
                                   uint32_t num_passes) {
   PassAssignment pass_assignment;
@@ -462,6 +534,9 @@ PassAssignment AssignPassesGreedy(const JPEGOptData& d, const ActiveRawBins& act
   return pass_assignment;
 }
 
+// Metadata for one compact active bin while rebuilding the pass-local AC
+// stream. `hist_key` matches the encoder's chosen AC histogram model so bins
+// can be emitted in histogram-major order.
 std::vector<EmitBin> BuildEmitBins(const JPEGOptData& d,
                                    const ActiveRawBins& active) {
   std::vector<EmitBin> emit_bins;
@@ -481,6 +556,9 @@ std::vector<EmitBin> BuildEmitBins(const JPEGOptData& d,
   return emit_bins;
 }
 
+// Rebuilds the AC stream after pass assignment. The resulting stream keeps the
+// same packed-entry layout as the canonical optimizer stream, but is split into
+// independent contiguous pass ranges recorded in `pass_offsets`.
 StatusOr<std::vector<ACEntry>> BuildPassStream(
     const JPEGOptData& d, const ActiveRawBins& active,
     const PassAssignment& pass_assignment, uint32_t num_passes,
@@ -605,6 +683,8 @@ StatusOr<std::vector<ACEntry>> BuildPassStream(
   return stream;
 }
 
+// --- Pass-aware clustering and scoring -----------------------------------------
+
 template <typename Func>
 void ForEachIntersection(const std::unordered_map<uint32_t, uint32_t>& lhs,
                          const std::unordered_map<uint32_t, uint32_t>& rhs,
@@ -620,6 +700,8 @@ void ForEachIntersection(const std::unordered_map<uint32_t, uint32_t>& lhs,
   }
 }
 
+// Small union-find helper for the agglomerative merge loop in
+// `ClusterContextsPassAware`.
 uint32_t FindRoot(std::vector<uint32_t>& parent, uint32_t x) {
   uint32_t root = x;
   while (parent[root] != root) {
@@ -633,6 +715,8 @@ uint32_t FindRoot(std::vector<uint32_t>& parent, uint32_t x) {
   return root;
 }
 
+// Entropy proxy for one sparse nz histogram. Kept file-local because only the
+// pass-aware search uses this sparse-map representation.
 FixedPointCost HistogramCost(const JPEGOptData& d,
                       const std::unordered_map<uint32_t, uint32_t>& hist) {
   FixedPointCost cost = 0;
@@ -642,6 +726,10 @@ FixedPointCost HistogramCost(const JPEGOptData& d,
   return cost;
 }
 
+// Agglomerative clustering of the pass-aware `(cell, pass)` contexts.
+// Thresholds define the rows/cells; the prebuilt pass stream defines the
+// pass-local AC events. The result is a flat `ctx_map` over original
+// `(channel, cell)` rows.
 StatusOr<ClusterResult> ClusterContextsPassAware(
     const JPEGOptData& d, const ThresholdSet& thresholds,
     const std::vector<ACEntry>& pass_stream, const std::vector<uint32_t>& pass_offsets,
@@ -797,6 +885,8 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
   return out;
 }
 
+// Estimates histogram-header cost for one sparse AC histogram by regrouping its
+// symbols into signalling-token histograms split by `zdc`.
 StatusOr<FixedPointCost> SignalOverheadFromHist(
     const JPEGOptData& d,
     const std::unordered_map<uint32_t, uint32_t>& hist_h) {
@@ -835,6 +925,8 @@ StatusOr<FixedPointCost> SignalOverheadFromHist(
   return overhead;
 }
 
+// Estimates histogram-header cost for one sparse nz histogram by splitting it
+// into one histogram per predictor bucket.
 StatusOr<FixedPointCost> SignalOverheadFromNZHist(
     const std::unordered_map<uint32_t, uint32_t>& nz_hist) {
   FixedPointCost overhead = 0;
@@ -868,6 +960,9 @@ StatusOr<FixedPointCost> SignalOverheadFromNZHist(
   return overhead;
 }
 
+// Fully evaluates one pass-aware model: rebuilds clustered AC and nz
+// histograms, computes entropy terms, and adds the estimated histogram-header
+// signalling cost.
 StatusOr<ModelEvaluation> EvaluatePassAwareModel(
     const JPEGOptData& d, const ThresholdSet& thresholds,
     const ContextMap& ctx_map, uint32_t num_clusters,
@@ -961,6 +1056,7 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
   return eval;
 }
 
+// Optional threshold refinement stage reused by both experimental searches.
 ThresholdSet RefinePassAwareThresholds(
     PartitioningCtx& ctx, const ThresholdSet& thresholds,
     const std::vector<ACEntry>& pass_stream,
@@ -971,6 +1067,9 @@ ThresholdSet RefinePassAwareThresholds(
                                 effort.refine_iters, &ignored_cost);
 }
 
+// Heuristic upper bound for the number of progressive passes worth considering
+// from the image size. The current experimental path still hardcodes a single
+// pass count, but this helper documents the intended scaling rule.
 uint32_t ComputeMaxNumPasses(const JPEGOptData& d) {
   const double groups_x = static_cast<double>((d.w_max + 31) / 32);
   const double groups_y = static_cast<double>((d.h_max + 31) / 32);
@@ -981,6 +1080,10 @@ uint32_t ComputeMaxNumPasses(const JPEGOptData& d) {
 
 }  // namespace
 
+// Runs the pass-aware planner on a fixed candidate list. For each candidate we
+// optimize thresholds against the pass-local AC stream, cluster the resulting
+// `(cell, pass)` contexts, evaluate the model, optionally refine thresholds,
+// and keep the best-scoring result.
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const std::vector<FactorizationCandidate>& candidates,
@@ -1005,14 +1108,33 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
     auto start_pass_config = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "PLANNER: Testing configuration with %u passes\n", num_passes);
     fflush(stderr);
+    auto start_assign_passes = PlannerClock::now();
     PassAssignment pass_assignment =
         AssignPassesGreedy(d, active, num_passes);
+    auto end_assign_passes = PlannerClock::now();
+    fprintf(stderr, "PLANNER: AssignPassesGreedy took %.2f ms\n",
+            NanosToMs(ElapsedNanos(start_assign_passes, end_assign_passes)));
+    fflush(stderr);
+
+    auto start_build_stream = PlannerClock::now();
     std::vector<uint32_t> pass_offsets;
     JXL_ASSIGN_OR_RETURN(std::vector<ACEntry> pass_stream,
                          BuildPassStream(d, active, pass_assignment, num_passes,
                                          &pass_offsets));
+    auto end_build_stream = PlannerClock::now();
+    fprintf(stderr, "PLANNER: BuildPassStream took %.2f ms\n",
+            NanosToMs(ElapsedNanos(start_build_stream, end_build_stream)));
+    fflush(stderr);
+
+    std::atomic<int64_t> rough_opt_ns(0);
+    std::atomic<int64_t> cluster_ns(0);
+    std::atomic<int64_t> rough_eval_ns(0);
+    std::atomic<int64_t> refine_ns(0);
+    std::atomic<int64_t> refined_eval_ns(0);
+    std::atomic<uint32_t> processed_candidates(0);
 
     std::vector<PartitioningCtx> ctx_pool;
+    auto start_candidate_loop = PlannerClock::now();
     JXL_RETURN_IF_ERROR(RunOnPool(
         pool, 0, static_cast<uint32_t>(candidates.size()),
         [&](size_t num_threads) -> Status {
@@ -1026,32 +1148,57 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
           PartitioningCtx& ctx = ctx_pool[thread_id];
           const FactorizationCandidate& candidate = candidates[idx];
 
+          auto start_rough_opt = PlannerClock::now();
           FixedPointCost rough_unclustered_cost = 0;
           ThresholdSet rough_thresholds =
               ctx.OptimizeThresholds(candidate.init, pass_stream,
                                      effort.main_m_target, effort.main_iters,
                                      &rough_unclustered_cost);
+          auto end_rough_opt = PlannerClock::now();
+          rough_opt_ns.fetch_add(
+              ElapsedNanos(start_rough_opt, end_rough_opt),
+              std::memory_order_relaxed);
 
+          auto start_cluster = PlannerClock::now();
           JXL_ASSIGN_OR_RETURN(
               ClusterResult cluster_result,
               ClusterContextsPassAware(d, rough_thresholds, pass_stream,
                                        pass_offsets, num_passes,
                                        target_clusters));
+          auto end_cluster = PlannerClock::now();
+          cluster_ns.fetch_add(ElapsedNanos(start_cluster, end_cluster),
+                               std::memory_order_relaxed);
 
+          auto start_rough_eval = PlannerClock::now();
           JXL_ASSIGN_OR_RETURN(
               ModelEvaluation rough_eval,
               EvaluatePassAwareModel(d, rough_thresholds, cluster_result.ctx_map,
                                      cluster_result.num_clusters, pass_assignment,
                                      num_passes, pass_stream, pass_offsets));
+          auto end_rough_eval = PlannerClock::now();
+          rough_eval_ns.fetch_add(
+              ElapsedNanos(start_rough_eval, end_rough_eval),
+              std::memory_order_relaxed);
 
+          auto start_refine = PlannerClock::now();
           ThresholdSet refined_thresholds =
               RefinePassAwareThresholds(ctx, rough_thresholds, pass_stream,
                                         effort);
+          auto end_refine = PlannerClock::now();
+          refine_ns.fetch_add(ElapsedNanos(start_refine, end_refine),
+                              std::memory_order_relaxed);
+
+          auto start_refined_eval = PlannerClock::now();
           JXL_ASSIGN_OR_RETURN(
               ModelEvaluation refined_eval,
               EvaluatePassAwareModel(d, refined_thresholds, cluster_result.ctx_map,
                                      cluster_result.num_clusters, pass_assignment,
                                      num_passes, pass_stream, pass_offsets));
+          auto end_refined_eval = PlannerClock::now();
+          refined_eval_ns.fetch_add(
+              ElapsedNanos(start_refined_eval, end_refined_eval),
+              std::memory_order_relaxed);
+          processed_candidates.fetch_add(1, std::memory_order_relaxed);
 
           const bool refined_is_better =
               refined_eval.total_cost() < rough_eval.total_cost();
@@ -1075,6 +1222,35 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
           return true;
         },
         "JpegCtxPasses"));
+    auto end_candidate_loop = PlannerClock::now();
+    const uint32_t num_processed = processed_candidates.load(
+        std::memory_order_relaxed);
+    fprintf(stderr,
+            "PLANNER: Candidate loop took %.2f ms wall time (%u candidates)\n",
+            NanosToMs(ElapsedNanos(start_candidate_loop, end_candidate_loop)),
+            num_processed);
+    if (num_processed != 0) {
+      fprintf(stderr,
+              "PLANNER: Candidate stages (sum/avg ms): rough_opt=%.2f/%.2f "
+              "cluster=%.2f/%.2f rough_eval=%.2f/%.2f refine=%.2f/%.2f "
+              "refined_eval=%.2f/%.2f\n",
+              NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)),
+              NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)) /
+                  num_processed,
+              NanosToMs(cluster_ns.load(std::memory_order_relaxed)),
+              NanosToMs(cluster_ns.load(std::memory_order_relaxed)) /
+                  num_processed,
+              NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)),
+              NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)) /
+                  num_processed,
+              NanosToMs(refine_ns.load(std::memory_order_relaxed)),
+              NanosToMs(refine_ns.load(std::memory_order_relaxed)) /
+                  num_processed,
+              NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)),
+              NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)) /
+                  num_processed);
+    }
+    fflush(stderr);
     auto end_pass_config = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "PLANNER: Pass configuration %u took %.2f ms\n", num_passes,
             std::chrono::duration<double, std::milli>(end_pass_config - start_pass_config).count());
@@ -1087,6 +1263,7 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
   return best_result;
 }
 
+// Convenience overload that ranks/trims factorization candidates first.
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool) {
@@ -1101,6 +1278,9 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
   return SearchPassAwareContextModel(opt_data, candidates, effort, pool);
 }
 
+// Biclustering-prototype search on a fixed candidate list. This currently
+// shares the pass-aware threshold optimization and row clustering steps, then
+// re-scores each candidate on the richer `(row, pass, slice)` lattice.
 StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const std::vector<FactorizationCandidate>& candidates,
@@ -1118,14 +1298,35 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
   best_result.total_cost = std::numeric_limits<FixedPointCost>::max();
   std::mutex mu;
 
+  auto start_assign_passes = PlannerClock::now();
   PassAssignment pass_assignment =
       AssignPassesGreedy(d, active, target_num_passes);
+  auto end_assign_passes = PlannerClock::now();
+  fprintf(stderr, "PLANNER: [bicluster] AssignPassesGreedy took %.2f ms\n",
+          NanosToMs(ElapsedNanos(start_assign_passes, end_assign_passes)));
+  fflush(stderr);
+
+  auto start_build_stream = PlannerClock::now();
   std::vector<uint32_t> pass_offsets;
   JXL_ASSIGN_OR_RETURN(std::vector<ACEntry> pass_stream,
                        BuildPassStream(d, active, pass_assignment,
                                        target_num_passes, &pass_offsets));
+  auto end_build_stream = PlannerClock::now();
+  fprintf(stderr, "PLANNER: [bicluster] BuildPassStream took %.2f ms\n",
+          NanosToMs(ElapsedNanos(start_build_stream, end_build_stream)));
+  fflush(stderr);
+
+  std::atomic<int64_t> rough_opt_ns(0);
+  std::atomic<int64_t> cluster_ns(0);
+  std::atomic<int64_t> rough_build_rows_ns(0);
+  std::atomic<int64_t> rough_eval_ns(0);
+  std::atomic<int64_t> refine_ns(0);
+  std::atomic<int64_t> refined_build_rows_ns(0);
+  std::atomic<int64_t> refined_eval_ns(0);
+  std::atomic<uint32_t> processed_candidates(0);
 
   std::vector<PartitioningCtx> ctx_pool;
+  auto start_candidate_loop = PlannerClock::now();
   JXL_RETURN_IF_ERROR(RunOnPool(
       pool, 0, static_cast<uint32_t>(candidates.size()),
       [&](size_t num_threads) -> Status {
@@ -1139,44 +1340,71 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
         PartitioningCtx& ctx = ctx_pool[thread_id];
         const FactorizationCandidate& candidate = candidates[idx];
 
+        auto start_rough_opt = PlannerClock::now();
         FixedPointCost rough_unclustered_cost = 0;
         ThresholdSet rough_thresholds =
             ctx.OptimizeThresholds(candidate.init, pass_stream,
                                    effort.main_m_target, effort.main_iters,
                                    &rough_unclustered_cost);
+        auto end_rough_opt = PlannerClock::now();
+        rough_opt_ns.fetch_add(ElapsedNanos(start_rough_opt, end_rough_opt),
+                               std::memory_order_relaxed);
 
+        auto start_cluster = PlannerClock::now();
         JXL_ASSIGN_OR_RETURN(
             ClusterResult cluster_result,
             ClusterContextsPassAware(d, rough_thresholds, pass_stream,
                                      pass_offsets, target_num_passes,
                                      std::min(target_clusters,
                                               effort.bicluster_row_budget)));
+        auto end_cluster = PlannerClock::now();
+        cluster_ns.fetch_add(ElapsedNanos(start_cluster, end_cluster),
+                             std::memory_order_relaxed);
 
-        JXL_ASSIGN_OR_RETURN(
-            RowSliceHistograms rough_rows,
-            BuildRowSliceHistograms(d, rough_thresholds, pass_assignment,
-                                    target_num_passes));
         std::vector<uint32_t> rough_num_prototypes;
-        JXL_ASSIGN_OR_RETURN(ModelEvaluation rough_eval,
-                             EvaluateBiclusterState(
-                                 d, rough_thresholds, cluster_result.ctx_map,
-                                 cluster_result.num_clusters, pass_assignment,
-                                 target_num_passes, rough_rows,
-                                 &rough_num_prototypes));
+        auto evaluate_thresholds =
+            [&](const ThresholdSet& thresholds, std::atomic<int64_t>* build_ns,
+                std::atomic<int64_t>* eval_ns,
+                std::vector<uint32_t>* num_prototypes)
+            -> StatusOr<ModelEvaluation> {
+          auto start_build_rows = PlannerClock::now();
+          JXL_ASSIGN_OR_RETURN(
+              RowSliceHistograms rows,
+              BuildRowSliceHistograms(d, thresholds, pass_assignment,
+                                      target_num_passes));
+          auto end_build_rows = PlannerClock::now();
+          build_ns->fetch_add(ElapsedNanos(start_build_rows, end_build_rows),
+                              std::memory_order_relaxed);
 
+          auto start_eval = PlannerClock::now();
+          JXL_ASSIGN_OR_RETURN(ModelEvaluation eval, EvaluateBiclusterState(
+              d, thresholds, cluster_result.ctx_map,
+              cluster_result.num_clusters, pass_assignment,
+              target_num_passes, rows, num_prototypes));
+          auto end_eval = PlannerClock::now();
+          eval_ns->fetch_add(ElapsedNanos(start_eval, end_eval),
+                             std::memory_order_relaxed);
+          return eval;
+        };
+        JXL_ASSIGN_OR_RETURN(ModelEvaluation rough_eval,
+                             evaluate_thresholds(rough_thresholds,
+                                                 &rough_build_rows_ns,
+                                                 &rough_eval_ns,
+                                                 &rough_num_prototypes));
+
+        auto start_refine = PlannerClock::now();
         ThresholdSet refined_thresholds =
             RefinePassAwareThresholds(ctx, rough_thresholds, pass_stream, effort);
-        JXL_ASSIGN_OR_RETURN(
-            RowSliceHistograms refined_rows,
-            BuildRowSliceHistograms(d, refined_thresholds, pass_assignment,
-                                    target_num_passes));
+        auto end_refine = PlannerClock::now();
+        refine_ns.fetch_add(ElapsedNanos(start_refine, end_refine),
+                            std::memory_order_relaxed);
         std::vector<uint32_t> refined_num_prototypes;
         JXL_ASSIGN_OR_RETURN(ModelEvaluation refined_eval,
-                             EvaluateBiclusterState(
-                                 d, refined_thresholds, cluster_result.ctx_map,
-                                 cluster_result.num_clusters, pass_assignment,
-                                 target_num_passes, refined_rows,
-                                 &refined_num_prototypes));
+                             evaluate_thresholds(refined_thresholds,
+                                                 &refined_build_rows_ns,
+                                                 &refined_eval_ns,
+                                                 &refined_num_prototypes));
+        processed_candidates.fetch_add(1, std::memory_order_relaxed);
 
         const bool refined_is_better =
             refined_eval.total_cost() < rough_eval.total_cost();
@@ -1209,6 +1437,43 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
         return true;
       },
       "JpegCtxBicluster"));
+  auto end_candidate_loop = PlannerClock::now();
+  const uint32_t num_processed =
+      processed_candidates.load(std::memory_order_relaxed);
+  fprintf(stderr,
+          "PLANNER: [bicluster] Candidate loop took %.2f ms wall time (%u candidates)\n",
+          NanosToMs(ElapsedNanos(start_candidate_loop, end_candidate_loop)),
+          num_processed);
+  if (num_processed != 0) {
+    fprintf(stderr,
+            "PLANNER: [bicluster] Candidate stages (sum/avg ms): "
+            "rough_opt=%.2f/%.2f cluster=%.2f/%.2f "
+            "rough_build_rows=%.2f/%.2f rough_eval=%.2f/%.2f "
+            "refine=%.2f/%.2f refined_build_rows=%.2f/%.2f "
+            "refined_eval=%.2f/%.2f\n",
+            NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)),
+            NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)) /
+                num_processed,
+            NanosToMs(cluster_ns.load(std::memory_order_relaxed)),
+            NanosToMs(cluster_ns.load(std::memory_order_relaxed)) /
+                num_processed,
+            NanosToMs(rough_build_rows_ns.load(std::memory_order_relaxed)),
+            NanosToMs(rough_build_rows_ns.load(std::memory_order_relaxed)) /
+                num_processed,
+            NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)),
+            NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)) /
+                num_processed,
+            NanosToMs(refine_ns.load(std::memory_order_relaxed)),
+            NanosToMs(refine_ns.load(std::memory_order_relaxed)) /
+                num_processed,
+            NanosToMs(refined_build_rows_ns.load(std::memory_order_relaxed)),
+            NanosToMs(refined_build_rows_ns.load(std::memory_order_relaxed)) /
+                num_processed,
+            NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)),
+            NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)) /
+                num_processed);
+  }
+  fflush(stderr);
 
   if (best_result.total_cost == std::numeric_limits<FixedPointCost>::max()) {
     return JXL_FAILURE("Biclustered search did not produce a result");
@@ -1216,6 +1481,7 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
   return best_result;
 }
 
+// Convenience overload that ranks/trims factorization candidates first.
 StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool) {
