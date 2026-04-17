@@ -7,11 +7,14 @@
 #define LIB_JXL_ENC_JPEG_FRAME_H_
 
 #include <array>
+#include <cstdint>
+#include <vector>
 
 #include "lib/jxl/ac_context.h"
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/common.h"
+#include "lib/jxl/frame_header.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/jpeg/jpeg_data.h"
 
@@ -51,6 +54,35 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
                               SpeedTier speed_tier,
                               const JpegCflContext& cfl_ctx,
                               BlockCtxMap& ctx_map, ThreadPool* pool);
+
+// Per-channel, per-block pass ownership.
+// pass_assignment[c][block_idx] = owning pass for that block of channel c.
+using JPEGPassAssignment = std::array<std::vector<uint8_t>, 3>;
+
+// Complete planning result for pass-aware JPEG recompression.
+// Replaces the legacy "ctx map only" output when the pass-aware optimizer
+// is enabled.
+struct JPEGPassEncodingPlan {
+  // Frame-header pass layout (zero-shift spatial passes).
+  Passes passes;
+  // Optimized block context map (thresholds + clustering).
+  BlockCtxMap block_ctx_map;
+  // Per-channel, per-block pass assignment.
+  JPEGPassAssignment pass_assignment;
+  // Number of passes selected by the optimizer.
+  uint32_t num_passes = 1;
+};
+
+// Run the pass-aware JPEG recompression planner.
+// Builds `JPEGOptData`, runs `SearchPassAwareContextModel`,
+// converts the result into a complete `JPEGPassEncodingPlan`.
+// Forces the sophisticated search path regardless of `speed_tier`.
+Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
+                                      const jpeg::JPEGData& jpeg_data,
+                                      SpeedTier speed_tier,
+                                      const JpegCflContext& cfl_ctx,
+                                      JPEGPassEncodingPlan& plan,
+                                      ThreadPool* pool);
 
 }  // namespace jxl
 

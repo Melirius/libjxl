@@ -20,6 +20,7 @@
 #include "lib/jxl/dct_util.h"
 #include "lib/jxl/enc_ans.h"
 #include "lib/jxl/enc_bit_writer.h"
+#include "lib/jxl/enc_jpeg_frame.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/enc_progressive_split.h"
 #include "lib/jxl/frame_header.h"
@@ -61,6 +62,11 @@ struct PassesEncoderState {
 
   std::vector<PassData> passes;
   std::vector<size_t> histogram_idx;
+
+  // When set, the pass-aware JPEG recompression plan is active.
+  // The plan owns the pass layout, `block_ctx_map`, and pass assignment.
+  bool has_jpeg_pass_plan = false;
+  JPEGPassEncodingPlan jpeg_pass_plan;
 
   // Block sizes seen so far.
   uint32_t used_acs = 0;

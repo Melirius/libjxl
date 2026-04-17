@@ -1091,9 +1091,32 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
               }
             }
           }
-          enc_state->progressive_splitter.SplitACCoefficients(
-              block, AcStrategy::FromRawStrategy(AcStrategyType::DCT), bx, by,
-              coeffs);
+          if (enc_state->has_jpeg_pass_plan) {
+            // Pass-aware path: assign the full block to its owning pass,
+            // zero out all other passes.
+            const auto& plan = enc_state->jpeg_pass_plan;
+            size_t jpeg_c = jpeg_c_map[c];
+            size_t block_idx =
+                (by >> vshift) *
+                    jpeg_data.components[jpeg_c].width_in_blocks +
+                (bx >> hshift);
+            uint8_t owning_pass = plan.pass_assignment[jpeg_c][block_idx];
+            for (size_t i = 0; i < enc_state->coeffs.size(); i++) {
+              if (i == owning_pass) {
+                for (size_t k = 0; k < kDCTBlockSize; k++) {
+                  coeffs[i][k] = block[k];
+                }
+              } else {
+                for (size_t k = 0; k < kDCTBlockSize; k++) {
+                  coeffs[i][k] = 0;
+                }
+              }
+            }
+          } else {
+            enc_state->progressive_splitter.SplitACCoefficients(
+                block, AcStrategy::FromRawStrategy(AcStrategyType::DCT), bx, by,
+                coeffs);
+          }
           for (size_t i = 0; i < enc_state->coeffs.size(); i++) {
             coeffs[i] += kDCTBlockSize;
           }
@@ -1102,7 +1125,10 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
     }
   }
 
-  if (enc_state->cparams.speed_tier >= SpeedTier::kSquirrel) {
+  if (enc_state->has_jpeg_pass_plan) {
+    // Pass-aware path: install the pre-computed block_ctx_map from the plan.
+    enc_state->shared.block_ctx_map = enc_state->jpeg_pass_plan.block_ctx_map;
+  } else if (enc_state->cparams.speed_tier >= SpeedTier::kSquirrel) {
     JXL_RETURN_IF_ERROR(
         ComputeJPEGContextMap(jpeg_data, enc_state, total_dc, dc_counts, qt));
   } else {
@@ -1171,11 +1197,19 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
 
 Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
                              const FrameDimensions& frame_dim) {
+  const size_t num_passes = enc_state.passes.size();
   auto used_orders_info = ComputeUsedOrders(
       enc_state.cparams.speed_tier, enc_state.shared.ac_strategy,
       Rect(enc_state.shared.raw_quant_field));
-  enc_state.used_orders.resize(enc_state.progressive_splitter.GetNumPasses());
-  for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
+  // In the pass-aware JPEG path, force coefficient order computation on
+  // (at least for DCT8x8) regardless of speed tier, since per-pass order
+  // gives significant benefit with spatial passes.
+  if (enc_state.has_jpeg_pass_plan) {
+    used_orders_info.first |= 1;   // DCT8x8 = order 0
+    used_orders_info.second |= 1;
+  }
+  enc_state.used_orders.resize(num_passes);
+  for (size_t i = 0; i < num_passes; i++) {
     JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
         enc_state.cparams.speed_tier, *enc_state.coeffs[i],
         enc_state.shared.ac_strategy, frame_dim, enc_state.used_orders[i],
@@ -1270,7 +1304,10 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
         }));
   }
 
-  for (size_t i = 0; i < enc_state->progressive_splitter.GetNumPasses(); i++) {
+  const size_t num_passes = enc_state->has_jpeg_pass_plan
+      ? enc_state->passes.size()
+      : enc_state->progressive_splitter.GetNumPasses();
+  for (size_t i = 0; i < num_passes; i++) {
     // Encode coefficient orders.
     if (!enc_state->streaming_mode) {
       size_t order_bits = 0;
@@ -1337,7 +1374,9 @@ Status EncodeGroups(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = shared.memory_manager;
   const FrameDimensions& frame_dim = shared.frame_dim;
   const size_t num_groups = frame_dim.num_groups;
-  const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
+  const size_t num_passes = enc_state->has_jpeg_pass_plan
+      ? enc_state->passes.size()
+      : enc_state->progressive_splitter.GetNumPasses();
   const size_t global_ac_index = frame_dim.num_dc_groups + 1;
   const bool is_small_image =
       !enc_state->streaming_mode && num_groups == 1 && num_passes == 1;
@@ -1660,7 +1699,14 @@ Status ComputeEncodingData(
   }
 
   if (frame_header.encoding == FrameEncoding::kVarDCT) {
-    enc_state.passes.resize(enc_state.progressive_splitter.GetNumPasses());
+    // In the pass-aware JPEG path, num_passes comes from the plan
+    // (already written into frame_header.passes); otherwise from the
+    // progressive splitter.
+    const size_t num_passes_for_alloc =
+        enc_state.has_jpeg_pass_plan
+            ? frame_header.passes.num_passes
+            : enc_state.progressive_splitter.GetNumPasses();
+    enc_state.passes.resize(num_passes_for_alloc);
     for (PassesEncoderState::PassData& pass : enc_state.passes) {
       pass.ac_tokens.resize(shared.frame_dim.num_groups);
     }
@@ -2036,7 +2082,10 @@ StatusOr<std::unique_ptr<BitWriter>> OutputAcGlobal(
         }));
   }
   const PassesSharedState& shared = enc_state.shared;
-  for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
+  const size_t num_passes = enc_state.has_jpeg_pass_plan
+      ? enc_state.passes.size()
+      : enc_state.progressive_splitter.GetNumPasses();
+  for (size_t i = 0; i < num_passes; i++) {
     // Encode coefficient orders.
     size_t order_bits = 0;
     JXL_RETURN_IF_ERROR(
@@ -2070,7 +2119,11 @@ JXL_NOINLINE Status EncodeFrameStreaming(
     const JxlCmsInterface& cms, ThreadPool* pool,
     JxlEncoderOutputProcessorWrapper* output_processor, AuxOut* aux_out) {
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
-  SetProgressiveMode(cparams, &enc_state->progressive_splitter);
+  const bool pass_aware_jpeg =
+      cparams.jpeg_optimize_passes && frame_data.IsJPEG();
+  if (!pass_aware_jpeg) {
+    SetProgressiveMode(cparams, &enc_state->progressive_splitter);
+  }
   FrameHeader frame_header(metadata);
   std::unique_ptr<jpeg::JPEGData> jpeg_data;
   if (frame_data.IsJPEG()) {
@@ -2081,7 +2134,29 @@ JXL_NOINLINE Status EncodeFrameStreaming(
                                       cparams, enc_state->progressive_splitter,
                                       frame_info, jpeg_data.get(), true,
                                       &frame_header));
-  const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
+  // Pass-aware JPEG recompression: run the planner and overwrite passes.
+  // The planner computes CfL maps internally when CfL is enabled.
+  if (pass_aware_jpeg && jpeg_data) {
+    auto jpeg_c_map = JpegOrder(frame_header.color_transform,
+                                jpeg_data->components.size() == 1);
+    bool cfl_enabled = cparams.force_cfl_jpeg_recompression &&
+                       frame_header.chroma_subsampling.Is444() &&
+                       jpeg_data->components.size() == 3;
+    ImageSB dummy_map;
+    int32_t dummy_qt[kDCTBlockSize] = {};
+    JpegCflContext cfl_ctx = {jpeg_c_map,
+                              cfl_enabled,
+                              {&dummy_map, &dummy_map},
+                              {dummy_qt, dummy_qt}};
+    JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
+        memory_manager, *jpeg_data, cparams.speed_tier, cfl_ctx,
+        enc_state->jpeg_pass_plan, pool));
+    enc_state->has_jpeg_pass_plan = true;
+    frame_header.passes = enc_state->jpeg_pass_plan.passes;
+  }
+  const size_t num_passes = pass_aware_jpeg
+                                ? frame_header.passes.num_passes
+                                : enc_state->progressive_splitter.GetNumPasses();
   JXL_ASSIGN_OR_RETURN(
       auto enc_modular,
       ModularFrameEncoder::Create(memory_manager, frame_header, cparams, true));
@@ -2251,7 +2326,11 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                           JxlEncoderOutputProcessorWrapper* output_processor,
                           AuxOut* aux_out) {
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
-  SetProgressiveMode(cparams, &enc_state->progressive_splitter);
+  const bool pass_aware_jpeg =
+      cparams.jpeg_optimize_passes && frame_data.IsJPEG();
+  if (!pass_aware_jpeg) {
+    SetProgressiveMode(cparams, &enc_state->progressive_splitter);
+  }
   FrameHeader frame_header(metadata);
   std::unique_ptr<jpeg::JPEGData> jpeg_data;
   if (frame_data.IsJPEG()) {
@@ -2262,10 +2341,39 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                                       cparams, enc_state->progressive_splitter,
                                       frame_info, jpeg_data.get(), false,
                                       &frame_header));
-  const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
+  // Pass-aware JPEG recompression: run the planner and overwrite passes.
+  // The planner computes CfL maps internally when CfL is enabled.
+  if (pass_aware_jpeg && jpeg_data) {
+    fprintf(stderr, "PASS-AWARE: entering planner\n"); fflush(stderr);
+    auto jpeg_c_map = JpegOrder(frame_header.color_transform,
+                                jpeg_data->components.size() == 1);
+    bool cfl_enabled = cparams.force_cfl_jpeg_recompression &&
+                       frame_header.chroma_subsampling.Is444() &&
+                       jpeg_data->components.size() == 3;
+    // The planner only reads plane_to_jpeg and enabled from the cfl_ctx;
+    // it computes its own CfL maps and scaled_qtables internally.
+    ImageSB dummy_map;
+    int32_t dummy_qt[kDCTBlockSize] = {};
+    JpegCflContext cfl_ctx = {jpeg_c_map,
+                              cfl_enabled,
+                              {&dummy_map, &dummy_map},
+                              {dummy_qt, dummy_qt}};
+    JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
+        memory_manager, *jpeg_data, cparams.speed_tier, cfl_ctx,
+        enc_state->jpeg_pass_plan, pool));
+    fprintf(stderr, "PASS-AWARE: planner done, %u passes\n",
+            enc_state->jpeg_pass_plan.num_passes);
+    enc_state->has_jpeg_pass_plan = true;
+    frame_header.passes = enc_state->jpeg_pass_plan.passes;
+  }
+  const size_t num_passes = pass_aware_jpeg
+                                ? frame_header.passes.num_passes
+                                : enc_state->progressive_splitter.GetNumPasses();
+  fprintf(stderr, "PASS-AWARE: num_passes=%zu\n", num_passes);
   JXL_ASSIGN_OR_RETURN(auto enc_modular,
                        ModularFrameEncoder::Create(memory_manager, frame_header,
                                                    cparams, false));
+  fprintf(stderr, "PASS-AWARE: modular created, calling ComputeEncodingData\n");
   std::vector<std::unique_ptr<BitWriter>> group_codes;
   JXL_RETURN_IF_ERROR(ComputeEncodingData(
       cparams, frame_info, metadata, frame_data, jpeg_data.get(), 0, 0,

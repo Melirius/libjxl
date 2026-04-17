@@ -354,6 +354,17 @@ struct CompressArgs {
         "    0 = disable. 1 = enable.",
         &jpeg_reconstruction_cfl, &ParseOverride, 3);
 
+    cmdline->AddOptionValue(
+        '\0', "jpeg_optimize_passes", "0|1",
+        "Disable/enable pass-aware optimization for lossless JPEG "
+        "recompression.\n"
+        "    When enabled, the encoder uses spatial passes with zero shifts\n"
+        "    driven by the pass-aware context model search.\n"
+        "    Incompatible with --progressive, --qprogressive_ac, and "
+        "--responsive.\n"
+        "    0 = disable. 1 = enable. EXPERIMENTAL.",
+        &jpeg_optimize_passes, &ParseOverride, 3);
+
     cmdline->AddOptionValue('\0', "num_reps", "REPS",
                             "How many times to compress, for benchmarking.",
                             &num_reps, &ParseUnsigned, 3);
@@ -518,6 +529,7 @@ struct CompressArgs {
   int32_t premultiply = -1;
   bool already_downsampled = false;
   jxl::Override jpeg_reconstruction_cfl = jxl::Override::kDefault;
+  jxl::Override jpeg_optimize_passes = jxl::Override::kDefault;
   jxl::Override modular = jxl::Override::kDefault;
   jxl::Override keep_invisible = jxl::Override::kDefault;
   jxl::Override dots = jxl::Override::kDefault;
@@ -891,6 +903,16 @@ void ProcessFlags(const jxl::extras::Codec codec,
                     JXL_ENC_FRAME_SETTING_JPEG_RECON_CFL, params);
     ProcessBoolFlag(args->compress_boxes,
                     JXL_ENC_FRAME_SETTING_JPEG_COMPRESS_BOXES, params);
+    if (args->jpeg_optimize_passes == jxl::Override::kOn) {
+      if (args->progressive || args->qprogressive_ac ||
+          args->responsive == 1) {
+        std::cerr << "--jpeg_optimize_passes=1 is incompatible with "
+                     "--progressive, --qprogressive_ac, and --responsive.\n";
+        exit(EXIT_FAILURE);
+      }
+    }
+    ProcessBoolFlag(args->jpeg_optimize_passes,
+                    JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES, params);
   }
   // Set per-frame options.
   for (size_t num_frame = 0; num_frame < ppf.num_frames(); ++num_frame) {

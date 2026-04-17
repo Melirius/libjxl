@@ -170,8 +170,8 @@ struct AgglomerativeCtx {
           hist_h[i].ForEachNonZero(
               [&](uint32_t, uint32_t freq) { local_E -= d.ftab[freq]; });
           for (uint32_t freq : hist_N[i]) local_E += d.ftab[freq];
-          for (uint32_t freq : hist_nz_N[i]) local_E += d.NZFTab(freq);
           for (uint32_t freq : hist_nz_h[i]) local_E -= d.NZFTab(freq);
+          for (uint32_t freq : hist_nz_N[i]) local_E += d.NZFTab(freq);
           E[i] = local_E;
           return true;
         },

@@ -413,6 +413,8 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/transcode_jpeg/enc_jpeg_histogram.h
   jxl/transcode_jpeg/enc_jpeg_opt_data.cc
   jxl/transcode_jpeg/enc_jpeg_opt_data.h
+  jxl/transcode_jpeg/enc_jpeg_passes.cc
+  jxl/transcode_jpeg/enc_jpeg_passes.h
   jxl/transcode_jpeg/enc_jpeg_refine.cc
   jxl/transcode_jpeg/enc_jpeg_refine.h
   jxl/transcode_jpeg/enc_jpeg_search.cc
@@ -563,6 +565,7 @@ set(JPEGXL_INTERNAL_TESTS
   jxl/speed_tier_test.cc
   jxl/splines_test.cc
   jxl/toc_test.cc
+  jxl/transcode_jpeg/enc_jpeg_passes_test.cc
   jxl/xorshift128plus_test.cc
   threads/thread_parallel_runner_test.cc
 )

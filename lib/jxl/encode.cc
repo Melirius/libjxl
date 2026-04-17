@@ -1602,6 +1602,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_EXIF:
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_XMP:
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_JUMBF:
+    case JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES:
       if (value < -1 || value > 1) {
         return JXL_API_ERROR(
             frame_settings->enc, JXL_ENC_ERR_API_USAGE,
@@ -1837,6 +1838,10 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       break;
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_JUMBF:
       frame_settings->values.cparams.jpeg_keep_jumbf = default_to_true(value);
+      break;
+    case JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES:
+      frame_settings->values.cparams.jpeg_optimize_passes =
+          default_to_false(value);
       break;
     case JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS:
       if (value < 0 || value > 1) {
