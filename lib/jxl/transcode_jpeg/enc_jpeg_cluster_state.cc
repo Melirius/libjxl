@@ -128,6 +128,8 @@ Status ClusterFinalHistograms(const JPEGOptData& d, const Clustering& clustering
                            histogram_symbols);
 }
 
+}  // namespace
+
 StatusOr<FixedPointCost> HistogramHeaderCost(const Histogram& h) {
   if (h.total_count == 0) return 0;
   JXL_ASSIGN_OR_RETURN(float ans_cost, h.ANSPopulationCost());
@@ -136,8 +138,6 @@ StatusOr<FixedPointCost> HistogramHeaderCost(const Histogram& h) {
   return header_cost > 0 ? static_cast<FixedPointCost>(header_cost * kFScale)
                          : 0;
 }
-
-}  // namespace
 
 // Estimates ANS histogram header cost for one AC cluster after regrouping its
 // symbols by signalling context (`zdc`) and token.

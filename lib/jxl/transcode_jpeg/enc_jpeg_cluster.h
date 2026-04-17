@@ -45,10 +45,13 @@
 #include <memory>
 
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/enc_cluster.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 
 namespace jxl {
+
+StatusOr<FixedPointCost> HistogramHeaderCost(const Histogram& h);
 
 // Cluster IDs on both sides of one DC threshold boundary along a swept axis.
 // `lo` = cluster of the interval below the threshold, `hi` = above.

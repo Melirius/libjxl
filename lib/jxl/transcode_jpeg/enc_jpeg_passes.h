@@ -29,12 +29,36 @@ struct PassSearchResult {
   FixedPointCost total_cost = 0;
 };
 
+struct BiclusterSearchResult {
+  ThresholdSet thresholds;
+  ContextMap ctx_map;
+  PassAssignment pass_assignment;
+  uint32_t num_passes = 1;
+  uint32_t num_cells = 0;
+  uint32_t num_row_clusters = 0;
+  std::vector<uint32_t> num_prototypes_per_pass;
+  uint32_t total_num_prototypes = 0;
+  FixedPointCost ac_cost = 0;
+  FixedPointCost nz_cost = 0;
+  FixedPointCost signalling_overhead = 0;
+  FixedPointCost total_cost = 0;
+};
+
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const std::vector<FactorizationCandidate>& candidates,
     const JPEGCtxEffortParams& effort, ThreadPool* pool);
 
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
+    std::shared_ptr<const JPEGOptData> opt_data,
+    const JPEGCtxEffortParams& effort, ThreadPool* pool);
+
+StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
+    std::shared_ptr<const JPEGOptData> opt_data,
+    const std::vector<FactorizationCandidate>& candidates,
+    const JPEGCtxEffortParams& effort, ThreadPool* pool);
+
+StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool);
 

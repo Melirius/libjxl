@@ -66,6 +66,17 @@ struct JPEGCtxEffortParams {
   // Half-width of the threshold jitter window in `RefineClustered`
   // (in DC-value units). 0 = no refinement.
   ptrdiff_t refine_radius;
+  // Experimental biclustering-based search in the passes pipeline.
+  bool use_bicluster_search;
+  // Maximum number of alternating refinement rounds for biclustering.
+  uint32_t bicluster_outer_iters;
+  // Histogram prototype budget per pass for the biclustering model.
+  uint32_t bicluster_proto_budget_per_pass;
+  // Row-cluster budget for the biclustering model.
+  uint32_t bicluster_row_budget;
+  // Reserved knob for later threshold refinement under the biclustering
+  // objective.
+  bool bicluster_refine_thresholds;
 
   static JPEGCtxEffortParams FromSpeedTier(SpeedTier speed_tier) {
     switch (speed_tier) {
@@ -79,7 +90,12 @@ struct JPEGCtxEffortParams {
                 /*main_iters=*/2,
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/0,
-                /*refine_radius=*/0};
+                /*refine_radius=*/0,
+                /*use_bicluster_search=*/false,
+                /*bicluster_outer_iters=*/2,
+                /*bicluster_proto_budget_per_pass=*/128,
+                /*bicluster_row_budget=*/kMaxClusters,
+                /*bicluster_refine_thresholds=*/false};
       case SpeedTier::kTortoise:
         // `kRawAI` is marginally slower here but did not give better results.
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kToken420,
@@ -90,7 +106,12 @@ struct JPEGCtxEffortParams {
                 /*main_iters=*/4,
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/1,
-                /*refine_radius=*/4};
+                /*refine_radius=*/4,
+                /*use_bicluster_search=*/false,
+                /*bicluster_outer_iters=*/2,
+                /*bicluster_proto_budget_per_pass=*/128,
+                /*bicluster_row_budget=*/kMaxClusters,
+                /*bicluster_refine_thresholds=*/false};
       case SpeedTier::kGlacier:
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kRawAI,
                 /*keep_top_k=*/0,
@@ -100,7 +121,12 @@ struct JPEGCtxEffortParams {
                 /*main_iters=*/8,
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/2,
-                /*refine_radius=*/8};
+                /*refine_radius=*/8,
+                /*use_bicluster_search=*/false,
+                /*bicluster_outer_iters=*/2,
+                /*bicluster_proto_budget_per_pass=*/128,
+                /*bicluster_row_budget=*/kMaxClusters,
+                /*bicluster_refine_thresholds=*/false};
       case SpeedTier::kTectonicPlate:
       default:
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kRawAI,
@@ -111,7 +137,12 @@ struct JPEGCtxEffortParams {
                 /*main_iters=*/20,
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/5,
-                /*refine_radius=*/16};
+                /*refine_radius=*/16,
+                /*use_bicluster_search=*/false,
+                /*bicluster_outer_iters=*/2,
+                /*bicluster_proto_budget_per_pass=*/128,
+                /*bicluster_row_budget=*/kMaxClusters,
+                /*bicluster_refine_thresholds=*/false};
     }
   }
 };

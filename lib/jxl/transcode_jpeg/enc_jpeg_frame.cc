@@ -410,8 +410,22 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
           std::chrono::duration<double, std::milli>(end_opt_data - start_opt_data).count());
 
   auto start_search = std::chrono::high_resolution_clock::now();
-  JXL_ASSIGN_OR_RETURN(PassSearchResult result,
-                        SearchPassAwareContextModel(opt_data, effort, pool));
+  PassSearchResult result;
+  if (effort.use_bicluster_search) {
+    JXL_ASSIGN_OR_RETURN(BiclusterSearchResult bicluster_result,
+                         SearchBiclusteredContextModel(opt_data, effort, pool));
+    result.thresholds = std::move(bicluster_result.thresholds);
+    result.ctx_map = std::move(bicluster_result.ctx_map);
+    result.pass_assignment = std::move(bicluster_result.pass_assignment);
+    result.num_passes = bicluster_result.num_passes;
+    result.num_clusters = bicluster_result.num_row_clusters;
+    result.ac_cost = bicluster_result.ac_cost;
+    result.nz_cost = bicluster_result.nz_cost;
+    result.signalling_overhead = bicluster_result.signalling_overhead;
+    result.total_cost = bicluster_result.total_cost;
+  } else {
+    JXL_ASSIGN_OR_RETURN(result, SearchPassAwareContextModel(opt_data, effort, pool));
+  }
   auto end_search = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "PLANNER: SearchPassAwareContextModel took %.2f ms (%u passes)\n",
           std::chrono::duration<double, std::milli>(end_search - start_search).count(),
