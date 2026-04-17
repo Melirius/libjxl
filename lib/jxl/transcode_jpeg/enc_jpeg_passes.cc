@@ -103,9 +103,12 @@ struct ModelEvaluation {
   FixedPointCost ac_cost = 0;
   FixedPointCost nz_cost = 0;
   FixedPointCost signalling_overhead = 0;
+  FixedPointCost corrected_entropy_cost = -1;
 
   FixedPointCost total_cost() const {
-    return ac_cost + nz_cost + signalling_overhead;
+    return (corrected_entropy_cost >= 0 ? corrected_entropy_cost
+                                        : ac_cost + nz_cost) +
+           signalling_overhead;
   }
 };
 
@@ -233,6 +236,59 @@ StatusOr<RowSliceHistograms> BuildRowSliceHistograms(
   return rows;
 }
 
+// Appends the non-empty clustered AC and nz slice histograms for one pass to a
+// flat generic `Histogram` pool so the encoder's `ClusterHistograms` helper can
+// be used directly on the biclustering prototype state.
+void BuildBiclusterPassHistograms(
+    uint32_t pass, uint32_t num_passes, uint32_t num_row_clusters,
+    const std::vector<DenseHistogram<kACTokenCount>>& ac_cluster_hist,
+    const std::vector<uint32_t>& ac_cluster_total,
+    const std::vector<DenseHistogram<kJPEGNonZeroRange>>& nz_cluster_hist,
+    const std::vector<uint32_t>& nz_cluster_total,
+    std::vector<Histogram>* histograms) {
+  histograms->clear();
+  histograms->reserve(static_cast<size_t>(num_row_clusters) *
+                      (kZeroDensityContextCount + kJPEGNonZeroBuckets));
+
+  for (uint32_t cluster = 0; cluster < num_row_clusters; ++cluster) {
+    for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
+      const size_t idx = (static_cast<size_t>(cluster) * num_passes + pass) *
+                             kZeroDensityContextCount +
+                         zdc;
+      if (ac_cluster_total[idx] == 0) continue;
+
+      uint32_t max_token = 0;
+      for (uint32_t t = 0; t < kACTokenCount; ++t) {
+        if (ac_cluster_hist[idx][t] != 0) max_token = t;
+      }
+      Histogram h(max_token + 1);
+      h.total_count = ac_cluster_total[idx];
+      for (uint32_t t = 0; t <= max_token; ++t) {
+        h.counts[t] = static_cast<ANSHistBin>(ac_cluster_hist[idx][t]);
+      }
+      histograms->push_back(std::move(h));
+    }
+
+    for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+      const size_t idx = (static_cast<size_t>(cluster) * num_passes + pass) *
+                             kJPEGNonZeroBuckets +
+                         pb;
+      if (nz_cluster_total[idx] == 0) continue;
+
+      uint32_t max_nz = 0;
+      for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+        if (nz_cluster_hist[idx][nz] != 0) max_nz = nz;
+      }
+      Histogram h(max_nz + 1);
+      h.total_count = nz_cluster_total[idx];
+      for (uint32_t nz = 0; nz <= max_nz; ++nz) {
+        h.counts[nz] = static_cast<ANSHistBin>(nz_cluster_hist[idx][nz]);
+      }
+      histograms->push_back(std::move(h));
+    }
+  }
+}
+
 // Scores a biclustering prototype state by first collapsing original rows into
 // the provided `ctx_map` clusters, then summing entropy and histogram-header
 // cost over the resulting pass-local AC and nz slice histograms.
@@ -243,7 +299,8 @@ StatusOr<RowSliceHistograms> BuildRowSliceHistograms(
 StatusOr<ModelEvaluation> EvaluateBiclusterState(
     const JPEGOptData& d, const ThresholdSet& thresholds, const ContextMap& ctx_map,
     uint32_t num_row_clusters, const PassAssignment& pass_assignment,
-    uint32_t num_passes, const RowSliceHistograms& rows,
+    uint32_t num_passes, uint32_t proto_budget_per_pass,
+    const RowSliceHistograms& rows,
     std::vector<uint32_t>* num_prototypes_per_pass) {
   ModelEvaluation eval;
   const uint32_t total_rows = rows.num_channels * rows.num_cells;
@@ -287,6 +344,7 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
   }
 
   num_prototypes_per_pass->assign(num_passes, 0);
+  eval.corrected_entropy_cost = 0;
   for (uint32_t cluster = 0; cluster < num_row_clusters; ++cluster) {
     for (uint32_t pass = 0; pass < num_passes; ++pass) {
       for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
@@ -294,26 +352,10 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
                                kZeroDensityContextCount +
                            zdc;
         if (ac_cluster_total[idx] == 0) continue;
-        ++(*num_prototypes_per_pass)[pass];
         eval.ac_cost += d.ftab[ac_cluster_total[idx]];
-        std::array<uint32_t, kACTokenCount> token_counts = {};
-        uint32_t max_token = 0;
-        size_t total = 0;
         for (uint32_t t = 0; t < kACTokenCount; ++t) {
-          token_counts[t] = ac_cluster_hist[idx][t];
-          if (token_counts[t] == 0) continue;
-          max_token = t;
-          total += token_counts[t];
-          eval.ac_cost -= d.ftab[token_counts[t]];
-        }
-        if (total != 0) {
-          Histogram h(max_token + 1);
-          for (uint32_t t = 0; t <= max_token; ++t) {
-            h.counts[t] = static_cast<ANSHistBin>(token_counts[t]);
-          }
-          h.total_count = total;
-          JXL_ASSIGN_OR_RETURN(FixedPointCost header_cost, HistogramHeaderCost(h));
-          eval.signalling_overhead += header_cost;
+          if (ac_cluster_hist[idx][t] == 0) continue;
+          eval.ac_cost -= d.ftab[ac_cluster_hist[idx][t]];
         }
       }
 
@@ -322,23 +364,36 @@ StatusOr<ModelEvaluation> EvaluateBiclusterState(
                                kJPEGNonZeroBuckets +
                            pb;
         if (nz_cluster_total[idx] == 0) continue;
-        ++(*num_prototypes_per_pass)[pass];
         eval.nz_cost += d.NZFTab(nz_cluster_total[idx]);
         for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
           eval.nz_cost -= d.NZFTab(nz_cluster_hist[idx][nz]);
         }
-        uint32_t max_nz = 0;
-        for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
-          if (nz_cluster_hist[idx][nz] != 0) max_nz = nz;
-        }
-        Histogram h(max_nz + 1);
-        h.total_count = nz_cluster_total[idx];
-        for (uint32_t nz = 0; nz <= max_nz; ++nz) {
-          h.counts[nz] = static_cast<ANSHistBin>(nz_cluster_hist[idx][nz]);
-        }
-        JXL_ASSIGN_OR_RETURN(FixedPointCost header_cost, HistogramHeaderCost(h));
-        eval.signalling_overhead += header_cost;
       }
+    }
+  }
+
+  HistogramParams params;
+  params.clustering = HistogramParams::ClusteringType::kBest;
+  std::vector<Histogram> pass_histograms;
+  std::vector<Histogram> clustered;
+  std::vector<uint32_t> histogram_symbols;
+  for (uint32_t pass = 0; pass < num_passes; ++pass) {
+    BuildBiclusterPassHistograms(pass, num_passes, num_row_clusters,
+                                 ac_cluster_hist, ac_cluster_total,
+                                 nz_cluster_hist, nz_cluster_total,
+                                 &pass_histograms);
+    clustered.clear();
+    histogram_symbols.clear();
+    if (pass_histograms.empty()) continue;
+    JXL_RETURN_IF_ERROR(ClusterHistograms(params, pass_histograms,
+                                          proto_budget_per_pass, &clustered,
+                                          &histogram_symbols));
+    (*num_prototypes_per_pass)[pass] = clustered.size();
+    for (const auto& h : clustered) {
+      eval.corrected_entropy_cost +=
+          static_cast<FixedPointCost>(h.ShannonEntropy() * kFScale);
+      JXL_ASSIGN_OR_RETURN(FixedPointCost header_cost, HistogramHeaderCost(h));
+      eval.signalling_overhead += header_cost;
     }
   }
   (void)thresholds;
@@ -1380,7 +1435,8 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
           JXL_ASSIGN_OR_RETURN(ModelEvaluation eval, EvaluateBiclusterState(
               d, thresholds, cluster_result.ctx_map,
               cluster_result.num_clusters, pass_assignment,
-              target_num_passes, rows, num_prototypes));
+              target_num_passes, effort.bicluster_proto_budget_per_pass, rows,
+              num_prototypes));
           auto end_eval = PlannerClock::now();
           eval_ns->fetch_add(ElapsedNanos(start_eval, end_eval),
                              std::memory_order_relaxed);
@@ -1429,8 +1485,12 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
           for (uint32_t n : best_num_prototypes) {
             best_result.total_num_prototypes += n;
           }
-          best_result.ac_cost = best_eval.ac_cost;
-          best_result.nz_cost = best_eval.nz_cost;
+          best_result.ac_cost =
+              best_eval.corrected_entropy_cost >= 0
+                  ? best_eval.corrected_entropy_cost
+                  : best_eval.ac_cost;
+          best_result.nz_cost =
+              best_eval.corrected_entropy_cost >= 0 ? 0 : best_eval.nz_cost;
           best_result.signalling_overhead = best_eval.signalling_overhead;
           best_result.total_cost = best_eval.total_cost();
         }
