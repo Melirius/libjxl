@@ -25,11 +25,119 @@
 // `PruneDeadThresholds`
 //   Removes structurally inert thresholds and rebuilds `ctx_map`.
 
+#include <cmath>
+
 #include "lib/jxl/enc_ans_params.h"
+#include "lib/jxl/enc_cluster.h"
+#include "lib/jxl/enc_context_map.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_cluster.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 
 namespace jxl {
+
+namespace {
+
+void AppendTokenHistograms(const JPEGOptData& d, const CompactHistogram& cluster,
+                           std::vector<Histogram>* histograms) {
+  if (cluster.empty()) return;
+
+  const auto& dense_to_zdcvalue = d.ACHistogram().dense_to_zdcvalue;
+  std::vector<std::array<uint32_t, kACTokenCount>> zdc_counts(
+      kZeroDensityContextCount);
+  cluster.ForEachNonZero([&](uint32_t id, uint32_t freq) {
+    const SignallingHistSymbol hist_symbol =
+        d.SignallingHistSymbolFromSymbol(dense_to_zdcvalue[id]);
+    JXL_DASSERT(hist_symbol.zdc < kZeroDensityContextCount);
+    JXL_DASSERT(hist_symbol.token < kACTokenCount);
+    zdc_counts[hist_symbol.zdc][hist_symbol.token] += freq;
+  });
+
+  for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
+    const auto& counts = zdc_counts[zdc];
+    uint32_t max_token = 0;
+    size_t total = 0;
+    for (uint32_t t = 0; t < kACTokenCount; ++t) {
+      if (counts[t] != 0) {
+        max_token = t;
+        total += counts[t];
+      }
+    }
+    if (total == 0) continue;
+
+    size_t alphabet_size = max_token + 1;
+    histograms->emplace_back(alphabet_size);
+    Histogram& h = histograms->back();
+    for (uint32_t t = 0; t < alphabet_size; ++t) {
+      h.counts[t] = static_cast<ANSHistBin>(counts[t]);
+    }
+    h.total_count = total;
+  }
+}
+
+void AppendNZHistograms(const DenseNZHistogram& nz_cluster,
+                        std::vector<Histogram>* histograms) {
+  if (nz_cluster.empty()) return;
+
+  for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+    uint32_t max_nz = 0;
+    size_t total = 0;
+    const uint32_t base = pb * kJPEGNonZeroRange;
+    for (uint32_t nz_count = 0; nz_count < kJPEGNonZeroRange; ++nz_count) {
+      uint32_t freq = nz_cluster[base + nz_count];
+      if (freq == 0) continue;
+      max_nz = nz_count;
+      total += freq;
+    }
+    if (total == 0) continue;
+
+    size_t alphabet_size = max_nz + 1;
+    histograms->emplace_back(alphabet_size);
+    Histogram& h = histograms->back();
+    for (uint32_t nz_count = 0; nz_count < alphabet_size; ++nz_count) {
+      h.counts[nz_count] =
+          static_cast<ANSHistBin>(nz_cluster[base + nz_count]);
+    }
+    h.total_count = total;
+  }
+}
+
+void BuildFinalHistograms(const JPEGOptData& d, const Clustering& clustering,
+                          std::vector<Histogram>* histograms) {
+  histograms->clear();
+  histograms->reserve(clustering.hist_h.size() *
+                      (kZeroDensityContextCount + kJPEGNonZeroBuckets));
+  for (size_t cluster_id = 0; cluster_id < clustering.hist_h.size();
+       ++cluster_id) {
+    AppendTokenHistograms(d, clustering.hist_h[cluster_id], histograms);
+    AppendNZHistograms(clustering.hist_nz_h[cluster_id], histograms);
+  }
+}
+
+Status ClusterFinalHistograms(const JPEGOptData& d, const Clustering& clustering,
+                              std::vector<Histogram>* histograms,
+                              std::vector<Histogram>* clustered,
+                              std::vector<uint32_t>* histogram_symbols) {
+  BuildFinalHistograms(d, clustering, histograms);
+  clustered->clear();
+  histogram_symbols->clear();
+  if (histograms->empty()) return true;
+
+  HistogramParams params;
+  params.clustering = HistogramParams::ClusteringType::kBest;
+  return ClusterHistograms(params, *histograms, kClustersLimit, clustered,
+                           histogram_symbols);
+}
+
+StatusOr<FixedPointCost> HistogramHeaderCost(const Histogram& h) {
+  if (h.total_count == 0) return 0;
+  JXL_ASSIGN_OR_RETURN(float ans_cost, h.ANSPopulationCost());
+  float shannon = h.ShannonEntropy();
+  float header_cost = ans_cost - shannon;
+  return header_cost > 0 ? static_cast<FixedPointCost>(header_cost * kFScale)
+                         : 0;
+}
+
+}  // namespace
 
 // Estimates ANS histogram header cost for one AC cluster after regrouping its
 // symbols by signalling context (`zdc`) and token.
@@ -140,13 +248,29 @@ StatusOr<FixedPointCost> Clustering::ComputeClusterSignallingOverhead(
 StatusOr<FixedPointCost> Clustering::ComputeSignallingOverhead(
     const JPEGOptData& d, FixedPointCost cutoff) const {
   FixedPointCost overhead = 0;
-  for (uint32_t cluster_id = 0; cluster_id < hist_h.size(); ++cluster_id) {
-    JXL_ASSIGN_OR_RETURN(
-        FixedPointCost cluster_overhead,
-        ComputeClusterSignallingOverhead(d, cluster_id, cutoff - overhead));
-    overhead += cluster_overhead;
+  std::vector<Histogram> histograms;
+  std::vector<Histogram> clustered;
+  std::vector<uint32_t> histogram_symbols;
+  JXL_RETURN_IF_ERROR(
+      ClusterFinalHistograms(d, *this, &histograms, &clustered,
+                             &histogram_symbols));
+  if (clustered.empty()) return overhead;
+
+  for (const auto& h : clustered) {
+    JXL_ASSIGN_OR_RETURN(FixedPointCost header_cost, HistogramHeaderCost(h));
+    overhead += header_cost;
     if (overhead >= cutoff) return overhead;
   }
+
+  // The encoder writes one context-map entry per original histogram context in
+  // the combined AC + nz pool. We keep the existing lower-bound estimate.
+  if (clustered.size() > 1) {
+    double ctx_map_bits =
+        static_cast<double>(histograms.size()) *
+        std::log2(static_cast<double>(clustered.size()));
+    overhead += static_cast<FixedPointCost>(ctx_map_bits * kFScale);
+  }
+
   return overhead;
 }
 
@@ -163,6 +287,22 @@ FixedPointCost Clustering::ComputeNZCost(const JPEGOptData& d) const {
     }
   }
   return nz_cost;
+}
+
+StatusOr<FixedPointCost> Clustering::ComputeClusteredEntropyCost(
+    const JPEGOptData& d) const {
+  std::vector<Histogram> histograms;
+  std::vector<Histogram> clustered;
+  std::vector<uint32_t> histogram_symbols;
+  JXL_RETURN_IF_ERROR(
+      ClusterFinalHistograms(d, *this, &histograms, &clustered,
+                             &histogram_symbols));
+
+  FixedPointCost entropy = 0;
+  for (const auto& h : clustered) {
+    entropy += static_cast<FixedPointCost>(h.ShannonEntropy() * kFScale);
+  }
+  return entropy;
 }
 
 std::array<std::vector<ClusterBoundary>, kNumCh>

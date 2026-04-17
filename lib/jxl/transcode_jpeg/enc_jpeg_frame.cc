@@ -186,22 +186,29 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
         ThresholdSet refined_thr = refine_result.thresholds;
         FixedPointCost entropy_cost = refine_result.cost;
         FixedPointCost nz_cost = refine_result.nz_cost;
+        (void)entropy_cost;
         (void)nz_cost;
-        FixedPointCost total_cost = entropy_cost;
 
-        // Add signalling overhead for histogram headers
+        // Use an ANS-clustering-corrected final-goal model for comparison.
+        // The raw `entropy_cost` assumes every `(cluster, zdc)` and
+        // `(cluster, nz_pred_bucket)` slice gets its own histogram, but the
+        // encoder merges the combined pool into a shared final histogram set.
+        JXL_ASSIGN_OR_RETURN(
+            FixedPointCost corrected_entropy,
+            cl_result.ComputeClusteredEntropyCost(*opt_data));
         JXL_ASSIGN_OR_RETURN(FixedPointCost overhead,
                              cl_result.ComputeSignallingOverhead(*opt_data));
-        total_cost += overhead;
+        FixedPointCost total_cost = corrected_entropy + overhead;
 
         std::lock_guard<std::mutex> lock(mu);
         JXL_DEBUG_V(2,
                     "(%u,%u,%u) cost: unclustered=%.2f clustered=%.2f "
-                    "refined=%.2f nz=%.2f overhead=%.2f total=%.2f\n",
+                    "refined=%.2f corrected=%.2f nz=%.2f overhead=%.2f "
+                    "total=%.2f\n",
                     candidate.a, candidate.b, candidate.c, bit_cost(opt_cost),
                     bit_cost(cl_result.clustered_cost), bit_cost(entropy_cost),
-                    bit_cost(nz_cost), bit_cost(overhead),
-                    bit_cost(total_cost));
+                    bit_cost(corrected_entropy), bit_cost(nz_cost),
+                    bit_cost(overhead), bit_cost(total_cost));
         if (total_cost < best_cost) {
           best_cost = total_cost;
           best_thr = refined_thr;

@@ -638,11 +638,11 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
     const std::vector<ACEntry>& pass_stream, const std::vector<uint32_t>& pass_offsets) {
   AxisMaps axis_maps(d);
   axis_maps.Update(thresholds);
-  const uint32_t n0 = static_cast<uint32_t>(thresholds.TY().size() + 1);
-  const uint32_t num_cells =
+  uint32_t n0 = static_cast<uint32_t>(thresholds.TY().size() + 1);
+  uint32_t num_cells =
       n0 * static_cast<uint32_t>(thresholds.TCb().size() + 1) *
       static_cast<uint32_t>(thresholds.TCr().size() + 1);
-  const uint32_t cp_count = num_clusters * num_passes;
+  uint32_t cp_count = num_clusters * num_passes;
 
   SparseHistogram ac_hist_h(cp_count);
   SparseHistogram ac_hist_N(cp_count);
@@ -667,16 +667,45 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
         });
   }
 
+  // Fill NZ histograms for each pass
   for (uint32_t c = 0; c < d.channels; ++c) {
-    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
-      const uint32_t pass = pass_assignment[c][b];
-      const uint32_t cell = BlockCell(d, axis_maps, thresholds, c, b);
-      const uint32_t cluster = ctx_map[c * num_cells + cell];
-      const uint32_t cp = cluster * num_passes + pass;
-      const uint32_t pb = d.block_nz_pred_bucket[c][b];
-      const uint32_t nz = d.block_nonzeros[c][b];
-      nz_hist_N[cp][pb] += 1;
-      nz_hist_h[cp][NZHistogramIndex(pb, nz)] += 1;
+    for (uint32_t y = 0; y < d.block_grid_h[c]; ++y) {
+      for (uint32_t x = 0; x < d.block_grid_w[c]; ++x) {
+        const uint32_t b = y * d.block_grid_w[c] + x;
+        const uint32_t pass = pass_assignment[c][b];
+        uint32_t cell = BlockCell(d, axis_maps, thresholds, c, b);
+        uint32_t cluster = ctx_map[c * num_cells + cell];
+
+        uint32_t b_top = (y - 1) * d.block_grid_w[c] + x;
+        uint32_t b_left = y * d.block_grid_w[c] + (x - 1);
+        uint32_t nz_top = (y > 0) ? d.block_nonzeros[c][b_top] : 0u;
+        uint32_t nz_left = (x > 0) ? d.block_nonzeros[c][b_left] : 0u;
+        uint8_t nz_top_pass = (y > 0) ? pass_assignment[c][b_top] : 255;
+        uint8_t nz_left_pass = (x > 0) ? pass_assignment[c][b_left] : 255;
+
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          uint32_t cp = cluster * num_passes + p;
+
+          uint32_t predicted_nz;
+          uint32_t pass_nz_top = (nz_top_pass == p) ? nz_top : 0u;
+          uint32_t pass_nz_left = (nz_left_pass == p) ? nz_left : 0u;
+          if (x == 0 && y == 0) {
+            predicted_nz = 32u;
+          } else if (x == 0) {
+            predicted_nz = pass_nz_top;
+          } else if (y == 0) {
+            predicted_nz = pass_nz_left;
+          } else {
+            predicted_nz = (pass_nz_top + pass_nz_left + 1u) / 2u;
+          }
+
+          uint32_t pb =
+              (predicted_nz < 8) ? predicted_nz : (4 + predicted_nz / 2);
+          uint32_t nz = pass == p ? d.block_nonzeros[c][b] : 0u;
+          ++nz_hist_h[cp][NZHistogramIndex(pb, nz)];
+          ++nz_hist_N[cp][pb];
+        }
+      }
     }
   }
 
@@ -735,7 +764,7 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
 
   //for (uint32_t num_passes = 1; num_passes <= max_num_passes; ++num_passes) 
   {
-    uint32_t num_passes = 6;
+    uint32_t num_passes = 7;
     auto start_pass_config = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "PLANNER: Testing configuration with %u passes\n", num_passes);
     fflush(stderr);

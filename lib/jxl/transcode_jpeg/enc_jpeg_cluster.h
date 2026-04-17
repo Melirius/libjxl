@@ -128,6 +128,15 @@ struct Clustering {
   // `Σ NZFTab[N_nz] − Σ NZFTab[h_nz]` summed over all clusters and histograms.
   FixedPointCost ComputeNZCost(const JPEGOptData& d) const;
 
+  // Computes the entropy cost corrected for the ANS encoder's histogram
+  // clustering. The standard `clustered_cost` assumes each `(cluster, zdc)`
+  // and `(cluster, nz_pred_bucket)` slice gets its own histogram. This method
+  // simulates the encoder's final `ClusterHistograms` step on the combined AC
+  // and nz histogram pool and returns the Shannon entropy of the merged
+  // histograms.
+  StatusOr<FixedPointCost> ComputeClusteredEntropyCost(
+      const JPEGOptData& d) const;
+
   // Build threshold-major boundary views for axis-local cluster lookups:
   // `(channel, thr_ind, ci) -> {cluster_left, cluster_right}`. `ci` enumerates
   // the other two bucket axes in local `(k1, k2)` order, so `ApplySlice` can
