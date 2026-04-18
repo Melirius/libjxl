@@ -2149,7 +2149,8 @@ JXL_NOINLINE Status EncodeFrameStreaming(
                               {&dummy_map, &dummy_map},
                               {dummy_qt, dummy_qt}};
     JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
-        memory_manager, *jpeg_data, cparams.speed_tier, cfl_ctx,
+        memory_manager, *jpeg_data, cparams.speed_tier,
+        cparams.jpeg_optimize_passes_fixed_num, cfl_ctx,
         enc_state->jpeg_pass_plan, pool));
     enc_state->has_jpeg_pass_plan = true;
     frame_header.passes = enc_state->jpeg_pass_plan.passes;
@@ -2359,7 +2360,8 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                               {&dummy_map, &dummy_map},
                               {dummy_qt, dummy_qt}};
     JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
-        memory_manager, *jpeg_data, cparams.speed_tier, cfl_ctx,
+        memory_manager, *jpeg_data, cparams.speed_tier,
+        cparams.jpeg_optimize_passes_fixed_num, cfl_ctx,
         enc_state->jpeg_pass_plan, pool));
     fprintf(stderr, "PASS-AWARE: planner done, %u passes\n",
             enc_state->jpeg_pass_plan.num_passes);

@@ -1843,6 +1843,14 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       frame_settings->values.cparams.jpeg_optimize_passes =
           default_to_false(value);
       break;
+    case JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES_NUM:
+      if (value < 0 || value > 11) {
+        return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_API_USAGE,
+                             "Option value has to be in [0..11]");
+      }
+      frame_settings->values.cparams.jpeg_optimize_passes_fixed_num = value;
+      frame_settings->values.cparams.jpeg_optimize_passes = true;
+      break;
     case JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS:
       if (value < 0 || value > 1) {
         return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
@@ -1961,6 +1969,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetFloatOption(
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_EXIF:
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_XMP:
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_JUMBF:
+    case JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES_NUM:
     case JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS:
       return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
                            "Int option, try setting it with "

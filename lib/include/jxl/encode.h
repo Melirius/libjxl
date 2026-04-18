@@ -402,6 +402,14 @@ typedef enum {
    */
   JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES = 40,
 
+  /** Fix the number of passes used by pass-aware optimization for lossless
+   * JPEG recompression. 0 = let the planner choose automatically (default),
+   * 1..11 = force the planner to use exactly that many passes. Setting a
+   * positive value implies @ref JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES.
+   * EXPERIMENTAL.
+   */
+  JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES_NUM = 41,
+
   /** Enum value not to be used as an option. This value is added to force the
    * C compiler to have the enum to take a known size.
    */

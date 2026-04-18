@@ -74,6 +74,8 @@ struct JPEGCtxEffortParams {
   uint32_t bicluster_proto_budget_per_pass;
   // Row-cluster budget for the biclustering model.
   uint32_t bicluster_row_budget;
+  // 0 = planner chooses pass count, otherwise use exactly this many passes.
+  uint32_t fixed_num_passes;
   // Reserved knob for later threshold refinement under the biclustering
   // objective.
   bool bicluster_refine_thresholds;
@@ -95,6 +97,7 @@ struct JPEGCtxEffortParams {
                 /*bicluster_outer_iters=*/5,
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
+                /*fixed_num_passes=*/0,
                 /*bicluster_refine_thresholds=*/false};
       case SpeedTier::kTortoise:
         // `kRawAI` is marginally slower here but did not give better results.
@@ -107,10 +110,11 @@ struct JPEGCtxEffortParams {
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/1,
                 /*refine_radius=*/4,
-                /*use_bicluster_search=*/false,
+                /*use_bicluster_search=*/true,
                 /*bicluster_outer_iters=*/2,
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
+                /*fixed_num_passes=*/0,
                 /*bicluster_refine_thresholds=*/false};
       case SpeedTier::kGlacier:
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kRawAI,
@@ -122,10 +126,11 @@ struct JPEGCtxEffortParams {
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/2,
                 /*refine_radius=*/8,
-                /*use_bicluster_search=*/false,
+                /*use_bicluster_search=*/true,
                 /*bicluster_outer_iters=*/2,
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
+                /*fixed_num_passes=*/0,
                 /*bicluster_refine_thresholds=*/false};
       case SpeedTier::kTectonicPlate:
       default:
@@ -138,10 +143,11 @@ struct JPEGCtxEffortParams {
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/5,
                 /*refine_radius=*/16,
-                /*use_bicluster_search=*/false,
+                /*use_bicluster_search=*/true,
                 /*bicluster_outer_iters=*/2,
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
+                /*fixed_num_passes=*/0,
                 /*bicluster_refine_thresholds=*/false};
     }
   }
