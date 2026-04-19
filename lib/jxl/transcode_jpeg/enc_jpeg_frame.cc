@@ -357,7 +357,7 @@ Status ComputeCflForPlanner(const jpeg::JPEGData& jpeg_data,
 Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
                                       const jpeg::JPEGData& jpeg_data,
                                       SpeedTier speed_tier,
-                                      uint32_t fixed_num_passes,
+                                      int32_t optimize_passes_num,
                                       const JpegCflContext& cfl_ctx,
                                       JPEGPassEncodingPlan& plan,
                                       ThreadPool* pool) {
@@ -370,7 +370,7 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
   SpeedTier effective_tier = std::min(speed_tier, SpeedTier::kKitten);
   JPEGCtxEffortParams effort =
       JPEGCtxEffortParams::FromSpeedTier(effective_tier);
-  effort.fixed_num_passes = fixed_num_passes;
+  effort.optimize_passes_num = optimize_passes_num;
 
   // Determine colour layout from the JPEG data.
   bool is_gray = (jpeg_data.components.size() == 1);

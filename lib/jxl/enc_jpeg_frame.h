@@ -80,7 +80,7 @@ struct JPEGPassEncodingPlan {
 Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
                                       const jpeg::JPEGData& jpeg_data,
                                       SpeedTier speed_tier,
-                                      uint32_t fixed_num_passes,
+                                      int32_t optimize_passes_num,
                                       const JpegCflContext& cfl_ctx,
                                       JPEGPassEncodingPlan& plan,
                                       ThreadPool* pool);

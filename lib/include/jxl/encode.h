@@ -392,23 +392,16 @@ typedef enum {
    */
   JXL_ENC_FRAME_SETTING_DISABLE_PERCEPTUAL_HEURISTICS = 39,
 
-  /** Enable or disable pass-aware optimization for lossless JPEG recompression.
+  /** Configure pass-aware optimization for lossless JPEG recompression.
    * When enabled, the encoder uses a pass-aware context model search to drive
    * the actual AC pass layout of the JPEG XL frame, potentially improving
    * compression density. This is incompatible with progressive AC options.
-   * -1 = default (off), 0 = disable, 1 = enable.
-   * EXPERIMENTAL - may regress compression on some inputs until the cost model
-   * is further refined.
+   * -1 = disable (default), 0 = enable with automatic pass count, 1..11 =
+   * force the planner to use exactly that many passes. EXPERIMENTAL - may
+   * regress compression on some inputs until the cost model is further
+   * refined.
    */
-  JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES = 40,
-
-  /** Fix the number of passes used by pass-aware optimization for lossless
-   * JPEG recompression. 0 = let the planner choose automatically (default),
-   * 1..11 = force the planner to use exactly that many passes. Setting a
-   * positive value implies @ref JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES.
-   * EXPERIMENTAL.
-   */
-  JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES_NUM = 41,
+  JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES_NUM = 40,
 
   /** Enum value not to be used as an option. This value is added to force the
    * C compiler to have the enum to take a known size.

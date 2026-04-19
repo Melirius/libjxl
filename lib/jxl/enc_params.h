@@ -94,13 +94,9 @@ struct CompressParams {
   // allowing reconstruction of the original JPEG.
   bool force_cfl_jpeg_recompression = true;
 
-  // Enable pass-aware optimization for lossless JPEG recompression.
-  // When true, the encoder uses a pass-aware context model search to control
-  // the actual AC pass layout (spatial passes with zero shifts).
-  bool jpeg_optimize_passes = false;
-  // Fixed number of passes for pass-aware JPEG recompression.
-  // 0 = let the planner choose automatically.
-  uint32_t jpeg_optimize_passes_fixed_num = 0;
+  // Configure pass-aware optimization for lossless JPEG recompression.
+  // -1 = disable, 0 = enable with automatic pass count, >0 = fixed pass count.
+  int32_t jpeg_optimize_passes_num = -1;
 
   // Use brotli compression for any boxes derived from a JPEG frame.
   bool jpeg_compress_boxes = true;

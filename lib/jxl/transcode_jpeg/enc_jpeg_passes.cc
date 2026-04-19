@@ -1834,10 +1834,13 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
   const JPEGOptData& d = *opt_data;
   const ActiveRawBins active = BuildActiveRawBins(d);
   const uint32_t min_num_passes =
-      effort.fixed_num_passes == 0 ? 1 : effort.fixed_num_passes;
+      effort.optimize_passes_num <= 0
+          ? 1
+          : static_cast<uint32_t>(effort.optimize_passes_num);
   const uint32_t max_num_passes =
-      effort.fixed_num_passes == 0 ? ComputeMaxNumPasses(d)
-                                   : effort.fixed_num_passes;
+      effort.optimize_passes_num <= 0
+          ? ComputeMaxNumPasses(d)
+          : static_cast<uint32_t>(effort.optimize_passes_num);
   const uint32_t target_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
 
@@ -2055,10 +2058,13 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
   const JPEGOptData& d = *opt_data;
   const ActiveRawBins active = BuildActiveRawBins(d);
   const uint32_t min_num_passes =
-      effort.fixed_num_passes == 0 ? 1 : effort.fixed_num_passes;
+      effort.optimize_passes_num <= 0
+          ? 1
+          : static_cast<uint32_t>(effort.optimize_passes_num);
   const uint32_t max_num_passes =
-      effort.fixed_num_passes == 0 ? ComputeMaxNumPasses(d)
-                                   : effort.fixed_num_passes;
+      effort.optimize_passes_num <= 0
+          ? ComputeMaxNumPasses(d)
+          : static_cast<uint32_t>(effort.optimize_passes_num);
   const uint32_t target_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
   BiclusterSearchResult best_result;

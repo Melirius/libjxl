@@ -2120,7 +2120,7 @@ JXL_NOINLINE Status EncodeFrameStreaming(
     JxlEncoderOutputProcessorWrapper* output_processor, AuxOut* aux_out) {
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
   const bool pass_aware_jpeg =
-      cparams.jpeg_optimize_passes && frame_data.IsJPEG();
+      cparams.jpeg_optimize_passes_num >= 0 && frame_data.IsJPEG();
   if (!pass_aware_jpeg) {
     SetProgressiveMode(cparams, &enc_state->progressive_splitter);
   }
@@ -2150,7 +2150,7 @@ JXL_NOINLINE Status EncodeFrameStreaming(
                               {dummy_qt, dummy_qt}};
     JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
         memory_manager, *jpeg_data, cparams.speed_tier,
-        cparams.jpeg_optimize_passes_fixed_num, cfl_ctx,
+        cparams.jpeg_optimize_passes_num, cfl_ctx,
         enc_state->jpeg_pass_plan, pool));
     enc_state->has_jpeg_pass_plan = true;
     frame_header.passes = enc_state->jpeg_pass_plan.passes;
@@ -2328,7 +2328,7 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                           AuxOut* aux_out) {
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
   const bool pass_aware_jpeg =
-      cparams.jpeg_optimize_passes && frame_data.IsJPEG();
+      cparams.jpeg_optimize_passes_num >= 0 && frame_data.IsJPEG();
   if (!pass_aware_jpeg) {
     SetProgressiveMode(cparams, &enc_state->progressive_splitter);
   }
@@ -2361,7 +2361,7 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                               {dummy_qt, dummy_qt}};
     JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
         memory_manager, *jpeg_data, cparams.speed_tier,
-        cparams.jpeg_optimize_passes_fixed_num, cfl_ctx,
+        cparams.jpeg_optimize_passes_num, cfl_ctx,
         enc_state->jpeg_pass_plan, pool));
     fprintf(stderr, "PASS-AWARE: planner done, %u passes\n",
             enc_state->jpeg_pass_plan.num_passes);
