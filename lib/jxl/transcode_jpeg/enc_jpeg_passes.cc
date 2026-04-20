@@ -748,18 +748,23 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
                                   0);
   std::array<std::vector<uint8_t>, kNumCh> nz_pred_bucket;
 
-  for (size_t i = 0; i < blocks.size(); ++i) {
-    const uint32_t pass =
-        std::min(static_cast<uint32_t>(i * num_passes / blocks.size()),
-                 num_passes - 1);
-    const BlockRef& ref = blocks[i];
-    pass_assignment[ref.c][ref.b] = static_cast<uint8_t>(pass);
-    ForEachBlockBin(d, ref.c, ref.b, [&](ACBin bin) {
-      const uint32_t compact_id = active.raw_to_compact[bin];
-      const uint32_t czdc = active.compact_to_czdc[compact_id];
-      ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
-      ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
-    });
+  //uint32_t ind = 0;
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+      // Seed each component independently so the initial pass split preserves
+      // spatial locality inside that component instead of concatenating all
+      // components into one global ramp.
+      const uint32_t pass = //std::min(num_passes - 1,//0;//(c != 0);//
+        //(ind++) * num_passes / static_cast<uint32_t>(blocks.size()));
+        b * num_passes / d.num_blocks[c];//c;//b % num_passes;//
+      pass_assignment[c][b] = static_cast<uint8_t>(pass);
+      ForEachBlockBin(d, c, b, [&](ACBin bin) {
+        const uint32_t compact_id = active.raw_to_compact[bin];
+        const uint32_t czdc = active.compact_to_czdc[compact_id];
+        ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
+        ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
+      });
+    }
   }
 
   auto PredictNZBucketForPass =
@@ -1074,6 +1079,19 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
       }
       return batch_moves.load(std::memory_order_seq_cst);
     };
+  auto apply_batch_moves = [&]() -> uint32_t {
+    uint32_t applied = 0;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+      if (i % kBatchStride != iter % kBatchStride) continue;
+      const BlockRef& ref = blocks[i];
+      const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
+      const uint32_t best_pass = new_passes[i];
+      if (best_pass == cur_pass) continue;
+      apply_move(ref, cur_pass, best_pass);
+      ++applied;
+    }
+    return applied;
+  };
   auto sequential_iter = [&]() -> uint32_t {
     uint32_t seq_moves = 0;
     for (const BlockRef& ref : blocks) {
@@ -1087,6 +1105,13 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
     return seq_moves;
   };
 
+  const auto start_init = PlannerClock::now();
+  uint32_t seq_moves = sequential_iter();
+  fprintf(stderr, "PLANNER: [bicluster] Initial phase 1 took %.2f ms for %u moves\n",
+          NanosToMs(ElapsedNanos(start_init, PlannerClock::now())), seq_moves);
+  fflush(stderr);
+  ++iter;
+
   if (pool != nullptr && blocks.size() > kLargeImageThreshold) {
     const auto start_batch = PlannerClock::now();
     FixedPointCost best_cost = assignment_cost();
@@ -1096,7 +1121,6 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
     uint32_t stale_count = 0;
     uint32_t applied = 1;
     //uint32_t batch_moves = min_moves + 1;
-    uint32_t seq_moves = min_moves + 1;
     FixedPointCost current_cost;
 
     while (iter < kMaxIters && applied > 0 && stale_count < kBatchPatience &&
@@ -1104,21 +1128,14 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
       uint32_t batch_moves = batch_iter();
       if (batch_moves == 0) break;
 
-      applied = 0;
-      for (size_t i = 0; i < blocks.size(); ++i) {
-        if (i % kBatchStride != iter % kBatchStride) continue;
-        const BlockRef& ref = blocks[i];
-        const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
-        const uint32_t best_pass = new_passes[i];
-        if (best_pass == cur_pass) continue;
-        apply_move(ref, cur_pass, best_pass);
-        ++applied;
-      }
+      applied = apply_batch_moves();
 
       ++iter;
       fprintf(stderr, "PLANNER: [bicluster] Batch phase %u took %.2f ms for %u moves\n",
-              iter, NanosToMs(ElapsedNanos(start_batch, PlannerClock::now())), batch_moves);
+              iter, NanosToMs(ElapsedNanos(start_batch, PlannerClock::now())), applied);
       fflush(stderr);
+
+      if (iter < 5) continue;
 
       // If we are caught in a loop where batch moves spoil sequential moves, we should stop.
       if (batch_moves < best_moves) {
@@ -1241,21 +1258,14 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
     fflush(stderr);
 
     if(moves > best_moves) {
-      ++iter;
       uint32_t batch_moves = batch_iter();
       if (batch_moves == 0) break;
 
-      for (size_t i = 0; i < blocks.size(); ++i) {
-        const BlockRef& ref = blocks[i];
-        const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
-        const uint32_t best_pass = new_passes[i];
-        if (best_pass == cur_pass) continue;
-        apply_move(ref, cur_pass, best_pass);
-      }
+      uint32_t applied = apply_batch_moves();
 
       ++iter;
       fprintf(stderr, "PLANNER: [bicluster] Batch global phase %u took %.2f ms for %u moves\n",
-              iter, NanosToMs(ElapsedNanos(start_sequential, PlannerClock::now())), batch_moves);
+              iter, NanosToMs(ElapsedNanos(start_sequential, PlannerClock::now())), applied);
       fflush(stderr);
     } else {
       best_moves = moves;

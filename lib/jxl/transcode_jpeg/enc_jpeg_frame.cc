@@ -9,11 +9,14 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <chrono>
+#include <string>
 #include <vector>
 
 #include "lib/jxl/base/data_parallel.h"
@@ -31,6 +34,61 @@
 #include "lib/jxl/transcode_jpeg/enc_jpeg_threshold.h"
 
 namespace jxl {
+
+namespace {
+
+void MaybeDumpPassAssignmentImage(const jpeg::JPEGData& jpeg_data,
+                                  const JPEGPassAssignment& pass_assignment,
+                                  uint32_t num_passes) {
+  const char* dump_path = std::getenv("JXL_DEBUG_PASSES_IMAGE");
+  if (dump_path == nullptr || dump_path[0] == '\0') return;
+
+  std::string path = dump_path;
+  if (path == "1") path = "planner_passes.ppm";
+
+  uint32_t gw = 0;
+  uint32_t gh = 0;
+  for (const auto& component : jpeg_data.components) {
+    gw = std::max<uint32_t>(gw, component.width_in_blocks);
+    gh = std::max<uint32_t>(gh, component.height_in_blocks);
+  }
+  if (gw == 0 || gh == 0) return;
+
+  FILE* ppm = std::fopen(path.c_str(), "wb");
+  if (ppm == nullptr) return;
+
+  std::fprintf(ppm, "P6\n%u %u\n255\n", gw, gh);
+  const uint32_t scale = (num_passes <= 1) ? 0 : 255 / (num_passes - 1);
+  for (uint32_t by = 0; by < gh; ++by) {
+    for (uint32_t bx = 0; bx < gw; ++bx) {
+      uint8_t rgb[3] = {};
+      for (uint32_t c = 0; c < 3; ++c) {
+        const uint32_t src_c =
+            std::min<uint32_t>(c, jpeg_data.components.size() - 1);
+        const auto& component = jpeg_data.components[src_c];
+        if (component.width_in_blocks == 0 || component.height_in_blocks == 0 ||
+            pass_assignment[src_c].empty()) {
+          rgb[c] = 0;
+          continue;
+        }
+        const uint32_t src_x =
+            std::min<uint32_t>(component.width_in_blocks - 1,
+                               bx * component.width_in_blocks / gw);
+        const uint32_t src_y =
+            std::min<uint32_t>(component.height_in_blocks - 1,
+                               by * component.height_in_blocks / gh);
+        const uint32_t block = src_y * component.width_in_blocks + src_x;
+        rgb[c] = static_cast<uint8_t>(pass_assignment[src_c][block] * scale);
+      }
+      std::fwrite(rgb, 1, sizeof(rgb), ppm);
+    }
+  }
+  std::fclose(ppm);
+  std::fprintf(stderr, "PLANNER: Wrote pass image to %s\n", path.c_str());
+  std::fflush(stderr);
+}
+
+}  // namespace
 
 // This file implements context-map optimization for JPEG-source images being
 // re-encoded into JPEG XL. The single public entry point is
@@ -481,6 +539,7 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
   for (size_t c = 0; c < 3; ++c) {
     plan.pass_assignment[c] = std::move(result.pass_assignment[c]);
   }
+  MaybeDumpPassAssignmentImage(jpeg_data, plan.pass_assignment, plan.num_passes);
 
   auto end_total = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "PLANNER: Total integration planning took %.2f ms\n",

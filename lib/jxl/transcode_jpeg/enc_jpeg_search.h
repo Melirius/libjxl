@@ -94,7 +94,7 @@ struct JPEGCtxEffortParams {
                 /*overhead_aware_tail=*/true,
                 /*refine_iters=*/0,
                 /*refine_radius=*/0,
-                /*use_bicluster_search=*/true,
+                /*use_bicluster_search=*/false,
                 /*bicluster_outer_iters=*/5,
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,

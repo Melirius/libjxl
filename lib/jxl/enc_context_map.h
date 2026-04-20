@@ -21,7 +21,7 @@ enum class LayerType : uint8_t;
 
 // Max limit is 255 because encoding assumes numbers < 255
 // More clusters can help compression, but makes encode/decode somewhat slower
-static const size_t kClustersLimit = 128;
+static const size_t kClustersLimit = 255;
 
 // Encodes the given context map to the bit stream. The number of different
 // histogram ids is given by num_histograms.
