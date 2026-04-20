@@ -6,6 +6,7 @@
 #include "lib/jxl/enc_jpeg_frame.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -14,8 +15,6 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <chrono>
 #include <string>
 #include <vector>
 
@@ -208,10 +207,13 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
               static_cast<int>(speed_tier), static_cast<int>(candidates.size()),
               effort.rank_iters, effort.main_iters, effort.refine_iters);
 
-  FixedPointCost best_cost = std::numeric_limits<FixedPointCost>::max();
-  ThresholdSet best_thr;
-  ContextMap best_ctx;
-  std::mutex mu;
+  struct FrameThreadBest {
+    FixedPointCost cost = std::numeric_limits<FixedPointCost>::max();
+    ThresholdSet thr;
+    ContextMap ctx;
+    uint32_t best_idx = std::numeric_limits<uint32_t>::max();
+  };
+  std::vector<FrameThreadBest> thread_best;
 
   std::vector<PartitioningCtx> ctx_pool;
   JXL_RETURN_IF_ERROR(RunOnPool(
@@ -221,6 +223,7 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
         for (size_t i = 0; i < num_threads; ++i) {
           ctx_pool.emplace_back(opt_data);
         }
+        thread_best.resize(num_threads);
         return true;
       },
       [&](uint32_t idx, size_t thread_id) -> Status {
@@ -258,7 +261,6 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
                              cl_result.ComputeSignallingOverhead(*opt_data));
         FixedPointCost total_cost = corrected_entropy + overhead;
 
-        std::lock_guard<std::mutex> lock(mu);
         JXL_DEBUG_V(2,
                     "(%u,%u,%u) cost: unclustered=%.2f clustered=%.2f "
                     "refined=%.2f corrected=%.2f nz=%.2f overhead=%.2f "
@@ -267,14 +269,35 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
                     bit_cost(cl_result.clustered_cost), bit_cost(entropy_cost),
                     bit_cost(corrected_entropy), bit_cost(nz_cost),
                     bit_cost(overhead), bit_cost(total_cost));
-        if (total_cost < best_cost) {
-          best_cost = total_cost;
-          best_thr = refined_thr;
-          best_ctx = cluster_map;
+        // Per-thread best; no lock needed. Tiebreaker: lowest candidate
+        // index for deterministic results independent of thread count.
+        auto& local = thread_best[thread_id];
+        if (total_cost < local.cost ||
+            (total_cost == local.cost && idx < local.best_idx)) {
+          local.cost = total_cost;
+          local.thr = std::move(refined_thr);
+          local.ctx = std::move(cluster_map);
+          local.best_idx = idx;
         }
         return true;
       },
       "JpegCtxOpt"));
+
+  // Deterministic reduction: pick best across all threads.
+  // Tiebreaker: lowest candidate index.
+  FixedPointCost best_cost = std::numeric_limits<FixedPointCost>::max();
+  ThresholdSet best_thr;
+  ContextMap best_ctx;
+  uint32_t overall_best_idx = std::numeric_limits<uint32_t>::max();
+  for (auto& tb : thread_best) {
+    if (tb.cost < best_cost ||
+        (tb.cost == best_cost && tb.best_idx < overall_best_idx)) {
+      best_cost = tb.cost;
+      best_thr = std::move(tb.thr);
+      best_ctx = std::move(tb.ctx);
+      overall_best_idx = tb.best_idx;
+    }
+  }
 
   JXL_RETURN_IF_ERROR(ConvertToBlockCtxMap(best_thr, best_ctx, *opt_data,
                                            cfl_ctx, ctx_map));

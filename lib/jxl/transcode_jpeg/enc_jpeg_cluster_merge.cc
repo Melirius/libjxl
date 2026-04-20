@@ -15,7 +15,6 @@
 //     the union-find `parent` array) and exposes one public entry point `Run`.
 
 #include <algorithm>
-#include <mutex>
 #include <numeric>
 
 #include "lib/jxl/transcode_jpeg/enc_jpeg_cluster.h"
@@ -248,36 +247,55 @@ struct AgglomerativeCtx {
   }
 
   // Scans the delta cache in parallel to find the pair `(best_i, best_j)`
-  // with the smallest merge cost, reducing per-thread bests under a mutex.
+  // with the smallest merge cost. Each thread tracks its own best; a
+  // deterministic reduction after join picks the winner with tiebreaker
+  // on (i, j) so the result is independent of thread count.
   Status FindBestMerge(size_t* best_i, size_t* best_j,
                        FixedPointCost* best_delta) {
     *best_delta = std::numeric_limits<FixedPointCost>::max();
     *best_i = 0;
     *best_j = 1;
-    std::mutex best_mtx;
+    struct ThreadBest {
+      FixedPointCost delta = std::numeric_limits<FixedPointCost>::max();
+      size_t i = 0;
+      size_t j = 1;
+    };
+    std::vector<ThreadBest> thread_best;
 
     JXL_RETURN_IF_ERROR(RunOnPool(
-        pool, 0, active_clusters - 1, ThreadPool::NoInit,
-        [&](uint32_t i, size_t) -> Status {
+        pool, 0, active_clusters - 1,
+        [&](size_t num_threads) -> Status {
+          thread_best.resize(num_threads);
+          return true;
+        },
+        [&](uint32_t i, size_t thread_id) -> Status {
           uint32_t id_i = active[i];
-          size_t local_best_j = i + 1;
-          FixedPointCost local_best_diff = Delta(id_i, active[local_best_j]);
-          for (size_t j = i + 2; j < active_clusters; ++j) {
+          auto& local = thread_best[thread_id];
+          for (size_t j = i + 1; j < active_clusters; ++j) {
             FixedPointCost diff = Delta(id_i, active[j]);
-            if (diff < local_best_diff) {
-              local_best_diff = diff;
-              local_best_j = j;
+            if (diff < local.delta ||
+                (diff == local.delta &&
+                 std::tie(i, j) < std::tie(local.i, local.j))) {
+              local.delta = diff;
+              local.i = i;
+              local.j = j;
             }
-          }
-          std::lock_guard<std::mutex> lock(best_mtx);
-          if (local_best_diff < *best_delta) {
-            *best_delta = local_best_diff;
-            *best_i = i;
-            *best_j = local_best_j;
           }
           return true;
         },
         "FindBestMerge"));
+
+    // Deterministic reduction: pick the minimum delta across all threads.
+    // Tiebreaker: lexicographically smallest (i, j).
+    for (const auto& tb : thread_best) {
+      if (tb.delta < *best_delta ||
+          (tb.delta == *best_delta &&
+           std::tie(tb.i, tb.j) < std::tie(*best_i, *best_j))) {
+        *best_delta = tb.delta;
+        *best_i = tb.i;
+        *best_j = tb.j;
+      }
+    }
     return true;
   }
 

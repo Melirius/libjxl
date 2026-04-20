@@ -42,14 +42,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <mutex>
+#include <queue>
 #include <unordered_map>
 #include <utility>
-#include <chrono>
 #include <vector>
 
 #include "lib/jxl/base/data_parallel.h"
@@ -130,7 +130,20 @@ void BlockDCIndices(const JPEGOptData& d, uint32_t c, uint32_t b, uint32_t* dc0,
                     uint32_t* dc1, uint32_t* dc2);
 uint32_t BlockCell(const JPEGOptData& d, const AxisMaps& axis_maps,
                    const ThresholdSet& thresholds, uint32_t c, uint32_t b);
-uint32_t FindRoot(std::vector<uint32_t>& parent, uint32_t x);
+// Small union-find helper for the agglomerative merge loop in
+// `ClusterContextsPassAware`.
+uint32_t FindRoot(std::vector<uint32_t>& parent, uint32_t x) {
+  uint32_t root = x;
+  while (parent[root] != root) {
+    root = parent[root];
+  }
+  while (parent[x] != x) {
+    const uint32_t next = parent[x];
+    parent[x] = root;
+    x = next;
+  }
+  return root;
+}
 
 // Fixed-threshold histogram lattice for the biclustering prototype.
 // Each original row is one `(channel, cell)` pair; within that row we store
@@ -698,78 +711,243 @@ uint32_t BlockCell(const JPEGOptData& d, const AxisMaps& axis_maps,
          axis_maps.ax0_to_k[d.block_DC_idx[0][b0]];
 }
 
-// Greedy local-search assignment of image blocks to progressive AC passes.
-// The objective is the same `ftab`-based entropy proxy used elsewhere in the
-// planner, but applied to pass-local AC and `zdc` counts. For large images we
-// first do a snapshot-batched phase, then finish with the original serial
-// online refinement so large reshuffles parallelize without giving up local
-// convergence quality on the final passes.
-AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
-                                      const ActiveRawBins& active,
-                                      uint32_t num_passes, ThreadPool* pool) {
-  const auto start_total = PlannerClock::now();
-  AssignPassesResult result;
-  PassAssignment& pass_assignment = result.pass_assignment;
-  for (uint32_t c = 0; c < kNumCh; ++c) {
-    pass_assignment[c].assign(d.num_blocks[c], 0);
-  }
-  if (num_passes <= 1 || active.active_bins.empty()) {
-    result.timings.total_ns =
-        ElapsedNanos(start_total, PlannerClock::now());
-    return result;
-  }
+constexpr uint32_t kMaxIters = 100;
+constexpr uint32_t kLargeImageThreshold = 1u << 15;
+constexpr uint32_t kBatchChunkSize = 1u << 14;
 
-  struct BlockRef {
-    uint16_t c;
-    uint32_t b;
-  };
-  std::vector<BlockRef> blocks;
-  for (uint32_t c = 0; c < d.channels; ++c) {
-    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
-      if (d.block_offsets[c][b] == d.block_offsets[c][b + 1]) continue;
-      blocks.push_back({static_cast<uint16_t>(c), b});
-    }
-  }
-  if (blocks.empty()) {
-    result.timings.total_ns =
-        ElapsedNanos(start_total, PlannerClock::now());
-    return result;
-  }
+struct BlockRef {
+  uint16_t c;
+  uint32_t b;
+};
 
-  const uint32_t M = static_cast<uint32_t>(active.active_bins.size());
-  const uint32_t czdc_size = d.channels * kZeroDensityContextCount;
-  std::vector<uint32_t> hist_h(static_cast<size_t>(M) * num_passes, 0);
-  std::vector<uint32_t> hist_N(static_cast<size_t>(czdc_size) * num_passes, 0);
-  std::vector<uint32_t> nz_hist_h(static_cast<size_t>(kNZHistogramsSize) *
-                                      num_passes,
-                                  0);
-  std::vector<uint32_t> nz_hist_N(static_cast<size_t>(kJPEGNonZeroBuckets) *
-                                      num_passes,
-                                  0);
+struct AssignScratch {
+  std::vector<FixedPointCost> delta;
+  std::vector<uint16_t> touched_czdc;
+  std::vector<uint32_t> czdc_counts;
+};
+
+// All mutable state for one pass-assignment solve: AC/NZ histograms and the
+// per-block NZ-predictor cache. Read-only references to the input data and
+// derived dimensional constants are bundled here to keep helper signatures
+// short.
+struct PassAssignmentCtx {
+  const JPEGOptData& d;
+  const ActiveRawBins& active;
+  const uint32_t num_passes;
+  const uint32_t M;          // active bin count
+  const uint32_t czdc_size;  // d.channels * kZeroDensityContextCount
+
+  PassAssignment pass_assignment;
+  std::vector<uint32_t> hist_h;     // [M * num_passes]
+  std::vector<uint32_t> hist_N;     // [czdc_size * num_passes]
+  std::vector<uint32_t> nz_hist_h;  // [kNZHistogramsSize * num_passes]
+  std::vector<uint32_t> nz_hist_N;  // [kJPEGNonZeroBuckets * num_passes]
   std::array<std::vector<uint8_t>, kNumCh> nz_pred_bucket;
 
-  //uint32_t ind = 0;
-  for (uint32_t c = 0; c < d.channels; ++c) {
-    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
-      // Seed each component independently so the initial pass split preserves
-      // spatial locality inside that component instead of concatenating all
-      // components into one global ramp.
-      const uint32_t pass = //std::min(num_passes - 1,//0;//(c != 0);//
-        //(ind++) * num_passes / static_cast<uint32_t>(blocks.size()));
-        b * num_passes / d.num_blocks[c];//c;//b % num_passes;//
-      pass_assignment[c][b] = static_cast<uint8_t>(pass);
-      ForEachBlockBin(d, c, b, [&](ACBin bin) {
-        const uint32_t compact_id = active.raw_to_compact[bin];
-        const uint32_t czdc = active.compact_to_czdc[compact_id];
-        ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
-        ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
-      });
+  PassAssignmentCtx(const JPEGOptData& d_, const ActiveRawBins& active_,
+                    uint32_t np)
+      : d(d_),
+        active(active_),
+        num_passes(np),
+        M(static_cast<uint32_t>(active_.active_bins.size())),
+        czdc_size(d_.channels * kZeroDensityContextCount),
+        hist_h(static_cast<size_t>(M) * np, 0),
+        hist_N(static_cast<size_t>(czdc_size) * np, 0),
+        nz_hist_h(static_cast<size_t>(kNZHistogramsSize) * np, 0),
+        nz_hist_N(static_cast<size_t>(kJPEGNonZeroBuckets) * np, 0) {
+    for (uint32_t c = 0; c < kNumCh; ++c)
+      pass_assignment[c].assign(d_.num_blocks[c], 0);
+  }
+
+  // Fills `nz_pred_bucket`, `nz_hist_h`, and `nz_hist_N` from the current
+  // `pass_assignment`.
+  void InitNZPredictorState() {
+    for (uint32_t c = 0; c < d.channels; ++c) {
+      nz_pred_bucket[c].resize(d.num_blocks[c], 0);
+      for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+        const uint32_t pass = pass_assignment[c][b];
+        const uint32_t pb = PredictNZBucket(c, b, pass, nullptr, 0);
+        nz_pred_bucket[c][b] = static_cast<uint8_t>(pb);
+        ++nz_hist_N[static_cast<size_t>(pass) * kJPEGNonZeroBuckets + pb];
+        ++nz_hist_h[static_cast<size_t>(pass) * kNZHistogramsSize +
+                    NZHistogramIndex(pb, d.block_nonzeros[c][b])];
+      }
     }
   }
 
-  auto PredictNZBucketForPass =
-      [&](uint16_t c, uint32_t b, uint32_t pass, const BlockRef* override_ref,
-          uint32_t override_pass) -> uint32_t {
+  // Initializes pass assignment and AC histograms via seeded spatial growth
+  // (or raster-order greedy scan when kLinearScan is true).
+  void InitPassAssignmentHistogramAware() {
+    for (uint32_t c = 0; c < d.channels; ++c) {
+      if (d.num_blocks[c] == 0) continue;
+
+      const uint32_t w = d.block_grid_w[c];
+      const uint32_t h = d.block_grid_h[c];
+      const uint32_t seeded_passes =
+          std::min<uint32_t>(num_passes, d.num_blocks[c]);
+      std::vector<uint8_t> assigned(d.num_blocks[c], 0);
+      std::vector<uint32_t> pass_sizes(num_passes, 0);
+
+      auto growth_cost = [&](uint32_t b, uint32_t pass) -> FixedPointCost {
+        FixedPointCost cost = 0;
+        std::vector<uint16_t> touched_czdc;
+        std::vector<uint32_t> czdc_counts(czdc_size, 0);
+        touched_czdc.reserve(64);
+        ForEachBlockBin(d, c, b, [&](ACBin bin) {
+          const uint32_t compact_id = active.raw_to_compact[bin];
+          const uint32_t czdc = active.compact_to_czdc[compact_id];
+          const uint32_t h_count =
+              hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
+          cost += d.ftab[h_count + 1] - d.ftab[h_count];
+          if (czdc_counts[czdc]++ == 0)
+            touched_czdc.push_back(static_cast<uint16_t>(czdc));
+        });
+        for (uint16_t czdc : touched_czdc) {
+          const uint32_t count = czdc_counts[czdc];
+          const uint32_t n_count =
+              hist_N[static_cast<size_t>(czdc) * num_passes + pass];
+          cost += d.ftab[n_count + count] - d.ftab[n_count];
+        }
+        return cost;
+      };
+
+      // Set to true to use O(N·P) raster-order greedy scan instead of
+      // O(N log N) seeded spatial growth.
+      static constexpr bool kLinearScan = false;
+
+      if (kLinearScan) {
+        for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+          uint32_t best_pass = 0;
+          FixedPointCost best_cost = growth_cost(b, 0);
+          for (uint32_t pass = 1; pass < num_passes; ++pass) {
+            const FixedPointCost cost = growth_cost(b, pass);
+            if (cost < best_cost) {
+              best_cost = cost;
+              best_pass = pass;
+            }
+          }
+          pass_assignment[c][b] = static_cast<uint8_t>(best_pass);
+          ++pass_sizes[best_pass];
+          ForEachBlockBin(d, c, b, [&](ACBin bin) {
+            const uint32_t compact_id = active.raw_to_compact[bin];
+            const uint32_t czdc = active.compact_to_czdc[compact_id];
+            ++hist_h[static_cast<size_t>(compact_id) * num_passes + best_pass];
+            ++hist_N[static_cast<size_t>(czdc) * num_passes + best_pass];
+          });
+        }
+      } else {
+        using FrontierEntry = std::pair<FixedPointCost, uint32_t>;
+        using FrontierHeap =
+            std::priority_queue<FrontierEntry, std::vector<FrontierEntry>,
+                                std::greater<FrontierEntry>>;
+        std::vector<FrontierHeap> frontier(num_passes);
+
+        auto add_block_to_pass = [&](uint32_t b, uint32_t pass) {
+          assigned[b] = 1;
+          pass_assignment[c][b] = static_cast<uint8_t>(pass);
+          ++pass_sizes[pass];
+          ForEachBlockBin(d, c, b, [&](ACBin bin) {
+            const uint32_t compact_id = active.raw_to_compact[bin];
+            const uint32_t czdc = active.compact_to_czdc[compact_id];
+            ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
+            ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
+          });
+          const uint32_t x = b % w;
+          const uint32_t y = b / w;
+          auto push_neighbor = [&](uint32_t nx, uint32_t ny) {
+            const uint32_t nb = ny * w + nx;
+            if (!assigned[nb])
+              frontier[pass].emplace(growth_cost(nb, pass), nb);
+          };
+          if (x > 0) push_neighbor(x - 1, y);
+          if (x + 1 < w) push_neighbor(x + 1, y);
+          if (y > 0) push_neighbor(x, y - 1);
+          if (y + 1 < h) push_neighbor(x, y + 1);
+        };
+
+        auto choose_seed = [&](uint32_t pass) {
+          const uint32_t target = std::min<uint32_t>(
+              d.num_blocks[c] - 1,
+              ((2 * pass + 1) * d.num_blocks[c]) / (2 * seeded_passes));
+          if (!assigned[target]) return target;
+          for (uint32_t radius = 1; radius < d.num_blocks[c]; ++radius) {
+            if (target >= radius && !assigned[target - radius])
+              return target - radius;
+            if (target + radius < d.num_blocks[c] && !assigned[target + radius])
+              return target + radius;
+          }
+          return target;
+        };
+
+        uint32_t assigned_count = 0;
+        for (uint32_t pass = 0; pass < seeded_passes; ++pass) {
+          const uint32_t seed = choose_seed(pass);
+          if (assigned[seed]) continue;
+          add_block_to_pass(seed, pass);
+          ++assigned_count;
+        }
+
+        while (assigned_count < d.num_blocks[c]) {
+          uint32_t best_pass = 0;
+          for (uint32_t p = 1; p < seeded_passes; ++p)
+            if (pass_sizes[p] < pass_sizes[best_pass]) best_pass = p;
+
+          while (!frontier[best_pass].empty() &&
+                 assigned[frontier[best_pass].top().second])
+            frontier[best_pass].pop();
+
+          if (!frontier[best_pass].empty()) {
+            const uint32_t best_block = frontier[best_pass].top().second;
+            frontier[best_pass].pop();
+            add_block_to_pass(best_block, best_pass);
+          } else {
+            for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+              if (!assigned[b]) {
+                add_block_to_pass(b, best_pass);
+                break;
+              }
+            }
+          }
+          ++assigned_count;
+        }
+      }
+    }
+  }
+
+  // Initializes pass assignment with a linear ramp for each component.
+  void InitPassAssignmentSimple(PassAssignmentCtx& ctx) {
+    // uint32_t ind = 0;
+    for (uint32_t c = 0; c < d.channels; ++c) {
+      for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+        // Seed each component independently so the initial pass split preserves
+        // spatial locality inside that component instead of concatenating all
+        // components into one global ramp.
+        const uint32_t pass =  // std::min(num_passes - 1,//0;//(c != 0);//
+                               //(ind++) * num_passes /
+                               // static_cast<uint32_t>(blocks.size()));
+            b * num_passes / d.num_blocks[c];  // c;//b % num_passes;//
+        pass_assignment[c][b] = static_cast<uint8_t>(pass);
+        ForEachBlockBin(d, c, b, [&](ACBin bin) {
+          const uint32_t compact_id = active.raw_to_compact[bin];
+          const uint32_t czdc = active.compact_to_czdc[compact_id];
+          ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
+          ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
+        });
+      }
+    }
+  }
+
+  AssignScratch MakeScratch() const {
+    AssignScratch s;
+    s.delta.resize(num_passes);
+    s.touched_czdc.reserve(128);
+    s.czdc_counts.assign(czdc_size, 0);
+    return s;
+  }
+
+  uint32_t PredictNZBucket(uint16_t c, uint32_t b, uint32_t pass,
+                           const BlockRef* override_ref,
+                           uint32_t override_pass) const {
     const uint32_t w = d.block_grid_w[c];
     const uint32_t x = b % w;
     const uint32_t y = b / w;
@@ -777,17 +955,14 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
     const uint32_t b_left = (x > 0) ? b - 1 : 0;
     auto PassOf = [&](uint32_t neighbor) -> uint32_t {
       if (override_ref != nullptr && override_ref->c == c &&
-          override_ref->b == neighbor) {
+          override_ref->b == neighbor)
         return override_pass;
-      }
       return pass_assignment[c][neighbor];
     };
-
     const uint32_t pass_nz_top =
         (y > 0 && PassOf(b_top) == pass) ? d.block_nonzeros[c][b_top] : 0u;
     const uint32_t pass_nz_left =
         (x > 0 && PassOf(b_left) == pass) ? d.block_nonzeros[c][b_left] : 0u;
-
     uint32_t predicted_nz;
     if (x == 0 && y == 0) {
       predicted_nz = 32u;
@@ -799,48 +974,22 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
       predicted_nz = (pass_nz_top + pass_nz_left + 1u) / 2u;
     }
     return (predicted_nz < 8) ? predicted_nz : (4 + predicted_nz / 2);
-  };
-
-  for (uint32_t c = 0; c < d.channels; ++c) {
-    nz_pred_bucket[c].resize(d.num_blocks[c], 0);
-    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
-      const uint32_t pass = pass_assignment[c][b];
-      const uint32_t pb = PredictNZBucketForPass(c, b, pass, nullptr, 0);
-      nz_pred_bucket[c][b] = static_cast<uint8_t>(pb);
-      ++nz_hist_N[static_cast<size_t>(pass) * kJPEGNonZeroBuckets + pb];
-      ++nz_hist_h[static_cast<size_t>(pass) * kNZHistogramsSize +
-                  NZHistogramIndex(pb, d.block_nonzeros[c][b])];
-    }
   }
 
-  struct AssignScratch {
-    std::vector<FixedPointCost> delta;
-    std::vector<uint16_t> touched_czdc;
-    std::vector<uint32_t> czdc_counts;
-  };
-
-  auto make_scratch = [&]() {
-    AssignScratch scratch;
-    scratch.delta.resize(num_passes);
-    scratch.touched_czdc.reserve(128);
-    scratch.czdc_counts.assign(czdc_size, 0);
-    return scratch;
-  };
-
-  auto find_best_pass = [&](const BlockRef& ref, uint32_t cur_pass,
-                            AssignScratch* scratch) {
+  uint32_t FindBestPass(const BlockRef& ref, uint32_t cur_pass,
+                        AssignScratch* scratch) const {
     std::fill(scratch->delta.begin(), scratch->delta.end(), 0);
     scratch->touched_czdc.clear();
 
     ForEachBlockBin(d, ref.c, ref.b, [&](ACBin bin) {
       const uint32_t compact_id = active.raw_to_compact[bin];
       const uint32_t czdc = active.compact_to_czdc[compact_id];
-      if (scratch->czdc_counts[czdc]++ == 0) {
+      if (scratch->czdc_counts[czdc]++ == 0)
         scratch->touched_czdc.push_back(static_cast<uint16_t>(czdc));
-      }
-
-      const uint32_t* h_row = &hist_h[static_cast<size_t>(compact_id) * num_passes];
-      const FixedPointCost rm_cost = d.ftab[h_row[cur_pass] - 1] - d.ftab[h_row[cur_pass]];
+      const uint32_t* h_row =
+          &hist_h[static_cast<size_t>(compact_id) * num_passes];
+      const FixedPointCost rm_cost =
+          d.ftab[h_row[cur_pass] - 1] - d.ftab[h_row[cur_pass]];
       for (uint32_t p = 0; p < num_passes; ++p) {
         scratch->delta[p] -=
             (d.ftab[h_row[p] + 1] - d.ftab[h_row[p]]) + rm_cost;
@@ -851,10 +1000,10 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
       const uint32_t n = scratch->czdc_counts[czdc];
       scratch->czdc_counts[czdc] = 0;
       const uint32_t* n_row = &hist_N[static_cast<size_t>(czdc) * num_passes];
-      const FixedPointCost rm_cost = d.ftab[n_row[cur_pass] - n] - d.ftab[n_row[cur_pass]];
-      for (uint32_t p = 0; p < num_passes; ++p) {
+      const FixedPointCost rm_cost =
+          d.ftab[n_row[cur_pass] - n] - d.ftab[n_row[cur_pass]];
+      for (uint32_t p = 0; p < num_passes; ++p)
         scratch->delta[p] += rm_cost + d.ftab[n_row[p] + n] - d.ftab[n_row[p]];
-      }
     }
 
     std::array<BlockRef, 3> affected = {ref, ref, ref};
@@ -862,7 +1011,8 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
     const uint32_t w = d.block_grid_w[ref.c];
     const uint32_t x = ref.b % w;
     if (x + 1 < w) affected[num_affected++] = {ref.c, ref.b + 1};
-    if (ref.b + w < d.num_blocks[ref.c]) affected[num_affected++] = {ref.c, ref.b + w};
+    if (ref.b + w < d.num_blocks[ref.c])
+      affected[num_affected++] = {ref.c, ref.b + w};
 
     scratch->delta[cur_pass] = 1;
     FixedPointCost best_delta = 0;
@@ -877,8 +1027,7 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
         size_t h_size = 0;
         auto AddChange = [](uint32_t key, int32_t delta,
                             std::array<uint32_t, 6>* keys,
-                            std::array<int32_t, 6>* diff,
-                            size_t* size) {
+                            std::array<int32_t, 6>* diff, size_t* size) {
           for (size_t i = 0; i < *size; ++i) {
             if ((*keys)[i] == key) {
               (*diff)[i] += delta;
@@ -889,44 +1038,38 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
           (*diff)[*size] = delta;
           ++(*size);
         };
-
         for (size_t i = 0; i < num_affected; ++i) {
-          const BlockRef& affected_ref = affected[i];
-          const uint32_t old_pass = pass_assignment[affected_ref.c][affected_ref.b];
-          const uint32_t old_pb = nz_pred_bucket[affected_ref.c][affected_ref.b];
+          const BlockRef& ar = affected[i];
+          const uint32_t old_pass = pass_assignment[ar.c][ar.b];
+          const uint32_t old_pb = nz_pred_bucket[ar.c][ar.b];
           const uint32_t new_pass =
-              (affected_ref.c == ref.c && affected_ref.b == ref.b) ? p : old_pass;
-          const uint32_t new_pb = PredictNZBucketForPass(
-              affected_ref.c, affected_ref.b, new_pass, &ref, p);
+              (ar.c == ref.c && ar.b == ref.b) ? p : old_pass;
+          const uint32_t new_pb =
+              PredictNZBucket(ar.c, ar.b, new_pass, &ref, p);
           if (old_pass == new_pass && old_pb == new_pb) continue;
-          const uint32_t nz = d.block_nonzeros[affected_ref.c][affected_ref.b];
-          AddChange(old_pass * kJPEGNonZeroBuckets + old_pb, -1, &n_keys, &n_diff,
-                    &n_size);
-          AddChange(new_pass * kJPEGNonZeroBuckets + new_pb, +1, &n_keys, &n_diff,
-                    &n_size);
-          AddChange(old_pass * kNZHistogramsSize + NZHistogramIndex(old_pb, nz), -1,
-                    &h_keys, &h_diff, &h_size);
-          AddChange(new_pass * kNZHistogramsSize + NZHistogramIndex(new_pb, nz), +1,
-                    &h_keys, &h_diff, &h_size);
+          const uint32_t nz = d.block_nonzeros[ar.c][ar.b];
+          AddChange(old_pass * kJPEGNonZeroBuckets + old_pb, -1, &n_keys,
+                    &n_diff, &n_size);
+          AddChange(new_pass * kJPEGNonZeroBuckets + new_pb, +1, &n_keys,
+                    &n_diff, &n_size);
+          AddChange(old_pass * kNZHistogramsSize + NZHistogramIndex(old_pb, nz),
+                    -1, &h_keys, &h_diff, &h_size);
+          AddChange(new_pass * kNZHistogramsSize + NZHistogramIndex(new_pb, nz),
+                    +1, &h_keys, &h_diff, &h_size);
         }
-
         for (size_t i = 0; i < n_size; ++i) {
-          const uint32_t key = n_keys[i];
-          const int32_t diff = n_diff[i];
-          if (diff == 0) continue;
+          if (n_diff[i] == 0) continue;
           scratch->delta[p] +=
               d.NZFTab(static_cast<uint32_t>(
-                           static_cast<int32_t>(nz_hist_N[key]) + diff)) -
-              d.NZFTab(nz_hist_N[key]);
+                  static_cast<int32_t>(nz_hist_N[n_keys[i]]) + n_diff[i])) -
+              d.NZFTab(nz_hist_N[n_keys[i]]);
         }
         for (size_t i = 0; i < h_size; ++i) {
-          const uint32_t key = h_keys[i];
-          const int32_t diff = h_diff[i];
-          if (diff == 0) continue;
+          if (h_diff[i] == 0) continue;
           scratch->delta[p] -=
               d.NZFTab(static_cast<uint32_t>(
-                           static_cast<int32_t>(nz_hist_h[key]) + diff)) -
-              d.NZFTab(nz_hist_h[key]);
+                  static_cast<int32_t>(nz_hist_h[h_keys[i]]) + h_diff[i])) -
+              d.NZFTab(nz_hist_h[h_keys[i]]);
         }
       }
       if (scratch->delta[p] < best_delta) {
@@ -935,40 +1078,28 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
       }
     }
     return best_pass;
-  };
+  }
 
-  auto apply_move = [&](const BlockRef& ref, uint32_t cur_pass,
-                        uint32_t new_pass) {
+  void ApplyMove(const BlockRef& ref, uint32_t cur_pass, uint32_t new_pass) {
     std::array<BlockRef, 3> affected = {ref, ref, ref};
     size_t num_affected = 1;
     const uint32_t w = d.block_grid_w[ref.c];
     const uint32_t x = ref.b % w;
     if (x + 1 < w) affected[num_affected++] = {ref.c, ref.b + 1};
-    if (ref.b + w < d.num_blocks[ref.c]) affected[num_affected++] = {ref.c, ref.b + w};
+    if (ref.b + w < d.num_blocks[ref.c])
+      affected[num_affected++] = {ref.c, ref.b + w};
 
-    struct NZAffectedState {
+    struct NZState {
       BlockRef ref;
-      uint32_t old_pass;
-      uint32_t old_pb;
-      uint32_t new_pass;
-      uint32_t new_pb;
+      uint32_t old_pass, old_pb, new_pass, new_pb;
     };
-    std::array<NZAffectedState, 3> nz_states = {};
+    std::array<NZState, 3> nz_states = {};
     for (size_t i = 0; i < num_affected; ++i) {
-      const BlockRef& affected_ref = affected[i];
-      const uint32_t old_pass = pass_assignment[affected_ref.c][affected_ref.b];
-      nz_states[i] = {affected_ref,
-                      old_pass,
-                      nz_pred_bucket[affected_ref.c][affected_ref.b],
-                      (affected_ref.c == ref.c && affected_ref.b == ref.b)
-                          ? new_pass
-                          : old_pass,
-                      PredictNZBucketForPass(affected_ref.c, affected_ref.b,
-                                             (affected_ref.c == ref.c &&
-                                              affected_ref.b == ref.b)
-                                                 ? new_pass
-                                                 : old_pass,
-                                             &ref, new_pass)};
+      const BlockRef& ar = affected[i];
+      const uint32_t op = pass_assignment[ar.c][ar.b];
+      const uint32_t np = (ar.c == ref.c && ar.b == ref.b) ? new_pass : op;
+      nz_states[i] = {ar, op, nz_pred_bucket[ar.c][ar.b], np,
+                      PredictNZBucket(ar.c, ar.b, np, &ref, new_pass)};
     }
 
     ForEachBlockBin(d, ref.c, ref.b, [&](ACBin bin) {
@@ -981,299 +1112,317 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
     });
 
     for (size_t i = 0; i < num_affected; ++i) {
-      const auto& state = nz_states[i];
-      --nz_hist_N[static_cast<size_t>(state.old_pass) * kJPEGNonZeroBuckets +
-                  state.old_pb];
-      --nz_hist_h[static_cast<size_t>(state.old_pass) * kNZHistogramsSize +
-                  NZHistogramIndex(state.old_pb,
-                                   d.block_nonzeros[state.ref.c][state.ref.b])];
+      const auto& s = nz_states[i];
+      --nz_hist_N[static_cast<size_t>(s.old_pass) * kJPEGNonZeroBuckets +
+                  s.old_pb];
+      --nz_hist_h[static_cast<size_t>(s.old_pass) * kNZHistogramsSize +
+                  NZHistogramIndex(s.old_pb,
+                                   d.block_nonzeros[s.ref.c][s.ref.b])];
     }
     pass_assignment[ref.c][ref.b] = static_cast<uint8_t>(new_pass);
     for (size_t i = 0; i < num_affected; ++i) {
-      const auto& state = nz_states[i];
-      ++nz_hist_N[static_cast<size_t>(state.new_pass) * kJPEGNonZeroBuckets +
-                  state.new_pb];
-      ++nz_hist_h[static_cast<size_t>(state.new_pass) * kNZHistogramsSize +
-                  NZHistogramIndex(state.new_pb,
-                                   d.block_nonzeros[state.ref.c][state.ref.b])];
-      nz_pred_bucket[state.ref.c][state.ref.b] = static_cast<uint8_t>(state.new_pb);
+      const auto& s = nz_states[i];
+      ++nz_hist_N[static_cast<size_t>(s.new_pass) * kJPEGNonZeroBuckets +
+                  s.new_pb];
+      ++nz_hist_h[static_cast<size_t>(s.new_pass) * kNZHistogramsSize +
+                  NZHistogramIndex(s.new_pb,
+                                   d.block_nonzeros[s.ref.c][s.ref.b])];
+      nz_pred_bucket[s.ref.c][s.ref.b] = static_cast<uint8_t>(s.new_pb);
     }
-  };
+  }
 
-  auto assignment_cost = [&]() {
+  FixedPointCost TotalCost() const {
     FixedPointCost cost = 0;
     for (uint32_t czdc = 0; czdc < czdc_size; ++czdc) {
       const uint32_t* n_row = &hist_N[static_cast<size_t>(czdc) * num_passes];
-      for (uint32_t pass = 0; pass < num_passes; ++pass) {
+      for (uint32_t pass = 0; pass < num_passes; ++pass)
         if (n_row[pass] != 0) cost += d.ftab[n_row[pass]];
-      }
     }
     for (uint32_t compact_id = 0; compact_id < M; ++compact_id) {
-      const uint32_t* h_row = &hist_h[static_cast<size_t>(compact_id) * num_passes];
-      for (uint32_t pass = 0; pass < num_passes; ++pass) {
+      const uint32_t* h_row =
+          &hist_h[static_cast<size_t>(compact_id) * num_passes];
+      for (uint32_t pass = 0; pass < num_passes; ++pass)
         if (h_row[pass] != 0) cost -= d.ftab[h_row[pass]];
-      }
     }
     for (uint32_t pass = 0; pass < num_passes; ++pass) {
-      const uint32_t* nz_n_row =
+      const uint32_t* nz_n =
           &nz_hist_N[static_cast<size_t>(pass) * kJPEGNonZeroBuckets];
-      for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
-        if (nz_n_row[pb] != 0) cost += d.NZFTab(nz_n_row[pb]);
-      }
-      const uint32_t* nz_h_row =
+      for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb)
+        if (nz_n[pb] != 0) cost += d.NZFTab(nz_n[pb]);
+      const uint32_t* nz_h =
           &nz_hist_h[static_cast<size_t>(pass) * kNZHistogramsSize];
-      for (uint32_t idx = 0; idx < kNZHistogramsSize; ++idx) {
-        if (nz_h_row[idx] != 0) cost -= d.NZFTab(nz_h_row[idx]);
-      }
+      for (uint32_t idx = 0; idx < kNZHistogramsSize; ++idx)
+        if (nz_h[idx] != 0) cost -= d.NZFTab(nz_h[idx]);
     }
     return cost;
-  };
+  }
 
-  constexpr uint32_t kMaxIters = 100;
-  uint32_t iter = 0;
-  constexpr uint32_t kLargeImageThreshold = 1u << 15;
-  constexpr uint32_t kBatchChunkSize = 1u << 14;
+
+uint32_t SequentialIter(const std::vector<BlockRef>& active_blocks,
+                        AssignScratch& scratch) {
+  uint32_t moves = 0;
+  for (const BlockRef& ref : active_blocks) {
+    const uint32_t cur = pass_assignment[ref.c][ref.b];
+    const uint32_t best = FindBestPass(ref, cur, &scratch);
+    if (best == cur) continue;
+    ApplyMove(ref, cur, best);
+    ++moves;
+  }
+  return moves;
+}
+
+// Scores all active blocks in parallel; writes proposed best pass per block
+// into new_passes[]. Returns number of proposed changes.
+uint32_t ScoreBatchMoves(const std::vector<BlockRef>& active_blocks,
+                         std::vector<uint8_t>& new_passes,
+                         std::vector<AssignScratch>& scratch_pool,
+                         ThreadPool* pool) {
+  std::atomic<uint32_t> batch_moves(0);
+  const uint32_t num_chunks = static_cast<uint32_t>(
+      (active_blocks.size() + kBatchChunkSize - 1) / kBatchChunkSize);
+  if (!RunOnPool(
+          pool, 0, num_chunks,
+          [&](size_t num_threads) -> Status {
+            scratch_pool.clear();
+            scratch_pool.reserve(num_threads);
+            for (size_t i = 0; i < num_threads; ++i)
+              scratch_pool.push_back(MakeScratch());
+            return true;
+          },
+          [&](uint32_t chunk, size_t thread_id) -> Status {
+            uint32_t chunk_moves = 0;
+            AssignScratch& ts = scratch_pool[thread_id];
+            const size_t begin = static_cast<size_t>(chunk) * kBatchChunkSize;
+            const size_t end =
+                std::min(begin + kBatchChunkSize, active_blocks.size());
+            for (size_t i = begin; i < end; ++i) {
+              const BlockRef& ref = active_blocks[i];
+              const uint32_t cur = pass_assignment[ref.c][ref.b];
+              const uint32_t best = FindBestPass(ref, cur, &ts);
+              new_passes[i] = static_cast<uint8_t>(best);
+              if (best != cur) ++chunk_moves;
+            }
+            batch_moves.fetch_add(chunk_moves, std::memory_order_relaxed);
+            return true;
+          },
+          "AssignPassesGreedyBatch")) {
+    return 0;
+  }
+  return batch_moves.load(std::memory_order_seq_cst);
+}
+
+// Applies the subset of new_passes moves where i % stride == iter % stride.
+uint32_t ApplyBatchMoves(const std::vector<BlockRef>& active_blocks,
+                         const std::vector<uint8_t>& new_passes,
+                         uint32_t stride, uint32_t iter) {
+  uint32_t n = 0;
+  for (size_t i = 0; i < active_blocks.size(); ++i) {
+    if (i % stride != iter % stride) continue;
+    const BlockRef& ref = active_blocks[i];
+    const uint32_t cur = pass_assignment[ref.c][ref.b];
+    if (new_passes[i] == cur) continue;
+    ApplyMove(ref, cur, new_passes[i]);
+    ++n;
+  }
+  return n;
+}
+
+// Snapshot-batched parallel refinement phase for large images.
+// Returns elapsed nanoseconds; updates iter and seq_moves.
+int64_t RunBatchPassRefinement(const std::vector<BlockRef>& active_blocks,
+                               ThreadPool* pool, uint32_t min_moves,
+                               uint32_t& iter, uint32_t& seq_moves) {
+  constexpr uint32_t kUnconditionalBatchIterations = 5;
   constexpr uint32_t kBatchPatience = 2;
   constexpr uint32_t kBatchStride = 1;
-  AssignScratch scratch = make_scratch();
-  const uint32_t min_moves = std::max<uint32_t>(1, blocks.size() >> 13);
 
+  const auto start = PlannerClock::now();
+
+  std::vector<uint8_t> new_passes(active_blocks.size(), 0);
   std::vector<AssignScratch> scratch_pool;
-  std::vector<uint8_t> new_passes(blocks.size(), 0);
+  FixedPointCost best_cost = TotalCost();
+  FixedPointCost current_cost = best_cost;
+  PassAssignment snap_assignment = pass_assignment;
+  std::vector<uint32_t> snap_hist_h = hist_h;
+  std::vector<uint32_t> snap_hist_N = hist_N;
+  uint32_t stale_count = 0;
+  uint32_t applied = 1;
   uint32_t best_moves = std::numeric_limits<uint32_t>::max();
 
-  auto batch_iter = [&]() -> uint32_t {
-    std::atomic<uint32_t> batch_moves(0);
-      const uint32_t num_chunks = static_cast<uint32_t>(
-          (blocks.size() + kBatchChunkSize - 1) / kBatchChunkSize);
-      if (!RunOnPool(
-              pool, 0, num_chunks,
-              [&](size_t num_threads) -> Status {
-                scratch_pool.clear();
-                scratch_pool.reserve(num_threads);
-                for (size_t thread = 0; thread < num_threads; ++thread) {
-                  scratch_pool.push_back(make_scratch());
-                }
-                return true;
-              },
-              [&](uint32_t chunk, size_t thread_id) -> Status {
-                uint32_t chunk_moves = 0;
-                AssignScratch& thread_scratch = scratch_pool[thread_id];
-                const size_t begin = static_cast<size_t>(chunk) * kBatchChunkSize;
-                const size_t end = std::min(begin + kBatchChunkSize, blocks.size());
-                for (size_t i = begin; i < end; ++i) {
-                  const BlockRef& ref = blocks[i];
-                  const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
-                  const uint32_t best_pass =
-                      find_best_pass(ref, cur_pass, &thread_scratch);
-                  new_passes[i] = static_cast<uint8_t>(best_pass);
-                  if (best_pass != cur_pass) {
-                    ++chunk_moves;
-                  }
-                }
-                batch_moves.fetch_add(chunk_moves, std::memory_order_relaxed);
-                return true;
-              },
-              "AssignPassesGreedyBatch")) {
-        return 0;
+  // The number of block moves in the iteration is the main tracking variable.
+  // We start with `kUnconditionalBatchIterations` batch iterations to allow the
+  // batching to start converging. Then we use sequential iterations if batching
+  // iteration is not improving the situation much (at least by `best_moves >>
+  // 4` moves), and stop the loop if `kBatchPatience` batch iterations are done
+  // without improving the number of moves.
+  while (iter < kMaxIters && applied > 0 && stale_count < kBatchPatience &&
+         seq_moves > min_moves) {
+    const uint32_t batch_moves =
+        ScoreBatchMoves(active_blocks, new_passes, scratch_pool, pool);
+    if (batch_moves == 0) break;
+
+    applied =
+        ApplyBatchMoves(active_blocks, new_passes, kBatchStride, iter);
+    ++iter;
+    fprintf(stderr,
+            "PLANNER: [bicluster] Batch phase %u took %.2f ms for %u moves\n",
+            iter, NanosToMs(ElapsedNanos(start, PlannerClock::now())), applied);
+    fflush(stderr);
+    if (iter < kUnconditionalBatchIterations) continue;
+
+    if (batch_moves < best_moves) {
+      if (batch_moves < best_moves - (best_moves >> 4)) {
+        stale_count = 0;
+        best_moves = batch_moves;
+        current_cost = TotalCost();
+        if (current_cost < best_cost) {
+          best_cost = current_cost;
+          snap_assignment = pass_assignment;
+          snap_hist_h = hist_h;
+          snap_hist_N = hist_N;
+        }
+        continue;
       }
-      return batch_moves.load(std::memory_order_seq_cst);
-    };
-  auto apply_batch_moves = [&]() -> uint32_t {
-    uint32_t applied = 0;
-    for (size_t i = 0; i < blocks.size(); ++i) {
-      if (i % kBatchStride != iter % kBatchStride) continue;
-      const BlockRef& ref = blocks[i];
-      const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
-      const uint32_t best_pass = new_passes[i];
-      if (best_pass == cur_pass) continue;
-      apply_move(ref, cur_pass, best_pass);
-      ++applied;
+      best_moves = batch_moves;
+    } else {
+      ++stale_count;
     }
-    return applied;
-  };
-  auto sequential_iter = [&]() -> uint32_t {
-    uint32_t seq_moves = 0;
-    for (const BlockRef& ref : blocks) {
-      const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
-      const uint32_t new_pass = find_best_pass(ref, cur_pass, &scratch);
-      if (new_pass == cur_pass) continue;
-      apply_move(ref, cur_pass, new_pass);
-      //enqueue_neighbors(ref);
-      ++seq_moves;
+
+    AssignScratch scratch = MakeScratch();
+    seq_moves = SequentialIter(active_blocks, scratch);
+    ++iter;
+    fprintf(
+        stderr,
+        "PLANNER: [bicluster] Sequential phase %u took %.2f ms for %u moves\n",
+        iter, NanosToMs(ElapsedNanos(start, PlannerClock::now())), seq_moves);
+    fflush(stderr);
+
+    current_cost = TotalCost();
+    if (current_cost < best_cost) {
+      best_cost = current_cost;
+      snap_assignment = pass_assignment;
+      snap_hist_h = hist_h;
+      snap_hist_N = hist_N;
     }
-    return seq_moves;
-  };
+  }
+
+  if (current_cost > best_cost) {
+    pass_assignment = std::move(snap_assignment);
+    hist_h = std::move(snap_hist_h);
+    hist_N = std::move(snap_hist_N);
+  }
+  return ElapsedNanos(start, PlannerClock::now());
+}
+
+// Serial sweep-to-convergence phase. Returns elapsed nanoseconds.
+int64_t RunSequentialPassRefinement(const std::vector<BlockRef>& active_blocks,
+                                    ThreadPool* pool, uint32_t min_moves,
+                                    uint32_t& iter) {
+  constexpr uint32_t kBatchStride = 1;
+  std::vector<uint8_t> new_passes(active_blocks.size(), 0);
+  std::vector<AssignScratch> scratch_pool;
+
+  const auto start = PlannerClock::now();
+  AssignScratch scratch = MakeScratch();
+  uint32_t best_moves = std::numeric_limits<uint32_t>::max();
+  uint32_t seq_moves = min_moves + 1;
+
+  // On sequential phase we iterate until we have a number of block moves less
+  // than `min_moves`. After each sequential phase without improvement on block
+  // moves we perform a batch phase to speed up the convergence.
+  while (iter < kMaxIters && seq_moves > min_moves) {
+    seq_moves = SequentialIter(active_blocks, scratch);
+    ++iter;
+    fprintf(stderr,
+            "PLANNER: [bicluster] Sequential global phase %u took %.2f ms for "
+            "%u moves\n",
+            iter, NanosToMs(ElapsedNanos(start, PlannerClock::now())),
+            seq_moves);
+    fflush(stderr);
+
+    if (seq_moves > best_moves) {
+      const uint32_t batch_moves =
+          ScoreBatchMoves(active_blocks, new_passes, scratch_pool, pool);
+      if (batch_moves == 0) break;
+      const uint32_t applied =
+          ApplyBatchMoves(active_blocks, new_passes, kBatchStride, iter);
+      ++iter;
+      fprintf(stderr,
+              "PLANNER: [bicluster] Batch global phase %u took %.2f ms for %u "
+              "moves\n",
+              iter, NanosToMs(ElapsedNanos(start, PlannerClock::now())),
+              applied);
+      fflush(stderr);
+    } else {
+      best_moves = seq_moves;
+    }
+  }
+  return ElapsedNanos(start, PlannerClock::now());
+}
+};
+
+// Greedy block-to-pass assignment:
+//   1. Seeded spatial growth initializes histograms and pass_assignment.
+//   2. NZ predictor state built from initial assignment.
+//   3. One serial sweep warms up the refinement state.
+//   4. Snapshot-batched parallel refinement (large images only).
+//   5. Serial sweep-to-convergence.
+AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
+                                      const ActiveRawBins& active,
+                                      uint32_t num_passes, ThreadPool* pool) {
+  const auto start_total = PlannerClock::now();
+  AssignPassesResult result;
+  if (num_passes <= 1 || active.active_bins.empty()) {
+    for (uint32_t c = 0; c < kNumCh; ++c)
+      result.pass_assignment[c].assign(d.num_blocks[c], 0);
+    result.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
+    return result;
+  }
+
+  std::vector<BlockRef> active_blocks;
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+      if (d.block_offsets[c][b] == d.block_offsets[c][b + 1]) continue;
+      active_blocks.push_back({static_cast<uint16_t>(c), b});
+    }
+  }
+
+  PassAssignmentCtx ctx(d, active, num_passes);
+  if (active_blocks.empty()) {
+    result.pass_assignment = std::move(ctx.pass_assignment);
+    result.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
+    return result;
+  }
+
+  // Heuristic for number of moves to stop at: ~1/8000 of blocks.
+  const uint32_t min_moves = std::max<uint32_t>(1, active_blocks.size() >> 13);
 
   const auto start_init = PlannerClock::now();
-  uint32_t seq_moves = sequential_iter();
-  fprintf(stderr, "PLANNER: [bicluster] Initial phase 1 took %.2f ms for %u moves\n",
+  ctx.InitPassAssignmentHistogramAware();
+  ctx.InitNZPredictorState();
+  fprintf(stderr, "PLANNER: [bicluster] Initializing clusters took %.2f ms\n",
+          NanosToMs(ElapsedNanos(start_init, PlannerClock::now())));
+  fflush(stderr);
+
+  // One sequential iteration to warm up.
+  AssignScratch scratch = ctx.MakeScratch();
+  uint32_t iter = 0;
+  uint32_t seq_moves = ctx.SequentialIter(active_blocks, scratch);
+  fprintf(stderr,
+          "PLANNER: [bicluster] Initial phase 1 took %.2f ms for %u moves\n",
           NanosToMs(ElapsedNanos(start_init, PlannerClock::now())), seq_moves);
   fflush(stderr);
   ++iter;
 
-  if (pool != nullptr && blocks.size() > kLargeImageThreshold) {
-    const auto start_batch = PlannerClock::now();
-    FixedPointCost best_cost = assignment_cost();
-    PassAssignment snap_assignment = pass_assignment;
-    std::vector<uint32_t> snap_hist_h = hist_h;
-    std::vector<uint32_t> snap_hist_N = hist_N;
-    uint32_t stale_count = 0;
-    uint32_t applied = 1;
-    //uint32_t batch_moves = min_moves + 1;
-    FixedPointCost current_cost;
-
-    while (iter < kMaxIters && applied > 0 && stale_count < kBatchPatience &&
-          /*batch_moves > min_batch_moves &&*/ seq_moves > min_moves) {
-      uint32_t batch_moves = batch_iter();
-      if (batch_moves == 0) break;
-
-      applied = apply_batch_moves();
-
-      ++iter;
-      fprintf(stderr, "PLANNER: [bicluster] Batch phase %u took %.2f ms for %u moves\n",
-              iter, NanosToMs(ElapsedNanos(start_batch, PlannerClock::now())), applied);
-      fflush(stderr);
-
-      if (iter < 5) continue;
-
-      // If we are caught in a loop where batch moves spoil sequential moves, we should stop.
-      if (batch_moves < best_moves) {
-        if (batch_moves < best_moves - (best_moves >> 4)) {
-          stale_count = 0;
-          best_moves = batch_moves;
-
-          current_cost = assignment_cost();
-          if (current_cost < best_cost) {
-            best_cost = current_cost;
-            snap_assignment = pass_assignment;
-            snap_hist_h = hist_h;
-            snap_hist_N = hist_N;
-          }
-          continue;
-        }
-        best_moves = batch_moves;
-      } else {
-        ++stale_count;
-      }
-
-      seq_moves = sequential_iter();
-      ++iter;
-      fprintf(stderr, "PLANNER: [bicluster] Sequential phase %u took %.2f ms for %u moves\n",
-              iter, NanosToMs(ElapsedNanos(start_batch, PlannerClock::now())), seq_moves);
-      fflush(stderr);
-
-      current_cost = assignment_cost();
-      if (current_cost < best_cost) {
-        best_cost = current_cost;
-        snap_assignment = pass_assignment;
-        snap_hist_h = hist_h;
-        snap_hist_N = hist_N;
-      }
-    }
-
-    if (current_cost > best_cost) {
-      pass_assignment = std::move(snap_assignment);
-      hist_h = std::move(snap_hist_h);
-      hist_N = std::move(snap_hist_N);
-    }
-    result.timings.batch_ns =
-        ElapsedNanos(start_batch, PlannerClock::now());
-  }
-
-  const auto start_sequential = PlannerClock::now();
-  best_moves = std::numeric_limits<uint32_t>::max();
-  // std::array<std::vector<uint8_t>, kNumCh> in_queue;
-  // for (uint32_t c = 0; c < kNumCh; ++c) {
-  //   in_queue[c].assign(d.num_blocks[c], 0);
-  // }
-  // std::vector<BlockRef> queue;
-  // queue.reserve(std::min(blocks.size(), size_t{1} << 20));
-
-  // auto enqueue = [&](const BlockRef& ref) {
-  //   if (d.block_offsets[ref.c][ref.b] == d.block_offsets[ref.c][ref.b + 1]) {
-  //     return;
-  //   }
-  //   if (!in_queue[ref.c][ref.b]) {
-  //     in_queue[ref.c][ref.b] = 1;
-  //     queue.push_back(ref);
-  //   }
-  // };
-
-  // auto enqueue_neighbors = [&](const BlockRef& ref) {
-  //   const uint32_t w = d.block_grid_w[ref.c];
-  //   const uint32_t bx = ref.b % w;
-  //   const uint32_t by = ref.b / w;
-  //   if (bx > 0) enqueue({ref.c, ref.b - 1});
-  //   if (bx + 1 < w) enqueue({ref.c, ref.b + 1});
-  //   if (by > 0) enqueue({ref.c, ref.b - w});
-  //   if (ref.b + w < d.num_blocks[ref.c]) enqueue({ref.c, ref.b + w});
-  // };
-
-  // auto is_boundary = [&](const BlockRef& ref) {
-  //   const uint32_t pass = pass_assignment[ref.c][ref.b];
-  //   const uint32_t w = d.block_grid_w[ref.c];
-  //   const uint32_t bx = ref.b % w;
-  //   const uint32_t by = ref.b / w;
-  //   auto has_other_pass = [&](uint32_t neighbor) {
-  //     if (d.block_offsets[ref.c][neighbor] == d.block_offsets[ref.c][neighbor + 1]) {
-  //       return false;
-  //     }
-  //     return pass_assignment[ref.c][neighbor] != pass;
-  //   };
-  //   return (bx > 0 && has_other_pass(ref.b - 1)) ||
-  //          (bx + 1 < w && has_other_pass(ref.b + 1)) ||
-  //          (by > 0 && has_other_pass(ref.b - w)) ||
-  //          (ref.b + w < d.num_blocks[ref.c] && has_other_pass(ref.b + w));
-  // };
-
-  // for (const BlockRef& ref : blocks) {
-  //   if (is_boundary(ref)) enqueue(ref);
-  // }
-  uint32_t moves = min_moves + 1;
-
-  while (iter < kMaxIters && moves > min_moves) {
-    // for (size_t qi = 0; qi < queue.size(); ++qi) {
-    //   const BlockRef ref = queue[qi];
-    //   in_queue[ref.c][ref.b] = 0;
-    //   const uint32_t cur_pass = pass_assignment[ref.c][ref.b];
-    //   const uint32_t new_pass = find_best_pass(ref, cur_pass, &scratch);
-    //   if (new_pass == cur_pass) continue;
-    //   apply_move(ref, cur_pass, new_pass);
-    //   enqueue_neighbors(ref);
-    //   if((queue.size() & 0xFFFFF) == 0) {
-    //     fprintf(stderr, "|");
-    //     fflush(stderr);
-    //   }
-    // }
-    // fprintf(stderr, "\nPLANNER: [bicluster] Sequential neighborhood phase %u took %.2f ms for %i blocks\n",
-    //         iter, NanosToMs(ElapsedNanos(start_sequential, PlannerClock::now())), (int)queue.size());
-    // fflush(stderr);
-    // queue.clear();
-
-    moves = sequential_iter();
-    ++iter;
-    fprintf(stderr, "PLANNER: [bicluster] Sequential global phase %u took %.2f ms for %u moves\n",
-            iter, NanosToMs(ElapsedNanos(start_sequential, PlannerClock::now())), moves);
-    fflush(stderr);
-
-    if(moves > best_moves) {
-      uint32_t batch_moves = batch_iter();
-      if (batch_moves == 0) break;
-
-      uint32_t applied = apply_batch_moves();
-
-      ++iter;
-      fprintf(stderr, "PLANNER: [bicluster] Batch global phase %u took %.2f ms for %u moves\n",
-              iter, NanosToMs(ElapsedNanos(start_sequential, PlannerClock::now())), applied);
-      fflush(stderr);
-    } else {
-      best_moves = moves;
-    }
+  if (pool != nullptr && active_blocks.size() > kLargeImageThreshold) {
+    result.timings.batch_ns = ctx.RunBatchPassRefinement(
+        active_blocks, pool, min_moves, iter, seq_moves);
   }
 
   result.timings.sequential_ns =
-      ElapsedNanos(start_sequential, PlannerClock::now());
+      ctx.RunSequentialPassRefinement(active_blocks, pool, min_moves, iter);
+
+  result.pass_assignment = std::move(ctx.pass_assignment);
   result.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
   return result;
 }
@@ -1442,21 +1591,6 @@ void ForEachIntersection(const std::unordered_map<uint32_t, uint32_t>& lhs,
       fn(entry.first, entry.second, it->second);
     }
   }
-}
-
-// Small union-find helper for the agglomerative merge loop in
-// `ClusterContextsPassAware`.
-uint32_t FindRoot(std::vector<uint32_t>& parent, uint32_t x) {
-  uint32_t root = x;
-  while (parent[root] != root) {
-    root = parent[root];
-  }
-  while (parent[x] != x) {
-    const uint32_t next = parent[x];
-    parent[x] = root;
-    x = next;
-  }
-  return root;
 }
 
 // Entropy proxy for one sparse nz histogram. Kept file-local because only the
@@ -1843,29 +1977,34 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
 
   const JPEGOptData& d = *opt_data;
   const ActiveRawBins active = BuildActiveRawBins(d);
-  const uint32_t min_num_passes =
+  const uint32_t min_passes =
       effort.optimize_passes_num <= 0
           ? 1
           : static_cast<uint32_t>(effort.optimize_passes_num);
-  const uint32_t max_num_passes =
-      effort.optimize_passes_num <= 0
-          ? ComputeMaxNumPasses(d)
-          : static_cast<uint32_t>(effort.optimize_passes_num);
+  const uint32_t max_img_passes = ComputeMaxNumPasses(d);
+  const uint32_t max_passes =
+      effort.optimize_passes_num < 0
+          ? 1
+          : (effort.optimize_passes_num == 0
+                 ? max_img_passes
+                 : std::min<uint32_t>(effort.optimize_passes_num,
+                                      max_img_passes));
   const uint32_t target_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
 
+  // Accumulates the best result across all pass configurations. Updated by
+  // deterministic reduction after each pass loop.
   PassSearchResult best_result;
   best_result.total_cost = std::numeric_limits<FixedPointCost>::max();
-  std::mutex mu;
+  // Tiebreaker for deterministic results: among equal-cost candidates the
+  // one with the lowest candidate index wins, independent of thread count.
+  uint32_t overall_best_idx = std::numeric_limits<uint32_t>::max();
 
-  for (uint32_t num_passes = min_num_passes; num_passes <= max_num_passes;
+  for (uint32_t num_passes = min_passes; num_passes <= max_passes;
        ++num_passes) {
-    //uint32_t num_passes = 3;
     auto start_pass_config = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "PLANNER: Testing configuration with %u passes\n", num_passes);
     fflush(stderr);
-    std::atomic<FixedPointCost> best_config_cost(
-        std::numeric_limits<FixedPointCost>::max());
     AssignPassesResult assign_result =
         AssignPassesGreedy(d, active, num_passes, pool);
     PassAssignment& pass_assignment = assign_result.pass_assignment;
@@ -1887,6 +2026,9 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
             NanosToMs(ElapsedNanos(start_build_stream, end_build_stream)));
     fflush(stderr);
 
+    // Per-stage timing accumulators (atomics for lock-free accumulation from
+    // multiple threads; relaxed ordering is sufficient — visibility is ensured
+    // by the `RunOnPool` join barrier).
     std::atomic<int64_t> rough_opt_ns(0);
     std::atomic<int64_t> cluster_ns(0);
     std::atomic<int64_t> rough_eval_ns(0);
@@ -1894,6 +2036,15 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
     std::atomic<int64_t> refined_eval_ns(0);
     std::atomic<uint32_t> processed_candidates(0);
 
+    // Per-thread best result. Each thread writes only its own slot
+    // `thread_best[thread_id]`, so no synchronization is needed. After
+    // `RunOnPool` returns, a single-threaded reduction picks the overall best.
+    struct PassThreadBest {
+      PassSearchResult result;
+      uint32_t best_idx = std::numeric_limits<uint32_t>::max();
+    };
+    std::vector<PassThreadBest> thread_best;
+    // One `PartitioningCtx` per thread.
     std::vector<PartitioningCtx> ctx_pool;
     auto start_candidate_loop = PlannerClock::now();
     JXL_RETURN_IF_ERROR(RunOnPool(
@@ -1903,12 +2054,15 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
           for (size_t i = 0; i < num_threads; ++i) {
             ctx_pool.emplace_back(opt_data);
           }
+          thread_best.resize(num_threads);
           return true;
         },
         [&](uint32_t idx, size_t thread_id) -> Status {
           PartitioningCtx& ctx = ctx_pool[thread_id];
           const FactorizationCandidate& candidate = candidates[idx];
 
+          // Stage 1: rough threshold optimization from the candidate's init
+          // point. Produces an initial `ThresholdSet`.
           auto start_rough_opt = PlannerClock::now();
           FixedPointCost rough_unclustered_cost = 0;
           ThresholdSet rough_thresholds =
@@ -1920,6 +2074,8 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
               ElapsedNanos(start_rough_opt, end_rough_opt),
               std::memory_order_relaxed);
 
+          // Stage 2: cluster the (cell, pass) contexts implied by the rough
+          // thresholds into at most `target_clusters` groups.
           auto start_cluster = PlannerClock::now();
           JXL_ASSIGN_OR_RETURN(
               ClusterResult cluster_result,
@@ -1941,6 +2097,7 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
               ElapsedNanos(start_rough_eval, end_rough_eval),
               std::memory_order_relaxed);
 
+          // Stage 3: refine thresholds around the rough optimum.
           auto start_refine = PlannerClock::now();
           ThresholdSet refined_thresholds =
               RefinePassAwareThresholds(ctx, rough_thresholds, pass_stream,
@@ -1959,37 +2116,53 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
           refined_eval_ns.fetch_add(
               ElapsedNanos(start_refined_eval, end_refined_eval),
               std::memory_order_relaxed);
+          // relaxed is safe: only used for diagnostic printing after join.
           processed_candidates.fetch_add(1, std::memory_order_relaxed);
 
+          // Pick whichever of rough/refined scored better.
           const bool refined_is_better =
               refined_eval.total_cost() < rough_eval.total_cost();
           const ThresholdSet& best_thresholds =
               refined_is_better ? refined_thresholds : rough_thresholds;
           const ModelEvaluation& best_eval =
               refined_is_better ? refined_eval : rough_eval;
-          FixedPointCost prev_config_best =
-              best_config_cost.load(std::memory_order_relaxed);
-          while (best_eval.total_cost() < prev_config_best &&
-                 !best_config_cost.compare_exchange_weak(
-                     prev_config_best, best_eval.total_cost(),
-                     std::memory_order_relaxed)) {
-          }
-
-          std::lock_guard<std::mutex> lock(mu);
-          if (best_eval.total_cost() < best_result.total_cost) {
-            best_result.thresholds = best_thresholds;
-            best_result.ctx_map = cluster_result.ctx_map;
-            best_result.pass_assignment = pass_assignment;
-            best_result.num_passes = num_passes;
-            best_result.num_clusters = cluster_result.num_clusters;
-            best_result.ac_cost = best_eval.ac_cost;
-            best_result.nz_cost = best_eval.nz_cost;
-            best_result.signalling_overhead = best_eval.signalling_overhead;
-            best_result.total_cost = best_eval.total_cost();
+          // Per-thread best; no lock needed. Tiebreaker: lowest candidate
+          // index for deterministic results independent of thread count.
+          auto& local = thread_best[thread_id];
+          if (best_eval.total_cost() < local.result.total_cost ||
+              (best_eval.total_cost() == local.result.total_cost &&
+               idx < local.best_idx)) {
+            local.result.thresholds = best_thresholds;
+            local.result.ctx_map = cluster_result.ctx_map;
+            local.result.pass_assignment = pass_assignment;
+            local.result.num_passes = num_passes;
+            local.result.num_clusters = cluster_result.num_clusters;
+            local.result.ac_cost = best_eval.ac_cost;
+            local.result.nz_cost = best_eval.nz_cost;
+            local.result.signalling_overhead = best_eval.signalling_overhead;
+            local.result.total_cost = best_eval.total_cost();
+            local.best_idx = idx;
           }
           return true;
         },
         "JpegCtxPasses"));
+    // Deterministic reduction: merge per-thread bests into the overall
+    // best_result. Tiebreaker: lowest candidate index. This also computes
+    // best_pass_cost (the best cost for this particular pass configuration)
+    // for diagnostic printing below.
+    FixedPointCost best_pass_cost = std::numeric_limits<FixedPointCost>::max();
+    for (auto& tb : thread_best) {
+      if (tb.result.total_cost < best_pass_cost) {
+        best_pass_cost = tb.result.total_cost;
+      }
+      if (tb.result.total_cost < best_result.total_cost ||
+          (tb.result.total_cost == best_result.total_cost &&
+           tb.best_idx < overall_best_idx)) {
+        best_result = std::move(tb.result);
+        overall_best_idx = tb.best_idx;
+      }
+    }
+
     auto end_candidate_loop = PlannerClock::now();
     const uint32_t num_processed = processed_candidates.load(
         std::memory_order_relaxed);
@@ -1998,29 +2171,29 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
             NanosToMs(ElapsedNanos(start_candidate_loop, end_candidate_loop)),
             num_processed);
     if (num_processed != 0) {
+      // relaxed is safe here: RunOnPool join establishes happens-before, so
+      // all fetch_add writes from worker threads are visible.
+      const double rough_opt_ms =
+          NanosToMs(rough_opt_ns.load(std::memory_order_relaxed));
+      const double cluster_ms =
+          NanosToMs(cluster_ns.load(std::memory_order_relaxed));
+      const double rough_eval_ms =
+          NanosToMs(rough_eval_ns.load(std::memory_order_relaxed));
+      const double refine_ms =
+          NanosToMs(refine_ns.load(std::memory_order_relaxed));
+      const double refined_eval_ms =
+          NanosToMs(refined_eval_ns.load(std::memory_order_relaxed));
       fprintf(stderr,
               "PLANNER: Candidate stages (sum/avg ms): \nrough_opt=%.2f/%.2f "
               "\ncluster=%.2f/%.2f \nrough_eval=%.2f/%.2f "
               "\nrefine=%.2f/%.2f \nrefined_eval=%.2f/%.2f\n",
-              NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)),
-              NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(cluster_ns.load(std::memory_order_relaxed)),
-              NanosToMs(cluster_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)),
-              NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(refine_ns.load(std::memory_order_relaxed)),
-              NanosToMs(refine_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)),
-              NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)) /
-                  num_processed);
+              rough_opt_ms, rough_opt_ms / num_processed, cluster_ms,
+              cluster_ms / num_processed, rough_eval_ms,
+              rough_eval_ms / num_processed, refine_ms,
+              refine_ms / num_processed, refined_eval_ms,
+              refined_eval_ms / num_processed);
     }
     fflush(stderr);
-    const FixedPointCost best_pass_cost =
-        best_config_cost.load(std::memory_order_relaxed);
     if (best_pass_cost != std::numeric_limits<FixedPointCost>::max()) {
       fprintf(stderr,
               "PLANNER: Best cost for %u passes = %.2f bits\n",
@@ -2077,9 +2250,12 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
           : static_cast<uint32_t>(effort.optimize_passes_num);
   const uint32_t target_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
+  // Accumulates the best result across all pass configurations. Updated by
+  // deterministic reduction after each pass loop.
   BiclusterSearchResult best_result;
   best_result.total_cost = std::numeric_limits<FixedPointCost>::max();
-  std::mutex mu;
+  // Tiebreaker: lowest candidate index for deterministic results.
+  uint32_t overall_best_idx = std::numeric_limits<uint32_t>::max();
 
   for (uint32_t num_passes = min_num_passes; num_passes <= max_num_passes;
        ++num_passes) {
@@ -2087,8 +2263,6 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     fprintf(stderr, "PLANNER: [bicluster] Testing configuration with %u passes\n",
             num_passes);
     fflush(stderr);
-    std::atomic<FixedPointCost> best_config_cost(
-        std::numeric_limits<FixedPointCost>::max());
 
     AssignPassesResult assign_result =
         AssignPassesGreedy(d, active, num_passes, pool);
@@ -2111,6 +2285,7 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
             NanosToMs(ElapsedNanos(start_build_stream, end_build_stream)));
     fflush(stderr);
 
+    // Per-stage timing accumulators (relaxed atomics; join ensures visibility).
     std::atomic<int64_t> rough_opt_ns(0);
     std::atomic<int64_t> rough_row_cluster_ns(0);
     std::atomic<int64_t> rough_build_rows_ns(0);
@@ -2121,6 +2296,12 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     std::atomic<int64_t> refined_eval_ns(0);
     std::atomic<uint32_t> processed_candidates(0);
 
+    // Per-thread best result.
+    struct BiclusterThreadBest {
+      BiclusterSearchResult result;
+      uint32_t best_idx = std::numeric_limits<uint32_t>::max();
+    };
+    std::vector<BiclusterThreadBest> thread_best;
     std::vector<PartitioningCtx> ctx_pool;
     auto start_candidate_loop = PlannerClock::now();
     JXL_RETURN_IF_ERROR(RunOnPool(
@@ -2130,12 +2311,14 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
           for (size_t i = 0; i < num_threads; ++i) {
             ctx_pool.emplace_back(opt_data);
           }
+          thread_best.resize(num_threads);
           return true;
         },
         [&](uint32_t idx, size_t thread_id) -> Status {
           PartitioningCtx& ctx = ctx_pool[thread_id];
           const FactorizationCandidate& candidate = candidates[idx];
 
+          // Stage 1: rough threshold optimization.
           auto start_rough_opt = PlannerClock::now();
           FixedPointCost rough_unclustered_cost = 0;
           ThresholdSet rough_thresholds =
@@ -2146,6 +2329,9 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
           rough_opt_ns.fetch_add(ElapsedNanos(start_rough_opt, end_rough_opt),
                                  std::memory_order_relaxed);
 
+          // Shared helper: given a `ThresholdSet`, build row-slice histograms,
+          // cluster rows biclustered, and evaluate the full bicluster model.
+          // Outputs the cluster result and per-pass prototype counts.
           std::vector<uint32_t> rough_num_prototypes;
           ClusterResult rough_cluster_result;
           auto evaluate_thresholds =
@@ -2211,6 +2397,7 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
                                                    &refined_num_prototypes));
           processed_candidates.fetch_add(1, std::memory_order_relaxed);
 
+          // Pick whichever of rough/refined scored better.
           const bool refined_is_better =
               refined_eval.total_cost() < rough_eval.total_cost();
           const ThresholdSet& best_thresholds =
@@ -2221,40 +2408,52 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
               refined_is_better ? refined_cluster_result : rough_cluster_result;
           const std::vector<uint32_t>& best_num_prototypes =
               refined_is_better ? refined_num_prototypes : rough_num_prototypes;
-          FixedPointCost prev_config_best =
-              best_config_cost.load(std::memory_order_relaxed);
-          while (best_eval.total_cost() < prev_config_best &&
-                 !best_config_cost.compare_exchange_weak(
-                     prev_config_best, best_eval.total_cost(),
-                     std::memory_order_relaxed)) {
-          }
-
-          std::lock_guard<std::mutex> lock(mu);
-          if (best_eval.total_cost() < best_result.total_cost) {
-            best_result.thresholds = best_thresholds;
-            best_result.ctx_map = best_cluster_result.ctx_map;
-            best_result.pass_assignment = pass_assignment;
-            best_result.num_passes = num_passes;
-            best_result.num_cells =
-                static_cast<uint32_t>(best_cluster_result.ctx_map.size() /
-                                      d.channels);
-            best_result.num_row_clusters = best_cluster_result.num_clusters;
-            best_result.num_prototypes_per_pass = best_num_prototypes;
-            best_result.total_num_prototypes = 0;
+          // Per-thread best; no lock needed. Tiebreaker: lowest candidate
+          // index for deterministic results independent of thread count.
+          auto& local = thread_best[thread_id];
+          if (best_eval.total_cost() < local.result.total_cost ||
+              (best_eval.total_cost() == local.result.total_cost &&
+               idx < local.best_idx)) {
+            local.result.thresholds = best_thresholds;
+            local.result.ctx_map = best_cluster_result.ctx_map;
+            local.result.pass_assignment = pass_assignment;
+            local.result.num_passes = num_passes;
+            local.result.num_cells = static_cast<uint32_t>(
+                best_cluster_result.ctx_map.size() / d.channels);
+            local.result.num_row_clusters = best_cluster_result.num_clusters;
+            local.result.num_prototypes_per_pass = best_num_prototypes;
+            local.result.total_num_prototypes = 0;
             for (uint32_t n : best_num_prototypes) {
-              best_result.total_num_prototypes += n;
+              local.result.total_num_prototypes += n;
             }
-            best_result.ac_cost =
-                best_eval.corrected_entropy_cost >= 0
-                    ? best_eval.corrected_entropy_cost
-                    : best_eval.ac_cost;
-            best_result.nz_cost = best_eval.nz_cost;
-            best_result.signalling_overhead = best_eval.signalling_overhead;
-            best_result.total_cost = best_eval.total_cost();
+            // Prefer the ANS-clustering-corrected cost when available
+            // (non-negative); fall back to the raw AC entropy cost.
+            local.result.ac_cost = best_eval.corrected_entropy_cost >= 0
+                                       ? best_eval.corrected_entropy_cost
+                                       : best_eval.ac_cost;
+            local.result.nz_cost = best_eval.nz_cost;
+            local.result.signalling_overhead = best_eval.signalling_overhead;
+            local.result.total_cost = best_eval.total_cost();
+            local.best_idx = idx;
           }
           return true;
         },
         "JpegCtxBicluster"));
+    // Deterministic reduction: pick best across all threads.
+    // Tiebreaker: lowest candidate index.
+    FixedPointCost best_pass_cost = std::numeric_limits<FixedPointCost>::max();
+    for (auto& tb : thread_best) {
+      if (tb.result.total_cost < best_pass_cost) {
+        best_pass_cost = tb.result.total_cost;
+      }
+      if (tb.result.total_cost < best_result.total_cost ||
+          (tb.result.total_cost == best_result.total_cost &&
+           tb.best_idx < overall_best_idx)) {
+        best_result = std::move(tb.result);
+        overall_best_idx = tb.best_idx;
+      }
+    }
+
     auto end_candidate_loop = PlannerClock::now();
     const uint32_t num_processed =
         processed_candidates.load(std::memory_order_relaxed);
@@ -2263,6 +2462,24 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
             NanosToMs(ElapsedNanos(start_candidate_loop, end_candidate_loop)),
             num_processed);
     if (num_processed != 0) {
+      // relaxed is safe here: `RunOnPool` join establishes happens-before, so
+      // all `fetch_add` writes from worker threads are visible.
+      const double rough_opt_ms =
+          NanosToMs(rough_opt_ns.load(std::memory_order_relaxed));
+      const double rough_row_cluster_ms =
+          NanosToMs(rough_row_cluster_ns.load(std::memory_order_relaxed));
+      const double rough_build_rows_ms =
+          NanosToMs(rough_build_rows_ns.load(std::memory_order_relaxed));
+      const double rough_eval_ms =
+          NanosToMs(rough_eval_ns.load(std::memory_order_relaxed));
+      const double refine_ms =
+          NanosToMs(refine_ns.load(std::memory_order_relaxed));
+      const double refined_row_cluster_ms =
+          NanosToMs(refined_row_cluster_ns.load(std::memory_order_relaxed));
+      const double refined_build_rows_ms =
+          NanosToMs(refined_build_rows_ns.load(std::memory_order_relaxed));
+      const double refined_eval_ms =
+          NanosToMs(refined_eval_ns.load(std::memory_order_relaxed));
       fprintf(stderr,
               "PLANNER: [bicluster] Candidate stages (sum/avg ms): "
               "rough_opt=%.2f/%.2f rough_row_cluster=%.2f/%.2f "
@@ -2270,34 +2487,16 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
               "refine=%.2f/%.2f refined_row_cluster=%.2f/%.2f "
               "refined_build_rows=%.2f/%.2f "
               "refined_eval=%.2f/%.2f\n",
-              NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)),
-              NanosToMs(rough_opt_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(rough_row_cluster_ns.load(std::memory_order_relaxed)),
-              NanosToMs(rough_row_cluster_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(rough_build_rows_ns.load(std::memory_order_relaxed)),
-              NanosToMs(rough_build_rows_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)),
-              NanosToMs(rough_eval_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(refine_ns.load(std::memory_order_relaxed)),
-              NanosToMs(refine_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(refined_row_cluster_ns.load(std::memory_order_relaxed)),
-              NanosToMs(refined_row_cluster_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(refined_build_rows_ns.load(std::memory_order_relaxed)),
-              NanosToMs(refined_build_rows_ns.load(std::memory_order_relaxed)) /
-                  num_processed,
-              NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)),
-              NanosToMs(refined_eval_ns.load(std::memory_order_relaxed)) /
-                  num_processed);
+              rough_opt_ms, rough_opt_ms / num_processed, rough_row_cluster_ms,
+              rough_row_cluster_ms / num_processed, rough_build_rows_ms,
+              rough_build_rows_ms / num_processed, rough_eval_ms,
+              rough_eval_ms / num_processed, refine_ms,
+              refine_ms / num_processed, refined_row_cluster_ms,
+              refined_row_cluster_ms / num_processed, refined_build_rows_ms,
+              refined_build_rows_ms / num_processed, refined_eval_ms,
+              refined_eval_ms / num_processed);
     }
     fflush(stderr);
-    const FixedPointCost best_pass_cost =
-        best_config_cost.load(std::memory_order_relaxed);
     if (best_pass_cost != std::numeric_limits<FixedPointCost>::max()) {
       fprintf(stderr,
               "PLANNER: [bicluster] Best cost for %u passes = %.2f bits\n",
