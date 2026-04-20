@@ -26,7 +26,7 @@ struct PassSearchResult {
   FixedPointCost ac_cost = 0;
   FixedPointCost nz_cost = 0;
   FixedPointCost signalling_overhead = 0;
-  FixedPointCost total_cost = 0;
+  FixedPointCost total_cost = std::numeric_limits<FixedPointCost>::max();
 };
 
 struct BiclusterSearchResult {
@@ -41,7 +41,7 @@ struct BiclusterSearchResult {
   FixedPointCost ac_cost = 0;
   FixedPointCost nz_cost = 0;
   FixedPointCost signalling_overhead = 0;
-  FixedPointCost total_cost = 0;
+  FixedPointCost total_cost = std::numeric_limits<FixedPointCost>::max();
 };
 
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
