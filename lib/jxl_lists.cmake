@@ -413,6 +413,8 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/transcode_jpeg/enc_jpeg_histogram.h
   jxl/transcode_jpeg/enc_jpeg_opt_data.cc
   jxl/transcode_jpeg/enc_jpeg_opt_data.h
+  jxl/transcode_jpeg/enc_jpeg_pass_assign.cc
+  jxl/transcode_jpeg/enc_jpeg_pass_assign.h
   jxl/transcode_jpeg/enc_jpeg_passes.cc
   jxl/transcode_jpeg/enc_jpeg_passes.h
   jxl/transcode_jpeg/enc_jpeg_refine.cc
