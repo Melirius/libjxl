@@ -1262,6 +1262,19 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
   const uint32_t target_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
 
+  std::unique_ptr<AssignPassesRangeResult> assign_range_result;
+  if (max_passes > min_passes) {
+    assign_range_result = jxl::make_unique<AssignPassesRangeResult>(
+        AssignPassesGreedyAllK(d, active, min_passes, max_passes, pool));
+    fprintf(stderr,
+            "PLANNER: AssignPassesGreedyAllK took %.2f ms total "
+            "(batch %.2f ms, sequential %.2f ms)\n",
+            NanosToMs(assign_range_result->shared_timings.total_ns),
+            NanosToMs(assign_range_result->shared_timings.batch_ns),
+            NanosToMs(assign_range_result->shared_timings.sequential_ns));
+    fflush(stderr);
+  }
+
   // Accumulates the best result across all pass configurations. Updated by
   // deterministic reduction after each pass loop.
   PassSearchResult best_result;
@@ -1275,16 +1288,23 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
     auto start_pass_config = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "PLANNER: Testing configuration with %u passes\n", num_passes);
     fflush(stderr);
-    AssignPassesResult assign_result =
-        AssignPassesGreedy(d, active, num_passes, pool);
-    PassAssignment& pass_assignment = assign_result.pass_assignment;
-    fprintf(stderr,
-            "PLANNER: AssignPassesGreedy took %.2f ms total "
-            "(batch %.2f ms, sequential %.2f ms)\n",
-            NanosToMs(assign_result.timings.total_ns),
-            NanosToMs(assign_result.timings.batch_ns),
-            NanosToMs(assign_result.timings.sequential_ns));
-    fflush(stderr);
+    AssignPassesResult assign_result_storage;
+    const AssignPassesResult* assign_result = nullptr;
+    if (assign_range_result != nullptr) {
+      assign_result =
+          &assign_range_result->results[num_passes - min_passes];
+    } else {
+      assign_result_storage = AssignPassesGreedy(d, active, num_passes, pool);
+      assign_result = &assign_result_storage;
+      fprintf(stderr,
+              "PLANNER: AssignPassesGreedy took %.2f ms total "
+              "(batch %.2f ms, sequential %.2f ms)\n",
+              NanosToMs(assign_result->timings.total_ns),
+              NanosToMs(assign_result->timings.batch_ns),
+              NanosToMs(assign_result->timings.sequential_ns));
+      fflush(stderr);
+    }
+    const PassAssignment& pass_assignment = assign_result->pass_assignment;
 
     auto start_build_stream = PlannerClock::now();
     std::vector<uint32_t> pass_offsets;
@@ -1518,6 +1538,20 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
           : static_cast<uint32_t>(effort.optimize_passes_num);
   const uint32_t target_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
+
+  std::unique_ptr<AssignPassesRangeResult> assign_range_result;
+  if (max_num_passes > min_num_passes) {
+    assign_range_result = jxl::make_unique<AssignPassesRangeResult>(
+        AssignPassesGreedyAllK(d, active, min_num_passes, max_num_passes,
+                               pool));
+    fprintf(stderr,
+            "PLANNER: [bicluster] AssignPassesGreedyAllK took %.2f ms total "
+            "(batch %.2f ms, sequential %.2f ms)\n",
+            NanosToMs(assign_range_result->shared_timings.total_ns),
+            NanosToMs(assign_range_result->shared_timings.batch_ns),
+            NanosToMs(assign_range_result->shared_timings.sequential_ns));
+    fflush(stderr);
+  }
   // Accumulates the best result across all pass configurations. Updated by
   // deterministic reduction after each pass loop.
   BiclusterSearchResult best_result;
@@ -1532,16 +1566,23 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
             num_passes);
     fflush(stderr);
 
-    AssignPassesResult assign_result =
-        AssignPassesGreedy(d, active, num_passes, pool);
-    PassAssignment& pass_assignment = assign_result.pass_assignment;
-    fprintf(stderr,
-            "PLANNER: [bicluster] AssignPassesGreedy took %.2f ms total "
-            "(batch %.2f ms, sequential %.2f ms)\n",
-            NanosToMs(assign_result.timings.total_ns),
-            NanosToMs(assign_result.timings.batch_ns),
-            NanosToMs(assign_result.timings.sequential_ns));
-    fflush(stderr);
+    AssignPassesResult assign_result_storage;
+    const AssignPassesResult* assign_result = nullptr;
+    if (assign_range_result != nullptr) {
+      assign_result =
+          &assign_range_result->results[num_passes - min_num_passes];
+    } else {
+      assign_result_storage = AssignPassesGreedy(d, active, num_passes, pool);
+      assign_result = &assign_result_storage;
+      fprintf(stderr,
+              "PLANNER: [bicluster] AssignPassesGreedy took %.2f ms total "
+              "(batch %.2f ms, sequential %.2f ms)\n",
+              NanosToMs(assign_result->timings.total_ns),
+              NanosToMs(assign_result->timings.batch_ns),
+              NanosToMs(assign_result->timings.sequential_ns));
+      fflush(stderr);
+    }
+    const PassAssignment& pass_assignment = assign_result->pass_assignment;
 
     auto start_build_stream = PlannerClock::now();
     std::vector<uint32_t> pass_offsets;

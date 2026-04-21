@@ -7,8 +7,8 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <queue>
 #include <utility>

@@ -59,6 +59,14 @@ struct AssignPassesResult {
   PassAssignmentTimings timings;
 };
 
+// Range result for fused multi-K pass assignment. `results[i]` corresponds to
+// `min_num_passes + i`.
+struct AssignPassesRangeResult {
+  uint32_t min_num_passes = 1;
+  std::vector<AssignPassesResult> results;
+  PassAssignmentTimings shared_timings;
+};
+
 // Lightweight (channel, block-index) pair used as the unit of the greedy
 // pass-assignment solver. `c` is a channel index (0..2), `b` is the block
 // index within that channel's raster order.
@@ -184,6 +192,14 @@ class PassAssignmentCtx {
 AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
                                       const ActiveRawBins& active,
                                       uint32_t num_passes, ThreadPool* pool);
+
+// Fused greedy block-to-pass assignment for a whole pass-count range.
+// Runs the current "1 seq warm-up, 5 unconditional batch, batch with rare
+// sequential rescues, then sequential with rare batch rescues" schedule across
+// all `K = [min_num_passes, max_num_passes]` in one shared block traversal.
+AssignPassesRangeResult AssignPassesGreedyAllK(
+    const JPEGOptData& d, const ActiveRawBins& active,
+    uint32_t min_num_passes, uint32_t max_num_passes, ThreadPool* pool);
 
 }  // namespace jxl
 
