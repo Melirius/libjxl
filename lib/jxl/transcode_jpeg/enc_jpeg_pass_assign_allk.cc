@@ -138,7 +138,7 @@ double CostDropPercent(FixedPointCost old_cost, FixedPointCost new_cost) {
 
 void PrintMoveTableHeader(const std::vector<MultiKState>& states,
                           int column_width) {
-  fprintf(stderr, "PLANNER: [all-k] %-12s", "step");
+  fprintf(stderr, "PLANNER: [all-k] %-12s", "step/passes");
   for (const auto& state : states) {
     fprintf(stderr, " %*u", column_width, state.num_passes);
   }
