@@ -80,10 +80,30 @@ PassAssignmentCtx::PassAssignmentCtx(const JPEGOptData& d,
       nz_hist_h(static_cast<size_t>(kNZHistogramsSize) * num_passes, 0),
       nz_hist_N(static_cast<size_t>(kJPEGNonZeroBuckets) * num_passes, 0) {
   for (uint32_t c = 0; c < kNumCh; ++c)
-    pass_assignment[c].assign(d.num_blocks[c], 0);
+    pass_assignment[c].assign(d.num_blocks[c], /*0*/ c);
+}
+
+void PassAssignmentCtx::InitPassAssignmentSimple() {
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+      const uint32_t pass = b * num_passes / d.num_blocks[c];  // c;//
+      pass_assignment[c][b] = static_cast<uint8_t>(pass);
+      ForEachBlockBin(d, c, b, [&](ACBin bin) {
+        const uint32_t compact_id = active.raw_to_compact[bin];
+        const uint32_t czdc = active.compact_to_czdc[compact_id];
+        ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
+        ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
+      });
+    }
+  }
 }
 
 void PassAssignmentCtx::InitPassAssignmentHistogramAware() {
+  struct GrowthScratch {
+    std::vector<uint16_t> touched_czdc;
+    std::vector<uint32_t> czdc_counts;
+  };
+
   for (uint32_t c = 0; c < d.channels; ++c) {
     if (d.num_blocks[c] == 0) continue;
 
@@ -93,23 +113,29 @@ void PassAssignmentCtx::InitPassAssignmentHistogramAware() {
         std::min<uint32_t>(num_passes, d.num_blocks[c]);
     std::vector<uint8_t> assigned(d.num_blocks[c], 0);
     std::vector<uint32_t> pass_sizes(num_passes, 0);
+    std::vector<GrowthScratch> growth_scratch(num_passes);
+    for (uint32_t pass = 0; pass < num_passes; ++pass) {
+      growth_scratch[pass].touched_czdc.reserve(64);
+      growth_scratch[pass].czdc_counts.assign(czdc_size, 0);
+    }
 
-    auto growth_cost = [&](uint32_t b, uint32_t pass) -> FixedPointCost {
+    auto growth_cost = [&](uint32_t b, uint32_t pass,
+                           GrowthScratch* scratch) -> FixedPointCost {
       FixedPointCost cost = 0;
-      std::vector<uint16_t> touched_czdc;
-      std::vector<uint32_t> czdc_counts(czdc_size, 0);
-      touched_czdc.reserve(64);
+      scratch->touched_czdc.clear();
       ForEachBlockBin(d, c, b, [&](ACBin bin) {
         const uint32_t compact_id = active.raw_to_compact[bin];
         const uint32_t czdc = active.compact_to_czdc[compact_id];
         const uint32_t h_count =
             hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
         cost += d.ftab[h_count + 1] - d.ftab[h_count];
-        if (czdc_counts[czdc]++ == 0)
-          touched_czdc.push_back(static_cast<uint16_t>(czdc));
+        if (scratch->czdc_counts[czdc]++ == 0) {
+          scratch->touched_czdc.push_back(static_cast<uint16_t>(czdc));
+        }
       });
-      for (uint16_t czdc : touched_czdc) {
-        const uint32_t count = czdc_counts[czdc];
+      for (uint16_t czdc : scratch->touched_czdc) {
+        const uint32_t count = scratch->czdc_counts[czdc];
+        scratch->czdc_counts[czdc] = 0;
         const uint32_t n_count =
             hist_N[static_cast<size_t>(czdc) * num_passes + pass];
         cost += d.ftab[n_count + count] - d.ftab[n_count];
@@ -124,9 +150,10 @@ void PassAssignmentCtx::InitPassAssignmentHistogramAware() {
     if (kLinearScan) {
       for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
         uint32_t best_pass = 0;
-        FixedPointCost best_cost = growth_cost(b, 0);
+        FixedPointCost best_cost = growth_cost(b, 0, &growth_scratch[0]);
         for (uint32_t pass = 1; pass < num_passes; ++pass) {
-          const FixedPointCost cost = growth_cost(b, pass);
+          const FixedPointCost cost =
+              growth_cost(b, pass, &growth_scratch[pass]);
           if (cost < best_cost) {
             best_cost = cost;
             best_pass = pass;
@@ -162,8 +189,10 @@ void PassAssignmentCtx::InitPassAssignmentHistogramAware() {
         const uint32_t y = b / w;
         auto push_neighbor = [&](uint32_t nx, uint32_t ny) {
           const uint32_t nb = ny * w + nx;
-          if (!assigned[nb])
-            frontier[pass].emplace(growth_cost(nb, pass), nb);
+          if (!assigned[nb]) {
+            frontier[pass].emplace(growth_cost(nb, pass, &growth_scratch[pass]),
+                                   nb);
+          }
         };
         if (x > 0) push_neighbor(x - 1, y);
         if (x + 1 < w) push_neighbor(x + 1, y);
@@ -193,14 +222,31 @@ void PassAssignmentCtx::InitPassAssignmentHistogramAware() {
         ++assigned_count;
       }
 
+      auto refresh_frontier_top = [&](uint32_t pass) {
+        while (!frontier[pass].empty()) {
+          const uint32_t block = frontier[pass].top().second;
+          const FixedPointCost stored_cost = frontier[pass].top().first;
+          if (assigned[block]) {
+            frontier[pass].pop();
+            continue;
+          }
+          const FixedPointCost refreshed_cost =
+              growth_cost(block, pass, &growth_scratch[pass]);
+          if (refreshed_cost != stored_cost) {
+            frontier[pass].pop();
+            frontier[pass].emplace(refreshed_cost, block);
+            continue;
+          }
+          break;
+        }
+      };
+
       while (assigned_count < d.num_blocks[c]) {
         uint32_t best_pass = 0;
         for (uint32_t p = 1; p < seeded_passes; ++p)
           if (pass_sizes[p] < pass_sizes[best_pass]) best_pass = p;
 
-        while (!frontier[best_pass].empty() &&
-               assigned[frontier[best_pass].top().second])
-          frontier[best_pass].pop();
+        refresh_frontier_top(best_pass);
 
         if (!frontier[best_pass].empty()) {
           const uint32_t best_block = frontier[best_pass].top().second;
@@ -230,21 +276,6 @@ void PassAssignmentCtx::InitNZPredictorState() {
       ++nz_hist_N[static_cast<size_t>(pass) * kJPEGNonZeroBuckets + pb];
       ++nz_hist_h[static_cast<size_t>(pass) * kNZHistogramsSize +
                   NZHistogramIndex(pb, d.block_nonzeros[c][b])];
-    }
-  }
-}
-
-void PassAssignmentCtx::InitPassAssignmentSimple() {
-  for (uint32_t c = 0; c < d.channels; ++c) {
-    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
-      const uint32_t pass = b * num_passes / d.num_blocks[c];
-      pass_assignment[c][b] = static_cast<uint8_t>(pass);
-      ForEachBlockBin(d, c, b, [&](ACBin bin) {
-        const uint32_t compact_id = active.raw_to_compact[bin];
-        const uint32_t czdc = active.compact_to_czdc[compact_id];
-        ++hist_h[static_cast<size_t>(compact_id) * num_passes + pass];
-        ++hist_N[static_cast<size_t>(czdc) * num_passes + pass];
-      });
     }
   }
 }
@@ -686,7 +717,7 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
   }
 
   PassAssignmentCtx ctx(d, active, num_passes);
-  if (active_blocks.empty()) {
+  if (active_blocks.empty() /* || num_passes == 3*/) {
     result.pass_assignment = std::move(ctx.pass_assignment);
     result.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
     return result;
@@ -695,7 +726,8 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
   const uint32_t min_moves = std::max<uint32_t>(1, active_blocks.size() >> 13);
 
   const auto start_init = PlannerClock::now();
-  ctx.InitPassAssignmentHistogramAware();
+  // ctx.InitPassAssignmentHistogramAware();
+  ctx.InitPassAssignmentSimple();
   ctx.InitNZPredictorState();
   fprintf(stderr, "PLANNER: [bicluster] Initializing clusters took %.2f ms\n",
           NanosToMs(ElapsedNanos(start_init, PlannerClock::now())));

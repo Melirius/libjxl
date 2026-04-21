@@ -1422,9 +1422,7 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
     // for diagnostic printing below.
     FixedPointCost best_pass_cost = std::numeric_limits<FixedPointCost>::max();
     for (auto& tb : thread_best) {
-      if (tb.result.total_cost < best_pass_cost) {
-        best_pass_cost = tb.result.total_cost;
-      }
+      best_pass_cost = std::min(tb.result.total_cost, best_pass_cost);
       if (tb.result.total_cost < best_result.total_cost ||
           (tb.result.total_cost == best_result.total_cost &&
            tb.best_idx < overall_best_idx)) {
@@ -1713,9 +1711,7 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     // Tiebreaker: lowest candidate index.
     FixedPointCost best_pass_cost = std::numeric_limits<FixedPointCost>::max();
     for (auto& tb : thread_best) {
-      if (tb.result.total_cost < best_pass_cost) {
-        best_pass_cost = tb.result.total_cost;
-      }
+      best_pass_cost = std::min(tb.result.total_cost, best_pass_cost);
       if (tb.result.total_cost < best_result.total_cost ||
           (tb.result.total_cost == best_result.total_cost &&
            tb.best_idx < overall_best_idx)) {

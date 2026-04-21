@@ -307,15 +307,27 @@ Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
 namespace {
 
 // Same algorithm as the CfL search in `ComputeJPEGTranscodingData`
+// Returns a pointer to the start of row `y` of 8x8-block coefficients for
+// component `c` in `jpeg_data`, using the component mapping `jpeg_c_map`.
+// Non-capturing (callable from RunOnPool without nested-lambda issues).
+static inline const int16_t* JpegCoeffRow(const jpeg::JPEGData& jpeg_data,
+                                          const std::array<int, 3>& jpeg_c_map,
+                                          size_t c, size_t y) {
+  return jpeg_data.components[jpeg_c_map[c]].coeffs.data() +
+         jpeg_data.components[jpeg_c_map[c]].width_in_blocks * kDCTBlockSize *
+             y;
+}
+
 // (`enc_frame.cc`) but self-contained: computes CfL maps and scaled
 // `qtables` from the JPEG data alone so the planner can run before
 // the main transcoding function.
 Status ComputeCflForPlanner(const jpeg::JPEGData& jpeg_data,
                             const std::array<int, 3>& jpeg_c_map,
                             size_t xsize_blocks, size_t ysize_blocks,
-                            JxlMemoryManager* memory_manager,
-                            ImageSB& ytox_map, ImageSB& ytob_map,
-                            int32_t scaled_qtable_out[3][kDCTBlockSize]) {
+                            JxlMemoryManager* memory_manager, ImageSB& ytox_map,
+                            ImageSB& ytob_map,
+                            int32_t scaled_qtable_out[3][kDCTBlockSize],
+                            ThreadPool* pool) {
   // Compute quant tables (not transposed, for CfL ratio computation).
   std::vector<int> qt(kDCTBlockSize * 3);
   for (size_t c = 0; c < 3; c++) {
@@ -348,12 +360,6 @@ Status ComputeCflForPlanner(const jpeg::JPEGData& jpeg_data,
   JXL_ASSIGN_OR_RETURN(ytob_map, ImageSB::Create(memory_manager,
                                                   num_tiles_x, num_tiles_y));
 
-  auto jpeg_row = [&](size_t c, size_t y) -> const int16_t* {
-    return jpeg_data.components[jpeg_c_map[c]].coeffs.data() +
-           jpeg_data.components[jpeg_c_map[c]].width_in_blocks *
-               kDCTBlockSize * y;
-  };
-
   // Use default `ColorCorrelation` base values (JPEG-compatible defaults).
   const float kScale = kDefaultColorFactor;
   const int kOffset = 127;
@@ -361,15 +367,28 @@ Status ComputeCflForPlanner(const jpeg::JPEGData& jpeg_data,
   const float kBaseX = base_cc.YtoXRatio(0);
   const float kBaseB = base_cc.YtoBRatio(0);
 
-  for (size_t c : {0, 2}) {
-    ImageSB& map = (c == 0 ? ytox_map : ytob_map);
-    const float kBase = (c == 0) ? kBaseX : kBaseB;
-    const float kZeroThresh =
-        kScale * kZeroBiasDefault[c] * 0.9999f;
+  // Flatten (c_idx, ty, tx) into a single index for parallel execution.
+  // c_idx 0 → c=0 (Cb), c_idx 1 → c=2 (Cr).  Each task writes to a
+  // unique (map, ty, tx) position, so no synchronisation is needed.
+  const uint32_t tiles_per_color =
+      static_cast<uint32_t>(num_tiles_y * num_tiles_x);
+  const uint32_t total_tasks = 2 * tiles_per_color;
 
-    for (size_t ty = 0; ty < num_tiles_y; ++ty) {
-      int8_t* JXL_RESTRICT row_out = map.Row(ty);
-      for (size_t tx = 0; tx < num_tiles_x; ++tx) {
+  JXL_RETURN_IF_ERROR(RunOnPool(
+      pool, 0, total_tasks, ThreadPool::NoInit,
+      [&](uint32_t idx, size_t /*thread_id*/) -> Status {
+        const uint32_t c_idx = idx / tiles_per_color;
+        const uint32_t remainder = idx % tiles_per_color;
+        const size_t c = (c_idx == 0) ? 0 : 2;
+        const size_t ty = remainder / num_tiles_x;
+        const size_t tx = remainder % num_tiles_x;
+
+        ImageSB& map = (c == 0) ? ytox_map : ytob_map;
+        const float kBase = (c == 0) ? kBaseX : kBaseB;
+        const float kZeroThresh = kScale * kZeroBiasDefault[c] * 0.9999f;
+
+        int8_t* JXL_RESTRICT row_out = map.Row(ty);
+
         const size_t y0 = ty * kColorTileDimInBlocks;
         const size_t x0 = tx * kColorTileDimInBlocks;
         const size_t y1 = std::min(ysize_blocks,
@@ -378,37 +397,38 @@ Status ComputeCflForPlanner(const jpeg::JPEGData& jpeg_data,
                                    (tx + 1) * kColorTileDimInBlocks);
         int32_t d_num_zeros[257] = {0};
         for (size_t y = y0; y < y1; ++y) {
-          const int16_t* JXL_RESTRICT row_m = jpeg_row(1, y);
-          const int16_t* JXL_RESTRICT row_s = jpeg_row(c, y);
+          const int16_t* JXL_RESTRICT row_m =
+              JpegCoeffRow(jpeg_data, jpeg_c_map, 1, y);
+          const int16_t* JXL_RESTRICT row_s =
+              JpegCoeffRow(jpeg_data, jpeg_c_map, c, y);
           for (size_t x = x0; x < x1; ++x) {
             for (size_t coeffpos = 1; coeffpos < kDCTBlockSize; coeffpos++) {
               const float scaled_m =
                   row_m[x * kDCTBlockSize + coeffpos] *
                   scaled_qtable_out[c][coeffpos] *
                   (1.0f / (1 << kCFLFixedPointPrecision));
-              const float scaled_s =
-                  kScale * row_s[x * kDCTBlockSize + coeffpos] +
-                  (kOffset - kBase * kScale) * scaled_m;
-              if (std::abs(scaled_m) > 1e-8f) {
-                float from, to;
-                if (scaled_m > 0) {
-                  from = (scaled_s - kZeroThresh) / scaled_m;
-                  to = (scaled_s + kZeroThresh) / scaled_m;
-                } else {
-                  from = (scaled_s + kZeroThresh) / scaled_m;
-                  to = (scaled_s - kZeroThresh) / scaled_m;
-                }
-                if (from < 0.0f) from = 0.0f;
-                if (to > 255.0f) to = 255.0f;
-                if (from <= to) {
-                  d_num_zeros[static_cast<int>(std::ceil(from))]++;
-                  d_num_zeros[static_cast<int>(std::floor(to + 1))]--;
+              if (scaled_m != 0.0f) {
+                const float scaled_s =
+                    kScale * row_s[x * kDCTBlockSize + coeffpos] +
+                    (kOffset - kBase * kScale) * scaled_m;
+                float edge1 = (scaled_s - kZeroThresh) / scaled_m;
+                float edge2 = (scaled_s + kZeroThresh) / scaled_m;
+                float from = std::max(std::min(edge1, edge2), 0.0f);
+                float to = std::min(std::max(edge1, edge2), 255.0f);
+                int start = static_cast<int>(std::ceil(from));
+                int stop = static_cast<int>(std::floor(to + 1));
+                // Can skip if both edges are outside of [0, 255]
+                // on the same side or come to the same integer value.
+                if (start < stop) {
+                  ++d_num_zeros[start];
+                  --d_num_zeros[stop];
                 }
               }
             }
           }
         }
         // Find best CfL factor via prefix-sum maximum.
+        // TODO: use middle of maximum region instead of first maximum
         int best = 0;
         int32_t best_sum = 0;
         int32_t val = 0;
@@ -427,9 +447,9 @@ Status ComputeCflForPlanner(const jpeg::JPEGData& jpeg_data,
         if (best_sum > offset_sum + 1) {
           row_out[tx] = best - kOffset;
         }
-      }
-    }
-  }
+        return true;
+      },
+      "ComputeCfl"));
   return true;
 }
 
@@ -482,7 +502,7 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
     size_t ysize_blocks = jpeg_data.components[jpeg_c_map[0]].height_in_blocks;
     JXL_RETURN_IF_ERROR(ComputeCflForPlanner(
         jpeg_data, jpeg_c_map, xsize_blocks, ysize_blocks, memory_manager,
-        ytox_map, ytob_map, scaled_qtable));
+        ytox_map, ytob_map, scaled_qtable, pool));
     planner_cfl.cfl_map[0] = &ytox_map;
     planner_cfl.cfl_map[1] = &ytob_map;
     planner_cfl.scaled_qtable[0] = scaled_qtable[0];
