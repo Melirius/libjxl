@@ -6,6 +6,7 @@
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_assign.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -322,7 +323,8 @@ uint32_t PassAssignmentCtx::PredictNZBucket(uint16_t c, uint32_t b,
 
 uint32_t PassAssignmentCtx::FindBestPass(const BlockRef& ref,
                                          uint32_t cur_pass,
-                                         AssignScratch* scratch) const {
+                                         AssignScratch* scratch,
+                                         FixedPointCost* best_delta_out) const {
   std::fill(scratch->delta.begin(), scratch->delta.end(), 0);
   scratch->touched_czdc.clear();
 
@@ -425,6 +427,7 @@ uint32_t PassAssignmentCtx::FindBestPass(const BlockRef& ref,
       best_pass = p;
     }
   }
+  if (best_delta_out != nullptr) *best_delta_out = best_delta;
   return best_pass;
 }
 
@@ -507,17 +510,19 @@ FixedPointCost PassAssignmentCtx::TotalCost() const {
   return cost;
 }
 
-uint32_t PassAssignmentCtx::SequentialIter(
+SequentialSweepResult PassAssignmentCtx::SequentialIter(
     const std::vector<BlockRef>& active_blocks, AssignScratch& scratch) {
-  uint32_t moves = 0;
+  SequentialSweepResult result;
   for (const BlockRef& ref : active_blocks) {
     const uint32_t cur = pass_assignment[ref.c][ref.b];
-    const uint32_t best = FindBestPass(ref, cur, &scratch);
+    FixedPointCost best_delta = 0;
+    const uint32_t best = FindBestPass(ref, cur, &scratch, &best_delta);
     if (best == cur) continue;
     ApplyMove(ref, cur, best);
-    ++moves;
+    ++result.moves;
+    result.delta_cost += best_delta;
   }
-  return moves;
+  return result;
 }
 
 uint32_t PassAssignmentCtx::ScoreBatchMoves(
@@ -627,7 +632,7 @@ int64_t PassAssignmentCtx::RunBatchPassRefinement(
     }
 
     AssignScratch scratch = MakeScratch();
-    seq_moves = SequentialIter(active_blocks, scratch);
+    seq_moves = SequentialIter(active_blocks, scratch).moves;
     ++iter;
     fprintf(
         stderr,
@@ -665,7 +670,7 @@ int64_t PassAssignmentCtx::RunSequentialPassRefinement(
   uint32_t seq_moves = min_moves + 1;
 
   while (iter < kMaxIters && seq_moves > min_moves) {
-    seq_moves = SequentialIter(active_blocks, scratch);
+    seq_moves = SequentialIter(active_blocks, scratch).moves;
     ++iter;
     fprintf(stderr,
             "PLANNER: [bicluster] Sequential global phase %u took %.2f ms for "
@@ -735,7 +740,7 @@ AssignPassesResult AssignPassesGreedy(const JPEGOptData& d,
 
   AssignScratch scratch = ctx.MakeScratch();
   uint32_t iter = 0;
-  uint32_t seq_moves = ctx.SequentialIter(active_blocks, scratch);
+  uint32_t seq_moves = ctx.SequentialIter(active_blocks, scratch).moves;
   fprintf(stderr,
           "PLANNER: [bicluster] Initial phase 1 took %.2f ms for %u moves\n",
           NanosToMs(ElapsedNanos(start_init, PlannerClock::now())), seq_moves);

@@ -49,8 +49,7 @@ struct MultiKState {
   std::vector<uint8_t> new_passes;
   uint32_t min_moves;
   uint32_t seq_moves;
-  uint32_t best_batch_moves;
-  uint32_t best_seq_moves;
+  FixedPointCost current_cost;
   bool finished;
 
   MultiKState(const JPEGOptData& d, const ActiveRawBins& active,
@@ -63,8 +62,7 @@ struct MultiKState {
             1, static_cast<uint32_t>(
                    std::max<size_t>(size_t{1}, num_active_blocks >> 13)))),
         seq_moves(std::numeric_limits<uint32_t>::max()),
-        best_batch_moves(std::numeric_limits<uint32_t>::max()),
-        best_seq_moves(std::numeric_limits<uint32_t>::max()),
+        current_cost(0),
         finished(false) {}
 };
 
@@ -75,48 +73,53 @@ bool AnyActiveK(const std::vector<MultiKState>& states) {
   return false;
 }
 
-bool ImprovedWell(uint32_t moves, uint32_t best_moves, uint32_t min_moves) {
-  if (best_moves == std::numeric_limits<uint32_t>::max()) return true;
-  if (moves >= best_moves) return false;
-  const uint32_t threshold = std::max<uint32_t>(best_moves >> 4, min_moves);
-  return moves + threshold < best_moves;
+bool GainWellEnough(FixedPointCost gain, FixedPointCost current_cost) {
+  const FixedPointCost threshold =
+      std::max<FixedPointCost>(1, current_cost >> 14);
+  return gain >= threshold;
 }
 
 bool MajorityBatchImproved(std::vector<MultiKState>* states,
-                           const std::vector<uint32_t>& batch_moves) {
+                           const std::vector<uint32_t>& batch_moves,
+                           const std::vector<FixedPointCost>& new_costs) {
   size_t active = 0;
   size_t good = 0;
   for (size_t i = 0; i < states->size(); ++i) {
     MultiKState& state = (*states)[i];
+    const FixedPointCost old_cost = state.current_cost;
+    const FixedPointCost gain = std::max<FixedPointCost>(0, old_cost - new_costs[i]);
     const bool finished_now = (batch_moves[i] == 0);
     if (!state.finished && !finished_now && state.seq_moves > state.min_moves) {
       ++active;
-      if (ImprovedWell(batch_moves[i], state.best_batch_moves,
-                       state.min_moves)) {
+      if (GainWellEnough(gain, old_cost)) {
         ++good;
       }
     }
-    state.best_batch_moves = std::min(batch_moves[i], state.best_batch_moves);
+    state.current_cost = new_costs[i];
     state.finished = state.finished || finished_now;
   }
   return active == 0 || good * 2 >= active;
 }
 
 bool MajoritySequentialImproved(std::vector<MultiKState>* states,
-                                const std::vector<uint32_t>& seq_moves) {
+                                const std::vector<SequentialSweepResult>& seq_stats) {
   size_t active = 0;
   size_t good = 0;
   for (size_t i = 0; i < states->size(); ++i) {
     MultiKState& state = (*states)[i];
-    state.seq_moves = seq_moves[i];
-    const bool finished_now = (seq_moves[i] == 0);
-    if (!state.finished && !finished_now && seq_moves[i] > state.min_moves) {
+    const FixedPointCost old_cost = state.current_cost;
+    state.seq_moves = seq_stats[i].moves;
+    state.current_cost += seq_stats[i].delta_cost;
+    const FixedPointCost gain =
+        std::max<FixedPointCost>(0, -seq_stats[i].delta_cost);
+    const bool finished_now = (seq_stats[i].moves == 0);
+    if (!state.finished && !finished_now &&
+        seq_stats[i].moves > state.min_moves) {
       ++active;
-      if (ImprovedWell(seq_moves[i], state.best_seq_moves, state.min_moves)) {
+      if (GainWellEnough(gain, old_cost)) {
         ++good;
       }
     }
-    state.best_seq_moves = std::min(seq_moves[i], state.best_seq_moves);
     state.finished = state.finished || finished_now;
   }
   // Be more permissive here than on the batch side: the sequential phase is
@@ -151,22 +154,25 @@ void PrintMoveTableRow(const char* label, const std::vector<MultiKState>& states
   fflush(stderr);
 }
 
-std::vector<uint32_t> FusedSequentialIter(
+std::vector<SequentialSweepResult> FusedSequentialIter(
     std::vector<MultiKState>* states, const std::vector<BlockRef>& active_blocks,
     ThreadPool* pool) {
-  std::vector<uint32_t> moves(states->size(), 0);
+  std::vector<SequentialSweepResult> results(states->size());
   auto run_one_k = [&](size_t ki) {
     MultiKState& state = (*states)[ki];
     if (state.finished) return;
-    uint32_t local_moves = 0;
+    SequentialSweepResult local_result;
     for (const BlockRef& ref : active_blocks) {
       const uint32_t cur = state.ctx.pass_assignment[ref.c][ref.b];
-      const uint32_t best = state.ctx.FindBestPass(ref, cur, &state.scratch);
+      FixedPointCost best_delta = 0;
+      const uint32_t best =
+          state.ctx.FindBestPass(ref, cur, &state.scratch, &best_delta);
       if (best == cur) continue;
       state.ctx.ApplyMove(ref, cur, best);
-      ++local_moves;
+      ++local_result.moves;
+      local_result.delta_cost += best_delta;
     }
-    moves[ki] = local_moves;
+    results[ki] = local_result;
   };
   if (pool != nullptr && states->size() > 1) {
     (void)RunOnPool(
@@ -181,7 +187,7 @@ std::vector<uint32_t> FusedSequentialIter(
       run_one_k(ki);
     }
   }
-  return moves;
+  return results;
 }
 
 std::vector<uint32_t> FusedScoreBatchMoves(
@@ -257,6 +263,29 @@ std::vector<uint32_t> FusedApplyBatchMoves(
   return applied;
 }
 
+std::vector<FixedPointCost> ComputeCurrentCosts(std::vector<MultiKState>* states,
+                                                ThreadPool* pool) {
+  std::vector<FixedPointCost> costs(states->size(), 0);
+  auto run_one_k = [&](size_t ki) {
+    MultiKState& state = (*states)[ki];
+    costs[ki] = state.finished ? state.current_cost : state.ctx.TotalCost();
+  };
+  if (pool != nullptr && states->size() > 1) {
+    (void)RunOnPool(
+        pool, 0, static_cast<uint32_t>(states->size()), ThreadPool::NoInit,
+        [&](uint32_t ki, size_t /*thread*/) -> Status {
+          run_one_k(ki);
+          return true;
+        },
+        "AssignPassesGreedyAllKCost");
+  } else {
+    for (size_t ki = 0; ki < states->size(); ++ki) {
+      run_one_k(ki);
+    }
+  }
+  return costs;
+}
+
 }  // namespace
 
 AssignPassesRangeResult AssignPassesGreedyAllK(
@@ -324,6 +353,13 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
     state.ctx.InitPassAssignmentSimple();
     state.ctx.InitNZPredictorState();
   }
+  {
+    const std::vector<FixedPointCost> initial_costs =
+        ComputeCurrentCosts(&states, pool);
+    for (size_t i = 0; i < states.size(); ++i) {
+      states[i].current_cost = initial_costs[i];
+    }
+  }
   fprintf(stderr, "PLANNER: [all-k] Initializing clusters took %.2f ms\n",
           NanosToMs(ElapsedNanos(start_init, PlannerClock::now())));
   fflush(stderr);
@@ -337,12 +373,14 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
   uint32_t iter = 0;
   {
     const auto start_seq = PlannerClock::now();
-    const std::vector<uint32_t> seq_moves =
+    const std::vector<SequentialSweepResult> seq_stats =
         FusedSequentialIter(&states, active_blocks, pool);
     out.shared_timings.sequential_ns +=
         ElapsedNanos(start_seq, PlannerClock::now());
-    MajoritySequentialImproved(&states, seq_moves);
+    MajoritySequentialImproved(&states, seq_stats);
     ++iter;
+    std::vector<uint32_t> seq_moves(states.size(), 0);
+    for (size_t i = 0; i < states.size(); ++i) seq_moves[i] = seq_stats[i].moves;
     PrintMoveTableRow("seq-1", states, seq_moves, move_width);
   }
 
@@ -366,7 +404,9 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
           FusedApplyBatchMoves(&states, active_blocks, kBatchStride, iter);
       out.shared_timings.batch_ns +=
           ElapsedNanos(start_batch, PlannerClock::now());
-      MajorityBatchImproved(&states, applied);
+      const std::vector<FixedPointCost> new_costs =
+          ComputeCurrentCosts(&states, pool);
+      MajorityBatchImproved(&states, applied, new_costs);
       ++iter;
       char label[32];
       std::snprintf(label, sizeof(label), "b-batch-%u", iter);
@@ -387,7 +427,9 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
           FusedApplyBatchMoves(&states, active_blocks, kBatchStride, iter);
       out.shared_timings.batch_ns +=
           ElapsedNanos(start_batch, PlannerClock::now());
-      const bool good_batch = MajorityBatchImproved(&states, applied);
+      const std::vector<FixedPointCost> new_costs =
+          ComputeCurrentCosts(&states, pool);
+      const bool good_batch = MajorityBatchImproved(&states, applied, new_costs);
       ++iter;
       char batch_label[32];
       std::snprintf(batch_label, sizeof(batch_label), "b-batch-%u", iter);
@@ -400,12 +442,14 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
       ++batch_stale_count;
       if (iter >= kMaxIters) break;
       const auto start_seq = PlannerClock::now();
-      const std::vector<uint32_t> seq_moves =
+      const std::vector<SequentialSweepResult> seq_stats =
           FusedSequentialIter(&states, active_blocks, pool);
       out.shared_timings.sequential_ns +=
           ElapsedNanos(start_seq, PlannerClock::now());
-      MajoritySequentialImproved(&states, seq_moves);
+      MajoritySequentialImproved(&states, seq_stats);
       ++iter;
+      std::vector<uint32_t> seq_moves(states.size(), 0);
+      for (size_t i = 0; i < states.size(); ++i) seq_moves[i] = seq_stats[i].moves;
       char seq_label[32];
       std::snprintf(seq_label, sizeof(seq_label), "b-seq-%u", iter);
       PrintMoveTableRow(seq_label, states, seq_moves, move_width);
@@ -415,12 +459,14 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
   uint32_t seq_bad_streak = 0;
   while (iter < kMaxIters && AnyActiveK(states)) {
     const auto start_seq = PlannerClock::now();
-    const std::vector<uint32_t> seq_moves =
+    const std::vector<SequentialSweepResult> seq_stats =
         FusedSequentialIter(&states, active_blocks, pool);
     out.shared_timings.sequential_ns +=
         ElapsedNanos(start_seq, PlannerClock::now());
-    const bool good_seq = MajoritySequentialImproved(&states, seq_moves);
+    const bool good_seq = MajoritySequentialImproved(&states, seq_stats);
     ++iter;
+    std::vector<uint32_t> seq_moves(states.size(), 0);
+    for (size_t i = 0; i < states.size(); ++i) seq_moves[i] = seq_stats[i].moves;
     char seq_label[32];
     std::snprintf(seq_label, sizeof(seq_label), "s-seq-%u", iter);
     PrintMoveTableRow(seq_label, states, seq_moves, move_width);
@@ -444,7 +490,9 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
           FusedApplyBatchMoves(&states, active_blocks, kBatchStride, iter);
       out.shared_timings.batch_ns +=
           ElapsedNanos(start_batch, PlannerClock::now());
-      MajorityBatchImproved(&states, applied);
+      const std::vector<FixedPointCost> new_costs =
+          ComputeCurrentCosts(&states, pool);
+      MajorityBatchImproved(&states, applied, new_costs);
       ++iter;
       char batch_label[32];
       std::snprintf(batch_label, sizeof(batch_label), "s-batch-%u", iter);

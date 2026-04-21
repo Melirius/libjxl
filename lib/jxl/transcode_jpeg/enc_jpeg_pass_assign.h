@@ -89,6 +89,13 @@ struct AssignScratch {
   std::vector<uint32_t> czdc_counts;
 };
 
+// Result of one full sequential sweep: number of accepted moves and the exact
+// accumulated proxy-cost delta from those moves.
+struct SequentialSweepResult {
+  uint32_t moves = 0;
+  FixedPointCost delta_cost = 0;
+};
+
 // All mutable state for one pass-assignment solve: AC/NZ histograms and the
 // per-block NZ-predictor cache. Read-only references to the input data and
 // derived dimensional constants are bundled here to keep helper signatures
@@ -128,7 +135,8 @@ class PassAssignmentCtx {
   // Evaluates the cost delta of moving block `ref` from `cur_pass` to every
   // other pass, and returns the pass with the lowest delta.
   uint32_t FindBestPass(const BlockRef& ref, uint32_t cur_pass,
-                        AssignScratch* scratch) const;
+                        AssignScratch* scratch,
+                        FixedPointCost* best_delta = nullptr) const;
 
   // Commits a block move: updates the AC histograms, NZ histograms, pass
   // assignment, and NZ predictor cache.
@@ -140,9 +148,9 @@ class PassAssignmentCtx {
   /// Iterative solvers ///
 
   // One sequential sweep over all active blocks. Returns the number of blocks
-  // moved.
-  uint32_t SequentialIter(const std::vector<BlockRef>& active_blocks,
-                          AssignScratch& scratch);
+  // moved and the exact accumulated proxy-cost delta of accepted moves.
+  SequentialSweepResult SequentialIter(
+      const std::vector<BlockRef>& active_blocks, AssignScratch& scratch);
 
   // Scores all active blocks in parallel; writes proposed best pass per block
   // into new_passes[]. Returns number of proposed changes.
