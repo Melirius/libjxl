@@ -209,6 +209,13 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
     const JPEGOptData& d, const ActiveRawBins& active,
     uint32_t min_num_passes, uint32_t max_num_passes, ThreadPool* pool);
 
+// Experimental variant that keeps the `(channel, cell)` row grid fixed and
+// scores pass moves on `(row, pass)` token/NZ histograms.
+AssignPassesRangeResult AssignPassesGreedyAllKFixedRows(
+    const JPEGOptData& d, const ActiveRawBins& active,
+    const FixedRows& fixed_rows, uint32_t num_rows,
+    uint32_t min_num_passes, uint32_t max_num_passes, ThreadPool* pool);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_PASS_ASSIGN_H_

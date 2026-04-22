@@ -16,6 +16,7 @@
 namespace jxl {
 
 using PassAssignment = std::array<std::vector<uint8_t>, kNumCh>;
+using FixedRows = std::array<std::vector<uint16_t>, kNumCh>;
 
 struct PassSearchResult {
   ThresholdSet thresholds;

@@ -531,9 +531,15 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
   auto start_search = std::chrono::high_resolution_clock::now();
   PassSearchResult result;
   if (effort.use_bicluster_search) {
-    fprintf(stderr,
-            "PLANNER: Running biclustered search path (max %u passes)\n",
-            planner_max_num_passes);
+    if (effort.bicluster_threshold_first) {
+      fprintf(stderr,
+              "PLANNER: Running biclustered threshold-first search path (max %u passes)\n",
+              planner_max_num_passes);
+    } else {
+      fprintf(stderr,
+              "PLANNER: Running biclustered search path (max %u passes)\n",
+              planner_max_num_passes);
+    }
     fflush(stderr);
     JXL_ASSIGN_OR_RETURN(BiclusterSearchResult bicluster_result,
                          SearchBiclusteredContextModel(opt_data, effort, pool));

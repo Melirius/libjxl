@@ -80,6 +80,9 @@ struct JPEGCtxEffortParams {
   // Reserved knob for later threshold refinement under the biclustering
   // objective.
   bool bicluster_refine_thresholds;
+  // Experimental alternative ordering: choose one threshold grid first, then
+  // assign passes on the fixed row grid, then bicluster.
+  bool bicluster_threshold_first;
 
   static JPEGCtxEffortParams FromSpeedTier(SpeedTier speed_tier) {
     switch (speed_tier) {
@@ -99,7 +102,8 @@ struct JPEGCtxEffortParams {
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
                 /*optimize_passes_num=*/-1,
-                /*bicluster_refine_thresholds=*/false};
+                /*bicluster_refine_thresholds=*/false,
+                /*bicluster_threshold_first=*/false};
       case SpeedTier::kTortoise:
         // `kRawAI` is marginally slower here but did not give better results.
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kToken420,
@@ -116,7 +120,8 @@ struct JPEGCtxEffortParams {
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
                 /*optimize_passes_num=*/-1,
-                /*bicluster_refine_thresholds=*/false};
+                /*bicluster_refine_thresholds=*/false,
+                /*bicluster_threshold_first=*/true};
       case SpeedTier::kGlacier:
       case SpeedTier::kTectonicPlate:
       default:
@@ -137,7 +142,8 @@ struct JPEGCtxEffortParams {
                 /*bicluster_proto_budget_per_pass=*/128,
                 /*bicluster_row_budget=*/kMaxClusters,
                 /*optimize_passes_num=*/-1,
-                /*bicluster_refine_thresholds=*/false};
+                /*bicluster_refine_thresholds=*/false,
+                /*bicluster_threshold_first=*/false};
     }
   }
 };

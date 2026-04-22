@@ -109,6 +109,24 @@ void BlockDCIndices(const JPEGOptData& d, uint32_t c, uint32_t b, uint32_t* dc0,
                     uint32_t* dc1, uint32_t* dc2);
 uint32_t BlockCell(const JPEGOptData& d, const AxisMaps& axis_maps,
                    const ThresholdSet& thresholds, uint32_t c, uint32_t b);
+FixedRows BuildFixedRows(const JPEGOptData& d, const ThresholdSet& thresholds) {
+  FixedRows rows;
+  AxisMaps axis_maps(d);
+  axis_maps.Update(thresholds);
+  const uint32_t num_cells = static_cast<uint32_t>((thresholds.TY().size() + 1) *
+                                                   (thresholds.TCb().size() + 1) *
+                                                   (thresholds.TCr().size() + 1));
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    rows[c].assign(d.num_blocks[c], 0);
+  }
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+      rows[c][b] = static_cast<uint16_t>(
+          c * num_cells + BlockCell(d, axis_maps, thresholds, c, b));
+    }
+  }
+  return rows;
+}
 // Small union-find helper for the agglomerative merge loop in
 // `ClusterContextsPassAware`.
 uint32_t FindRoot(std::vector<uint32_t>& parent, uint32_t x) {
@@ -2050,6 +2068,215 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
   return SearchPassAwareContextModel(opt_data, candidates, effort, pool);
 }
 
+StatusOr<BiclusterSearchResult> SearchBiclusteredContextModelThresholdFirst(
+    std::shared_ptr<const JPEGOptData> opt_data,
+    const std::vector<FactorizationCandidate>& candidates,
+    const JPEGCtxEffortParams& effort, ThreadPool* pool) {
+  if (candidates.empty()) {
+    return JXL_FAILURE("Biclustered search requires at least one candidate");
+  }
+
+  const JPEGOptData& d = *opt_data;
+  const ActiveRawBins active = BuildActiveRawBins(d);
+  const uint32_t min_num_passes =
+      effort.optimize_passes_num <= 0
+          ? 1
+          : static_cast<uint32_t>(effort.optimize_passes_num);
+  const uint32_t max_num_passes =
+      effort.optimize_passes_num <= 0
+          ? ComputeMaxNumPasses(d)
+          : static_cast<uint32_t>(effort.optimize_passes_num);
+  const uint32_t target_clusters =
+      kMaxClusters - static_cast<uint32_t>(d.channels == 1);
+
+  fprintf(stderr,
+          "PLANNER: [bicluster-threshold-first] Selecting fixed thresholds with 1-pass search\n");
+  fflush(stderr);
+  auto start_seed = PlannerClock::now();
+  JPEGCtxEffortParams seed_effort = effort;
+  seed_effort.use_bicluster_search = false;
+  seed_effort.optimize_passes_num = 1;
+  seed_effort.bicluster_threshold_first = false;
+  JXL_ASSIGN_OR_RETURN(
+      PassSearchResult threshold_seed,
+      SearchPassAwareContextModel(opt_data, candidates, seed_effort, pool));
+  auto end_seed = PlannerClock::now();
+  fprintf(stderr,
+          "PLANNER: [bicluster-threshold-first] Seed search took %.2f ms\n",
+          NanosToMs(ElapsedNanos(start_seed, end_seed)));
+  fflush(stderr);
+
+  PrunedCtxMapResult pruned_seed = PruneDeadThresholdsFromCtxMap(
+      threshold_seed.thresholds, threshold_seed.ctx_map, d.channels);
+  ThresholdSet seed_thresholds = std::move(pruned_seed.thresholds);
+  const uint32_t seed_num_cells = static_cast<uint32_t>(
+      (seed_thresholds.TY().size() + 1) * (seed_thresholds.TCb().size() + 1) *
+      (seed_thresholds.TCr().size() + 1));
+  const FixedRows fixed_rows = BuildFixedRows(d, seed_thresholds);
+  fprintf(stderr,
+          "PLANNER: [bicluster-threshold-first] Using seed threshold grid with %u cells\n",
+          seed_num_cells);
+  fflush(stderr);
+
+  auto start_assign = PlannerClock::now();
+  AssignPassesRangeResult assign_range_result = AssignPassesGreedyAllKFixedRows(
+      d, active, fixed_rows, d.channels * seed_num_cells, min_num_passes,
+      max_num_passes, pool);
+  auto end_assign = PlannerClock::now();
+  fprintf(stderr,
+          "PLANNER: [bicluster-threshold-first] AssignPassesGreedyAllKFixedRows took %.2f ms total "
+          "(batch %.2f ms, sequential %.2f ms)\n",
+          NanosToMs(assign_range_result.shared_timings.total_ns),
+          NanosToMs(assign_range_result.shared_timings.batch_ns),
+          NanosToMs(assign_range_result.shared_timings.sequential_ns));
+  fprintf(stderr,
+          "PLANNER: [bicluster-threshold-first] Fixed-row pass assignment stage took %.2f ms wall time\n",
+          NanosToMs(ElapsedNanos(start_assign, end_assign)));
+  fflush(stderr);
+
+  BiclusterSearchResult best_result;
+  best_result.total_cost = std::numeric_limits<FixedPointCost>::max();
+  for (uint32_t num_passes = min_num_passes; num_passes <= max_num_passes;
+       ++num_passes) {
+    auto start_pass_config = PlannerClock::now();
+    fprintf(stderr,
+            "PLANNER: [bicluster-threshold-first] Testing configuration with %u passes\n",
+            num_passes);
+    fflush(stderr);
+
+    const PassAssignment& pass_assignment =
+        assign_range_result.results[num_passes - min_num_passes].pass_assignment;
+    const NZBlockCache nz_cache =
+        BuildNZBlockCache(d, pass_assignment, num_passes);
+
+    auto start_build_stream = PlannerClock::now();
+    std::vector<uint32_t> pass_offsets;
+    JXL_ASSIGN_OR_RETURN(
+        std::vector<ACEntry> pass_stream,
+        BuildPassStream(d, active, pass_assignment, num_passes, &pass_offsets,
+                        pool));
+    auto end_build_stream = PlannerClock::now();
+
+    auto start_rough_opt = PlannerClock::now();
+    PartitioningCtx ctx(opt_data);
+    FixedPointCost rough_unclustered_cost = 0;
+    ThresholdSet rough_thresholds =
+        ctx.OptimizeThresholds(seed_thresholds, pass_stream,
+                               effort.main_m_target, effort.main_iters,
+                               &rough_unclustered_cost);
+    auto end_rough_opt = PlannerClock::now();
+
+    auto start_build_rows = PlannerClock::now();
+    JXL_ASSIGN_OR_RETURN(
+        RowSliceState rough_state,
+        BuildRowSliceState(d, rough_thresholds, pass_assignment, num_passes,
+                           nz_cache));
+    auto end_build_rows = PlannerClock::now();
+
+    auto start_row_cluster = PlannerClock::now();
+    JXL_ASSIGN_OR_RETURN(
+        ClusterResult rough_cluster_result,
+        ClusterRowsBiclustered(d, rough_state.rows,
+                               std::min(target_clusters,
+                                        effort.bicluster_row_budget)));
+    auto end_row_cluster = PlannerClock::now();
+
+    std::vector<uint32_t> rough_num_prototypes;
+    auto start_eval = PlannerClock::now();
+    JXL_ASSIGN_OR_RETURN(
+        ModelEvaluation rough_eval,
+        EvaluateBiclusterState(
+            d, rough_thresholds, rough_cluster_result.ctx_map,
+            rough_cluster_result.num_clusters, pass_assignment, num_passes,
+            effort.bicluster_proto_budget_per_pass, rough_state.rows,
+            &rough_num_prototypes, best_result.total_cost));
+    auto end_eval = PlannerClock::now();
+
+    bool refined_is_better = false;
+    ThresholdSet refined_thresholds;
+    ClusterResult refined_cluster_result;
+    ModelEvaluation refined_eval;
+    std::vector<uint32_t> refined_num_prototypes;
+    if (effort.bicluster_refine_thresholds) {
+      refined_thresholds = RefinePassAwareThresholds(ctx, rough_thresholds,
+                                                     pass_stream, effort);
+      JXL_ASSIGN_OR_RETURN(
+          RowSliceState refined_state,
+          RefineRowSliceState(d, refined_thresholds, pass_assignment, num_passes,
+                              rough_state, nz_cache));
+      JXL_ASSIGN_OR_RETURN(
+          refined_cluster_result,
+          ClusterRowsBiclustered(d, refined_state.rows,
+                                 std::min(target_clusters,
+                                          effort.bicluster_row_budget)));
+      JXL_ASSIGN_OR_RETURN(
+          refined_eval,
+          EvaluateBiclusterState(
+              d, refined_thresholds, refined_cluster_result.ctx_map,
+              refined_cluster_result.num_clusters, pass_assignment, num_passes,
+              effort.bicluster_proto_budget_per_pass, refined_state.rows,
+              &refined_num_prototypes,
+              std::min(best_result.total_cost, rough_eval.total_cost())));
+      refined_is_better =
+          refined_eval.total_cost() < rough_eval.total_cost();
+    }
+
+    const ThresholdSet& best_thresholds =
+        refined_is_better ? refined_thresholds : rough_thresholds;
+    const ClusterResult& best_cluster_result =
+        refined_is_better ? refined_cluster_result : rough_cluster_result;
+    const ModelEvaluation& best_eval =
+        refined_is_better ? refined_eval : rough_eval;
+    const std::vector<uint32_t>& best_num_prototypes =
+        refined_is_better ? refined_num_prototypes : rough_num_prototypes;
+    if (best_eval.total_cost() < best_result.total_cost) {
+      best_result.thresholds = best_thresholds;
+      best_result.ctx_map = best_cluster_result.ctx_map;
+      best_result.pass_assignment = pass_assignment;
+      best_result.num_passes = num_passes;
+      best_result.num_cells = static_cast<uint32_t>(
+          (best_thresholds.TY().size() + 1) *
+          (best_thresholds.TCb().size() + 1) *
+          (best_thresholds.TCr().size() + 1));
+      best_result.num_row_clusters = best_cluster_result.num_clusters;
+      best_result.num_prototypes_per_pass = best_num_prototypes;
+      best_result.total_num_prototypes = 0;
+      for (uint32_t n : best_num_prototypes) best_result.total_num_prototypes += n;
+      best_result.ac_cost =
+          best_eval.corrected_entropy_cost >= 0 ? best_eval.corrected_entropy_cost
+                                                : best_eval.ac_cost;
+      best_result.nz_cost = best_eval.nz_cost;
+      best_result.signalling_overhead = best_eval.signalling_overhead;
+      best_result.total_cost = best_eval.total_cost();
+    }
+
+    fprintf(stderr,
+            "PLANNER: [bicluster-threshold-first] Stages: build_stream=%.2f ms rough_opt=%.2f ms build_rows=%.2f ms row_cluster=%.2f ms eval=%.2f ms\n",
+            NanosToMs(ElapsedNanos(start_build_stream, end_build_stream)),
+            NanosToMs(ElapsedNanos(start_rough_opt, end_rough_opt)),
+            NanosToMs(ElapsedNanos(start_build_rows, end_build_rows)),
+            NanosToMs(ElapsedNanos(start_row_cluster, end_row_cluster)),
+            NanosToMs(ElapsedNanos(start_eval, end_eval)));
+    fprintf(stderr,
+            "PLANNER: [bicluster-threshold-first] Best cost for %u passes = %.2f bits\n",
+            num_passes, bit_cost(best_eval.total_cost()));
+    auto end_pass_config = PlannerClock::now();
+    fprintf(stderr,
+            "PLANNER: [bicluster-threshold-first] Pass configuration %u took %.2f ms\n",
+            num_passes,
+            std::chrono::duration<double, std::milli>(end_pass_config -
+                                                      start_pass_config)
+                .count());
+    fflush(stderr);
+  }
+
+  if (best_result.total_cost == std::numeric_limits<FixedPointCost>::max()) {
+    return JXL_FAILURE(
+        "Threshold-first biclustered search did not produce a result");
+  }
+  return best_result;
+}
+
 // Biclustering-prototype search on a fixed candidate list. This currently
 // shares the pass-aware threshold optimization and row clustering steps, then
 // re-scores each candidate on the richer `(row, pass, slice)` lattice.
@@ -2057,6 +2284,10 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const std::vector<FactorizationCandidate>& candidates,
     const JPEGCtxEffortParams& effort, ThreadPool* pool) {
+  if (effort.bicluster_threshold_first) {
+    return SearchBiclusteredContextModelThresholdFirst(opt_data, candidates,
+                                                       effort, pool);
+  }
   if (candidates.empty()) {
     return JXL_FAILURE("Biclustered search requires at least one candidate");
   }
