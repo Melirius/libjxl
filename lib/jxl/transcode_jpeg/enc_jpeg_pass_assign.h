@@ -211,6 +211,12 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
 
 // Experimental variant that keeps the `(channel, cell)` row grid fixed and
 // scores pass moves on `(row, pass)` token/NZ histograms.
+AssignPassesResult AssignPassesGreedyFixedRows(
+    const JPEGOptData& d, const FixedRows& fixed_rows, uint32_t num_rows,
+    uint32_t num_passes, const PassAssignment* warm_start, ThreadPool* pool);
+
+// Experimental fused variant that keeps the `(channel, cell)` row grid fixed
+// and scores pass moves on `(row, pass)` token/NZ histograms.
 AssignPassesRangeResult AssignPassesGreedyAllKFixedRows(
     const JPEGOptData& d, const ActiveRawBins& active,
     const FixedRows& fixed_rows, uint32_t num_rows,

@@ -805,6 +805,27 @@ class FixedRowsPassAssignmentCtx {
     }
   }
 
+  void InitPassAssignmentWarm(const PassAssignment& warm_start) {
+    for (uint32_t c = 0; c < d.channels; ++c) {
+      if (warm_start[c].size() != d.num_blocks[c]) {
+        InitPassAssignmentSimple();
+        return;
+      }
+      for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+        if (warm_start[c][b] >= num_passes) {
+          InitPassAssignmentSimple();
+          return;
+        }
+      }
+    }
+    for (uint32_t c = 0; c < d.channels; ++c) {
+      pass_assignment[c] = warm_start[c];
+      for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+        AddACBlockToPass(c, b, pass_assignment[c][b]);
+      }
+    }
+  }
+
   void InitNZPredictorState() {
     for (uint32_t c = 0; c < d.channels; ++c) {
       nz_pred_bucket[c].resize(d.num_blocks[c], 0);
@@ -1135,6 +1156,231 @@ struct FixedRowsMultiKState {
 };
 
 }  // namespace
+
+AssignPassesResult AssignPassesGreedyFixedRows(
+    const JPEGOptData& d, const FixedRows& fixed_rows, uint32_t num_rows,
+    uint32_t num_passes, const PassAssignment* warm_start, ThreadPool* pool) {
+  AssignPassesResult out;
+  const auto start_total = PlannerClock::now();
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    out.pass_assignment[c].assign(d.num_blocks[c], 0);
+  }
+  if (num_passes <= 1) {
+    out.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
+    return out;
+  }
+
+  std::vector<BlockRef> active_blocks;
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    for (uint32_t b = 0; b < d.num_blocks[c]; ++b) {
+      if (d.block_offsets[c][b] == d.block_offsets[c][b + 1]) continue;
+      active_blocks.push_back({static_cast<uint16_t>(c), b});
+    }
+  }
+  if (active_blocks.empty()) {
+    out.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
+    return out;
+  }
+
+  FixedRowsPassAssignmentCtx ctx(d, fixed_rows, num_rows, num_passes);
+  if (warm_start != nullptr) {
+    ctx.InitPassAssignmentWarm(*warm_start);
+  } else {
+    ctx.InitPassAssignmentSimple();
+  }
+  ctx.InitNZPredictorState();
+
+  FixedRowsAssignScratch scratch = ctx.MakeScratch();
+  std::vector<uint8_t> new_passes(active_blocks.size(), 0);
+  const uint32_t min_moves = std::max<uint32_t>(
+      1, static_cast<uint32_t>(
+             std::max<size_t>(size_t{1}, active_blocks.size() >> 13)));
+  uint32_t seq_moves = std::numeric_limits<uint32_t>::max();
+  FixedPointCost current_cost = ctx.TotalCost();
+  bool finished = false;
+  const bool use_batch =
+      (pool != nullptr && active_blocks.size() > kLargeImageThreshold);
+
+  auto run_seq_iter = [&]() {
+    SequentialSweepResult result;
+    for (const BlockRef& ref : active_blocks) {
+      const uint32_t cur = ctx.pass_assignment[ref.c][ref.b];
+      FixedPointCost best_delta = 0;
+      const uint32_t best = ctx.FindBestPass(ref, cur, &scratch, &best_delta);
+      if (best == cur) continue;
+      ctx.ApplyMove(ref, cur, best);
+      ++result.moves;
+      result.delta_cost += best_delta;
+    }
+    return result;
+  };
+  auto apply_seq_result = [&](const SequentialSweepResult& stats) {
+    const FixedPointCost old_cost = current_cost;
+    seq_moves = stats.moves;
+    current_cost += stats.delta_cost;
+    finished = finished || (stats.moves == 0);
+    if (finished || seq_moves <= min_moves) return true;
+    return GainWellEnough(std::max<FixedPointCost>(0, -stats.delta_cost),
+                          old_cost);
+  };
+  auto score_batch = [&]() {
+    const uint32_t num_chunks = static_cast<uint32_t>(
+        (active_blocks.size() + kBatchChunkSize - 1) / kBatchChunkSize);
+    std::vector<uint32_t> thread_moves;
+    std::vector<FixedRowsAssignScratch> scratch_pool;
+    if (!RunOnPool(
+            pool, 0, num_chunks,
+            [&](size_t num_threads) -> Status {
+              thread_moves.assign(num_threads, 0);
+              scratch_pool.reserve(num_threads);
+              for (size_t t = 0; t < num_threads; ++t) {
+                scratch_pool.push_back(ctx.MakeScratch());
+              }
+              return true;
+            },
+            [&](uint32_t chunk, size_t thread_id) -> Status {
+              uint32_t local_moves = 0;
+              const size_t begin = static_cast<size_t>(chunk) * kBatchChunkSize;
+              const size_t end =
+                  std::min(begin + kBatchChunkSize, active_blocks.size());
+              for (size_t i = begin; i < end; ++i) {
+                const BlockRef& ref = active_blocks[i];
+                const uint32_t cur = ctx.pass_assignment[ref.c][ref.b];
+                const uint32_t best =
+                    ctx.FindBestPass(ref, cur, &scratch_pool[thread_id]);
+                new_passes[i] = static_cast<uint8_t>(best);
+                if (best != cur) ++local_moves;
+              }
+              thread_moves[thread_id] += local_moves;
+              return true;
+            },
+            "AssignPassesGreedyFixedRowsBatch")) {
+      return 0u;
+    }
+    uint32_t total_moves = 0;
+    for (uint32_t v : thread_moves) total_moves += v;
+    return total_moves;
+  };
+  auto apply_batch = [&](uint32_t stride, uint32_t iter) {
+    uint32_t applied = 0;
+    for (size_t i = 0; i < active_blocks.size(); ++i) {
+      if (i % stride != iter % stride) continue;
+      const BlockRef& ref = active_blocks[i];
+      const uint32_t cur = ctx.pass_assignment[ref.c][ref.b];
+      const uint32_t next = new_passes[i];
+      if (next == cur) continue;
+      ctx.ApplyMove(ref, cur, next);
+      ++applied;
+    }
+    return applied;
+  };
+  auto apply_batch_result = [&](uint32_t applied, FixedPointCost new_cost) {
+    const FixedPointCost old_cost = current_cost;
+    current_cost = new_cost;
+    finished = finished || (applied == 0);
+    if (finished || seq_moves <= min_moves) return true;
+    return GainWellEnough(std::max<FixedPointCost>(0, old_cost - new_cost),
+                          old_cost);
+  };
+
+  uint32_t iter = 0;
+  {
+    const auto start_seq = PlannerClock::now();
+    const SequentialSweepResult seq_stats = run_seq_iter();
+    out.timings.sequential_ns += ElapsedNanos(start_seq, PlannerClock::now());
+    apply_seq_result(seq_stats);
+    ++iter;
+  }
+
+  constexpr uint32_t kUnconditionalBatchIterations = 5;
+  constexpr uint32_t kBatchPatience = 2;
+  constexpr uint32_t kBatchStride = 1;
+
+  if (use_batch) {
+    for (uint32_t n = 0;
+         n < kUnconditionalBatchIterations && iter < kMaxIters &&
+         !finished && seq_moves > min_moves;
+         ++n) {
+      const auto start_batch = PlannerClock::now();
+      const uint32_t batch_moves = score_batch();
+      if (batch_moves == 0) {
+        finished = true;
+        break;
+      }
+      const uint32_t applied = apply_batch(kBatchStride, iter);
+      out.timings.batch_ns += ElapsedNanos(start_batch, PlannerClock::now());
+      apply_batch_result(applied, ctx.TotalCost());
+      ++iter;
+    }
+
+    uint32_t batch_stale_count = 0;
+    while (iter < kMaxIters && !finished && seq_moves > min_moves &&
+           batch_stale_count < kBatchPatience) {
+      const auto start_batch = PlannerClock::now();
+      const uint32_t batch_moves = score_batch();
+      if (batch_moves == 0) {
+        finished = true;
+        break;
+      }
+      const uint32_t applied = apply_batch(kBatchStride, iter);
+      out.timings.batch_ns += ElapsedNanos(start_batch, PlannerClock::now());
+      const bool good_batch = apply_batch_result(applied, ctx.TotalCost());
+      ++iter;
+      if (good_batch) {
+        batch_stale_count = 0;
+        continue;
+      }
+
+      ++batch_stale_count;
+      if (iter >= kMaxIters) break;
+      const auto start_seq = PlannerClock::now();
+      const SequentialSweepResult seq_stats = run_seq_iter();
+      out.timings.sequential_ns += ElapsedNanos(start_seq, PlannerClock::now());
+      apply_seq_result(seq_stats);
+      ++iter;
+    }
+  }
+
+  uint32_t seq_bad_streak = 0;
+  while (iter < kMaxIters && !finished && seq_moves > min_moves) {
+    const auto start_seq = PlannerClock::now();
+    const SequentialSweepResult seq_stats = run_seq_iter();
+    out.timings.sequential_ns += ElapsedNanos(start_seq, PlannerClock::now());
+    const FixedPointCost old_cost = current_cost;
+    const double seq_drop_pct =
+        CostDropPercent(old_cost, old_cost + seq_stats.delta_cost);
+    const bool good_seq = apply_seq_result(seq_stats);
+    ++iter;
+    if (!finished && seq_moves > min_moves &&
+        seq_drop_pct < kSequentialStopDropPct) {
+      break;
+    }
+    if (iter >= kMaxIters || finished || seq_moves <= min_moves) break;
+    if (good_seq) {
+      seq_bad_streak = 0;
+      continue;
+    }
+
+    ++seq_bad_streak;
+    if (use_batch && seq_bad_streak >= 2) {
+      const auto start_batch = PlannerClock::now();
+      const uint32_t batch_moves = score_batch();
+      if (batch_moves == 0) {
+        finished = true;
+        break;
+      }
+      const uint32_t applied = apply_batch(kBatchStride, iter);
+      out.timings.batch_ns += ElapsedNanos(start_batch, PlannerClock::now());
+      apply_batch_result(applied, ctx.TotalCost());
+      ++iter;
+      seq_bad_streak = 0;
+    }
+  }
+
+  out.pass_assignment = std::move(ctx.pass_assignment);
+  out.timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
+  return out;
+}
 
 AssignPassesRangeResult AssignPassesGreedyAllKFixedRows(
     const JPEGOptData& d, const ActiveRawBins& /*active*/,
