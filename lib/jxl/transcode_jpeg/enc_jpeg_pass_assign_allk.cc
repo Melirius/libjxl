@@ -24,29 +24,13 @@
 #include "lib/jxl/enc_cluster.h"
 #include "lib/jxl/enc_context_map.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_cluster.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_pass_utils.h"
 
 namespace jxl {
 
 namespace {
 
-constexpr uint32_t kMaxIters = 100;
-constexpr uint32_t kLargeImageThreshold = 1u << 15;
-constexpr uint32_t kBatchChunkSize = 1u << 14;
 constexpr double kSequentialStopDropPct = 0.0005;
-
-using PlannerClock = std::chrono::high_resolution_clock;
-
-int64_t ElapsedNanos(const PlannerClock::time_point& start,
-                     const PlannerClock::time_point& end) {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
-      .count();
-}
-
-double NanosToMs(int64_t ns) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::nanoseconds(ns))
-      .count();
-}
 
 struct MultiKState {
   uint32_t num_passes;

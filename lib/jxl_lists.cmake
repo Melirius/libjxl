@@ -405,6 +405,8 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/modular/transform/enc_transform.cc
   jxl/modular/transform/enc_transform.h
   jxl/transcode_jpeg/enc_jpeg_axis_maps.h
+  jxl/transcode_jpeg/enc_jpeg_bicluster.cc
+  jxl/transcode_jpeg/enc_jpeg_bicluster.h
   jxl/transcode_jpeg/enc_jpeg_cluster.h
   jxl/transcode_jpeg/enc_jpeg_cluster_build.cc
   jxl/transcode_jpeg/enc_jpeg_cluster_merge.cc
@@ -414,8 +416,14 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/transcode_jpeg/enc_jpeg_opt_data.cc
   jxl/transcode_jpeg/enc_jpeg_opt_data.h
   jxl/transcode_jpeg/enc_jpeg_pass_assign.cc
-  jxl/transcode_jpeg/enc_jpeg_pass_assign_allk.cc
   jxl/transcode_jpeg/enc_jpeg_pass_assign.h
+  jxl/transcode_jpeg/enc_jpeg_pass_assign_allk.cc
+  jxl/transcode_jpeg/enc_jpeg_pass_cluster.cc
+  jxl/transcode_jpeg/enc_jpeg_pass_cluster.h
+  jxl/transcode_jpeg/enc_jpeg_pass_stream.cc
+  jxl/transcode_jpeg/enc_jpeg_pass_stream.h
+  jxl/transcode_jpeg/enc_jpeg_pass_utils.cc
+  jxl/transcode_jpeg/enc_jpeg_pass_utils.h
   jxl/transcode_jpeg/enc_jpeg_passes.cc
   jxl/transcode_jpeg/enc_jpeg_passes.h
   jxl/transcode_jpeg/enc_jpeg_refine.cc

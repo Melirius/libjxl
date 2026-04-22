@@ -17,32 +17,11 @@
 
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_pass_utils.h"
 
 namespace jxl {
 
 namespace {
-
-// Iteration cap for the sequential/batch refinement loops.
-constexpr uint32_t kMaxIters = 100;
-// Above this many active blocks, the batch parallel refinement phase is used.
-constexpr uint32_t kLargeImageThreshold = 1u << 15;
-// Number of blocks scored per chunk in `ScoreBatchMoves`.
-constexpr uint32_t kBatchChunkSize = 1u << 14;
-
-using PlannerClock = std::chrono::high_resolution_clock;
-
-int64_t ElapsedNanos(const PlannerClock::time_point& start,
-                     const PlannerClock::time_point& end) {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
-      .count();
-}
-
-double NanosToMs(int64_t ns) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::nanoseconds(ns))
-      .count();
-}
-
 }  // namespace
 
 ActiveRawBins BuildActiveRawBins(const JPEGOptData& d) {

@@ -45,6 +45,7 @@ struct BiclusterSearchResult {
   FixedPointCost total_cost = std::numeric_limits<FixedPointCost>::max();
 };
 
+// Exported search functions (defined in enc_jpeg_passes.cc)
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const std::vector<FactorizationCandidate>& candidates,
