@@ -13,11 +13,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <vector>
 
 #include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/enc_ans_params.h"
+#include "lib/jxl/enc_cluster.h"
+#include "lib/jxl/enc_context_map.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_cluster.h"
 
 namespace jxl {
 
@@ -151,6 +157,183 @@ void PrintMoveTableRow(const char* label, const std::vector<MultiKState>& states
   fprintf(stderr, "PLANNER: [all-k] %-12s", label);
   for (size_t i = 0; i < states.size(); ++i) {
     fprintf(stderr, " %*.3f%%", column_width - 1, drop_pct[i]);
+  }
+  fprintf(stderr, "\n");
+  fflush(stderr);
+}
+
+void PrintFinalCostRow(const std::vector<MultiKState>& states,
+                       const FixedPointCost* one_pass_cost) {
+  int column_width = 1;
+  if (one_pass_cost != nullptr) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", bit_cost(*one_pass_cost));
+    column_width = std::max<int>(column_width, static_cast<int>(std::strlen(buf)));
+  }
+  for (const auto& state : states) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", bit_cost(state.current_cost));
+    column_width = std::max<int>(column_width, static_cast<int>(std::strlen(buf)));
+  }
+
+  fprintf(stderr, "PLANNER: [all-k] %-12s", "cost(bits)");
+  if (one_pass_cost != nullptr) {
+    fprintf(stderr, " 1=%*.2f", column_width, bit_cost(*one_pass_cost));
+  }
+  for (const auto& state : states) {
+    fprintf(stderr, " %*.2f", column_width, bit_cost(state.current_cost));
+  }
+  fprintf(stderr, "\n");
+  fflush(stderr);
+}
+
+FixedPointCost ClusteredHistogramProxyCost(const PassAssignmentCtx& ctx) {
+  HistogramParams params;
+  params.clustering = HistogramParams::ClusteringType::kBest;
+
+  std::vector<std::array<uint32_t, kACTokenCount>> token_counts(ctx.czdc_size);
+  const auto& dense_to_symbol = ctx.d.ACHistogram().dense_to_zdcvalue;
+
+  FixedPointCost unclustered_token_cost = 0;
+  FixedPointCost clustered_token_cost = 0;
+  std::vector<Histogram> histograms;
+  std::vector<Histogram> clustered;
+  std::vector<uint32_t> histogram_symbols;
+  for (uint32_t pass = 0; pass < ctx.num_passes; ++pass) {
+    histograms.clear();
+    histograms.reserve(ctx.czdc_size + kJPEGNonZeroBuckets);
+    std::fill(token_counts.begin(), token_counts.end(),
+              std::array<uint32_t, kACTokenCount>{});
+    for (uint32_t compact_id = 0; compact_id < ctx.M; ++compact_id) {
+      const uint32_t freq =
+          ctx.hist_h[static_cast<size_t>(compact_id) * ctx.num_passes + pass];
+      if (freq == 0) continue;
+      const uint16_t czdc = ctx.active.compact_to_czdc[compact_id];
+      const SignallingHistSymbol sym = ctx.d.SignallingHistSymbolFromSymbol(
+          dense_to_symbol[ctx.active.active_bins[compact_id]]);
+      token_counts[czdc][sym.token] += freq;
+    }
+
+    for (uint32_t czdc = 0; czdc < ctx.czdc_size; ++czdc) {
+      uint32_t max_token = 0;
+      size_t total = 0;
+      for (uint32_t token = 0; token < kACTokenCount; ++token) {
+        if (token_counts[czdc][token] == 0) continue;
+        max_token = token;
+        total += token_counts[czdc][token];
+      }
+      if (total == 0) continue;
+
+      Histogram h(max_token + 1);
+      h.total_count = total;
+      for (uint32_t token = 0; token <= max_token; ++token) {
+        h.counts[token] = static_cast<ANSHistBin>(token_counts[czdc][token]);
+      }
+      unclustered_token_cost +=
+          static_cast<FixedPointCost>(h.ShannonEntropy() * kFScale);
+      histograms.push_back(std::move(h));
+    }
+
+    for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+      const uint32_t total = ctx.nz_hist_N[static_cast<size_t>(pass) *
+                                               kJPEGNonZeroBuckets +
+                                           pb];
+      if (total == 0) continue;
+
+      uint32_t max_nz = 0;
+      const size_t base =
+          static_cast<size_t>(pass) * kNZHistogramsSize + pb * kJPEGNonZeroRange;
+      for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+        if (ctx.nz_hist_h[base + nz] != 0) max_nz = nz;
+      }
+      Histogram h(max_nz + 1);
+      h.total_count = total;
+      for (uint32_t nz = 0; nz <= max_nz; ++nz) {
+        h.counts[nz] = static_cast<ANSHistBin>(ctx.nz_hist_h[base + nz]);
+      }
+      unclustered_token_cost +=
+          static_cast<FixedPointCost>(h.ShannonEntropy() * kFScale);
+      histograms.push_back(std::move(h));
+    }
+
+    if (histograms.empty()) continue;
+
+    clustered.clear();
+    histogram_symbols.clear();
+    if (!ClusterHistograms(params, histograms, kClustersLimit, &clustered,
+                           &histogram_symbols)) {
+      JXL_WARNING("ClusterHistograms failed in AssignPassesGreedyAllK proxy");
+      return ctx.TotalCost();
+    }
+
+    for (const auto& h : clustered) {
+      clustered_token_cost +=
+          static_cast<FixedPointCost>(h.ShannonEntropy() * kFScale);
+      StatusOr<FixedPointCost> header_cost = HistogramHeaderCost(h);
+      if (!header_cost.ok()) {
+        JXL_WARNING("HistogramHeaderCost failed in AssignPassesGreedyAllK proxy");
+        return ctx.TotalCost();
+      }
+      clustered_token_cost += std::move(header_cost).value_();
+    }
+    if (clustered.size() > 1) {
+      const double ctx_map_bits =
+          static_cast<double>(histograms.size()) *
+          std::log2(static_cast<double>(clustered.size()));
+      clustered_token_cost += static_cast<FixedPointCost>(ctx_map_bits * kFScale);
+    }
+  }
+
+  const FixedPointCost penalty =
+      std::max<FixedPointCost>(0, clustered_token_cost - unclustered_token_cost);
+  return ctx.TotalCost() + penalty;
+}
+
+std::vector<FixedPointCost> ComputeClusteredProxyCosts(
+    std::vector<MultiKState>* states, ThreadPool* pool) {
+  std::vector<FixedPointCost> costs(states->size(), 0);
+  auto run_one_k = [&](size_t ki) {
+    costs[ki] = ClusteredHistogramProxyCost((*states)[ki].ctx);
+  };
+  if (pool != nullptr && states->size() > 1) {
+    (void)RunOnPool(
+        pool, 0, static_cast<uint32_t>(states->size()), ThreadPool::NoInit,
+        [&](uint32_t ki, size_t /*thread*/) -> Status {
+          run_one_k(ki);
+          return true;
+        },
+        "AssignPassesGreedyAllKClusteredCost");
+  } else {
+    for (size_t ki = 0; ki < states->size(); ++ki) {
+      run_one_k(ki);
+    }
+  }
+  return costs;
+}
+
+void PrintClusteredCostRow(const std::vector<MultiKState>& states,
+                           const FixedPointCost* one_pass_cost,
+                           const std::vector<FixedPointCost>& clustered_costs) {
+  int column_width = 1;
+  if (one_pass_cost != nullptr) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", bit_cost(*one_pass_cost));
+    column_width =
+        std::max<int>(column_width, static_cast<int>(std::strlen(buf)));
+  }
+  for (FixedPointCost cost : clustered_costs) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", bit_cost(cost));
+    column_width =
+        std::max<int>(column_width, static_cast<int>(std::strlen(buf)));
+  }
+
+  fprintf(stderr, "PLANNER: [all-k] %-12s", "cluster(bits)");
+  if (one_pass_cost != nullptr) {
+    fprintf(stderr, " 1=%*.2f", column_width, bit_cost(*one_pass_cost));
+  }
+  for (FixedPointCost cost : clustered_costs) {
+    fprintf(stderr, " %*.2f", column_width, bit_cost(cost));
   }
   fprintf(stderr, "\n");
   fflush(stderr);
@@ -345,6 +528,19 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
     for (uint32_t c = 0; c < kNumCh; ++c) {
       result.pass_assignment[c].assign(d.num_blocks[c], 0);
     }
+  }
+  bool have_one_pass_cost = false;
+  FixedPointCost one_pass_cost = 0;
+  bool have_one_pass_clustered_cost = false;
+  FixedPointCost one_pass_clustered_cost = 0;
+  if (min_num_passes <= 1 && 1 <= max_num_passes) {
+    PassAssignmentCtx one_pass_ctx(d, active, 1);
+    one_pass_ctx.InitPassAssignmentSimple();
+    one_pass_ctx.InitNZPredictorState();
+    one_pass_cost = one_pass_ctx.TotalCost();
+    one_pass_clustered_cost = ClusteredHistogramProxyCost(one_pass_ctx);
+    have_one_pass_cost = true;
+    have_one_pass_clustered_cost = true;
   }
 
   std::vector<MultiKState> states;
@@ -553,6 +749,11 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
         CostDropPercent(states[i].initial_cost, states[i].current_cost);
   }
   PrintMoveTableRow("total", states, total_drop_pct, kPctColumnWidth);
+  PrintFinalCostRow(states, have_one_pass_cost ? &one_pass_cost : nullptr);
+  PrintClusteredCostRow(
+      states,
+      have_one_pass_clustered_cost ? &one_pass_clustered_cost : nullptr,
+      ComputeClusteredProxyCosts(&states, pool));
 
   out.shared_timings.total_ns = ElapsedNanos(start_total, PlannerClock::now());
   for (MultiKState& state : states) {
