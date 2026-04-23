@@ -84,6 +84,20 @@ struct SoftCostResult {
   uint32_t num_cp_slots = 0;
 };
 
+// Analytic gradient of the soft AC cost with respect to the optimizable
+// parameters. Shapes mirror `GradientJointState`: `thresholds[axis]` has the
+// same length as `state.thresholds[axis]`, and `pass_logits[c]` has length
+// `num_blocks[c] * num_passes`.
+struct GradientJointGrad {
+  std::array<std::vector<double>, kNumCh> thresholds;
+  std::array<std::vector<double>, kNumCh> pass_logits;
+};
+
+// Zeros the gradient and sizes it to match `state`. Callers that accumulate
+// across blocks should call this once before the first backward pass.
+void ResetGradientJointGrad(const GradientJointState& state,
+                            GradientJointGrad* grad);
+
 // Computes soft AC cost for the given state.
 //
 // Arguments:
@@ -110,6 +124,28 @@ SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
                                  const GradientJointState& state,
                                  const ContextMap& ctx_map,
                                  uint32_t num_clusters, uint32_t num_passes);
+
+// Forward pass plus analytic backward pass. Computes the same cost as
+// `ComputeSoftACCost` and additionally accumulates the gradient of the AC cost
+// wrt `state.pass_logits` and `state.thresholds` into `*grad`. The caller must
+// call `ResetGradientJointGrad` first (or otherwise zero and size `*grad`).
+//
+// Gradient accumulates rather than overwrites, so the same `grad` buffer can
+// be reused across mini-batches if future iterations introduce them.
+//
+// The threshold-gradient formula uses the sigmoid relaxation's analytic
+// derivative: for threshold `T[a][j]` with width `tau_t`,
+//   dL/dT[a][j] += sigmoid'((T[a][j] - DC_a) / tau_t) / tau_t
+//                    * (dL/dw[a][j] - dL/dw[a][j+1])
+// summed over every block whose `DC_a` is the block's DC value on axis `a`.
+// The softmax Jacobian for the pass logits uses the standard
+//   dL/dlogit[q] = pi[q] * (dL/dpi[q] - sum_p pi[p] dL/dpi[p]) / tau_pi.
+SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
+                                         const GradientJointState& state,
+                                         const ContextMap& ctx_map,
+                                         uint32_t num_clusters,
+                                         uint32_t num_passes,
+                                         GradientJointGrad* grad);
 
 }  // namespace jxl
 
