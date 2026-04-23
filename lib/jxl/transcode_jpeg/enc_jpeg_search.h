@@ -84,6 +84,20 @@ struct JPEGCtxEffortParams {
   // assign passes on the fixed row grid, then bicluster.
   bool bicluster_threshold_first;
 
+  // --- Lane B (gradient-based joint relaxation) -----------------------------
+  // Not yet wired into any planner path. `FromSpeedTier` sets
+  // `use_gradient_joint_search=false` by default so the forward pass has no
+  // production consumers yet. See plans/lane_b_progress.md for iteration plan.
+  bool use_gradient_joint_search;
+  // High-temperature Adam steps before annealing begins.
+  uint32_t grad_hot_iters;
+  // Annealing Adam steps that drive temperatures toward zero.
+  uint32_t grad_anneal_iters;
+  // Starting temperature for sigmoid (thresholds) and softmax (pass / proto).
+  double grad_init_temperature;
+  // Adam learning rate.
+  double grad_lr;
+
   static JPEGCtxEffortParams FromSpeedTier(SpeedTier speed_tier) {
     switch (speed_tier) {
       // case SpeedTier::kSquirrel:
@@ -103,7 +117,12 @@ struct JPEGCtxEffortParams {
                 /*bicluster_row_budget=*/kMaxClusters,
                 /*optimize_passes_num=*/-1,
                 /*bicluster_refine_thresholds=*/false,
-                /*bicluster_threshold_first=*/false};
+                /*bicluster_threshold_first=*/false,
+                /*use_gradient_joint_search=*/false,
+                /*grad_hot_iters=*/0,
+                /*grad_anneal_iters=*/0,
+                /*grad_init_temperature=*/1.0,
+                /*grad_lr=*/0.01};
       case SpeedTier::kTortoise:
         // `kRawAI` is marginally slower here but did not give better results.
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kToken420,
@@ -121,7 +140,12 @@ struct JPEGCtxEffortParams {
                 /*bicluster_row_budget=*/kMaxClusters,
                 /*optimize_passes_num=*/-1,
                 /*bicluster_refine_thresholds=*/false,
-                /*bicluster_threshold_first=*/true};
+                /*bicluster_threshold_first=*/true,
+                /*use_gradient_joint_search=*/false,
+                /*grad_hot_iters=*/0,
+                /*grad_anneal_iters=*/0,
+                /*grad_init_temperature=*/1.0,
+                /*grad_lr=*/0.01};
       case SpeedTier::kGlacier:
       case SpeedTier::kTectonicPlate:
       default:
@@ -143,7 +167,12 @@ struct JPEGCtxEffortParams {
                 /*bicluster_row_budget=*/kMaxClusters,
                 /*optimize_passes_num=*/-1,
                 /*bicluster_refine_thresholds=*/false,
-                /*bicluster_threshold_first=*/false};
+                /*bicluster_threshold_first=*/false,
+                /*use_gradient_joint_search=*/false,
+                /*grad_hot_iters=*/0,
+                /*grad_anneal_iters=*/0,
+                /*grad_init_temperature=*/1.0,
+                /*grad_lr=*/0.01};
     }
   }
 };

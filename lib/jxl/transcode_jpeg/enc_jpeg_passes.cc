@@ -86,20 +86,16 @@ PassAssignment MakeZeroPassAssignment(const JPEGOptData& d) {
 }
 
 StatusOr<PassAssignment> BuildRowClusterPassSeed(const JPEGOptData& d,
-                                                 const ThresholdSet& thresholds,
                                                  const FixedRows& fixed_rows,
                                                  uint32_t num_rows,
+                                                 const RowSliceHistograms& rows,
                                                  uint32_t num_passes) {
   PassAssignment seed_assignment = MakeZeroPassAssignment(d);
   if (num_passes <= 1) return seed_assignment;
 
-  const NZBlockCache nz_cache = BuildNZBlockCache(d, seed_assignment, 1);
-  JXL_ASSIGN_OR_RETURN(RowSliceState seed_state,
-                       BuildRowSliceState(d, thresholds, seed_assignment, 1,
-                                          nz_cache));
   JXL_ASSIGN_OR_RETURN(
       ClusterResult cluster_result,
-      ClusterRowsBiclustered(d, seed_state.rows,
+      ClusterRowsBiclustered(d, rows,
                              std::max<uint32_t>(
                                  1, std::min<uint32_t>(
                                         num_passes,
@@ -113,6 +109,20 @@ StatusOr<PassAssignment> BuildRowClusterPassSeed(const JPEGOptData& d,
     }
   }
   return seed_assignment;
+}
+
+StatusOr<PassAssignment> BuildRowClusterPassSeed(const JPEGOptData& d,
+                                                 const ThresholdSet& thresholds,
+                                                 const FixedRows& fixed_rows,
+                                                 uint32_t num_rows,
+                                                 uint32_t num_passes) {
+  PassAssignment zero_assignment = MakeZeroPassAssignment(d);
+  const NZBlockCache zero_nz_cache = BuildNZBlockCache(d, zero_assignment, 1);
+  JXL_ASSIGN_OR_RETURN(
+      RowSliceState seed_state,
+      BuildRowSliceState(d, thresholds, zero_assignment, 1, zero_nz_cache));
+  return BuildRowClusterPassSeed(d, fixed_rows, num_rows, seed_state.rows,
+                                 num_passes);
 }
 
 // Upper bound for the number of progressive passes worth considering from
@@ -444,6 +454,395 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModelThresholdFirst(
           "PLANNER: [bicluster-threshold-first] Running joint search over %zu factorization candidates\n",
           candidates.size());
   fflush(stderr);
+
+  if (effort.bicluster_threshold_first) {
+    struct ThresholdFirstState {
+      size_t candidate_idx = 0;
+      uint32_t num_passes = 1;
+      ThresholdSet current_thresholds;
+      PassAssignment current_pass_assignment;
+      BiclusterSearchResult best_result;
+      int64_t seed_ns = 0;
+      int64_t build_stream_ns = 0;
+      int64_t assign_ns = 0;
+      int64_t rough_opt_ns = 0;
+      int64_t build_rows_ns = 0;
+      int64_t row_cluster_ns = 0;
+      int64_t eval_ns = 0;
+      bool alive = true;
+    };
+
+    BiclusterSearchResult raced_best_result;
+    raced_best_result.total_cost = std::numeric_limits<FixedPointCost>::max();
+    std::vector<ThresholdFirstState> states;
+    states.reserve(candidates.size() *
+                   (max_num_passes - min_num_passes + 1u));
+
+    for (size_t candidate_idx = 0; candidate_idx < candidates.size();
+         ++candidate_idx) {
+      const FactorizationCandidate& candidate = candidates[candidate_idx];
+      const ThresholdSet& seed_thresholds = candidate.init;
+      const uint32_t seed_num_cells = static_cast<uint32_t>(
+          (seed_thresholds.TY().size() + 1) *
+          (seed_thresholds.TCb().size() + 1) *
+          (seed_thresholds.TCr().size() + 1));
+      const FixedRows seed_fixed_rows = BuildFixedRows(d, seed_thresholds);
+      const PassAssignment zero_assignment = MakeZeroPassAssignment(d);
+      const NZBlockCache zero_nz_cache =
+          BuildNZBlockCache(d, zero_assignment, 1);
+      JXL_ASSIGN_OR_RETURN(
+          RowSliceState seed_state,
+          BuildRowSliceState(d, seed_thresholds, zero_assignment, 1,
+                             zero_nz_cache));
+      for (uint32_t num_passes = min_num_passes; num_passes <= max_num_passes;
+           ++num_passes) {
+        ThresholdFirstState state;
+        state.candidate_idx = candidate_idx;
+        state.num_passes = num_passes;
+        state.current_thresholds = seed_thresholds;
+        auto start_seed = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            state.current_pass_assignment,
+            BuildRowClusterPassSeed(d, seed_fixed_rows,
+                                    d.channels * seed_num_cells,
+                                    seed_state.rows, num_passes));
+        auto end_seed = PlannerClock::now();
+        state.seed_ns += ElapsedNanos(start_seed, end_seed);
+        state.best_result.total_cost =
+            std::numeric_limits<FixedPointCost>::max();
+        states.push_back(std::move(state));
+      }
+    }
+
+    for (uint32_t outer = 0; outer < outer_iters; ++outer) {
+      std::vector<size_t> active_indices;
+      active_indices.reserve(states.size());
+      for (size_t i = 0; i < states.size(); ++i) {
+        if (states[i].alive) active_indices.push_back(i);
+      }
+      if (active_indices.empty()) break;
+
+      fprintf(stderr,
+              "PLANNER: [bicluster-threshold-first] Racing round %u/%u on %zu states\n",
+              outer + 1, outer_iters, active_indices.size());
+      fflush(stderr);
+
+      for (size_t state_idx : active_indices) {
+        ThresholdFirstState& state = states[state_idx];
+        PartitioningCtx ctx(opt_data);
+
+        auto start_build_stream = PlannerClock::now();
+        std::vector<uint32_t> pass_offsets;
+        JXL_ASSIGN_OR_RETURN(
+            std::vector<ACEntry> pass_stream,
+            BuildPassStream(d, active, state.current_pass_assignment,
+                            state.num_passes, &pass_offsets, pool));
+        auto end_build_stream = PlannerClock::now();
+        state.build_stream_ns +=
+            ElapsedNanos(start_build_stream, end_build_stream);
+
+        auto start_rough_opt = PlannerClock::now();
+        FixedPointCost rough_unclustered_cost = 0;
+        ThresholdSet rough_thresholds = ctx.OptimizeThresholds(
+            state.current_thresholds, pass_stream, effort.main_m_target,
+            main_iters_per_outer, &rough_unclustered_cost);
+        auto end_rough_opt = PlannerClock::now();
+        state.rough_opt_ns += ElapsedNanos(start_rough_opt, end_rough_opt);
+
+        const uint32_t rough_num_cells = static_cast<uint32_t>(
+            (rough_thresholds.TY().size() + 1) *
+            (rough_thresholds.TCb().size() + 1) *
+            (rough_thresholds.TCr().size() + 1));
+        const FixedRows rough_fixed_rows = BuildFixedRows(d, rough_thresholds);
+
+        AssignPassesResult reassign_result = AssignPassesGreedyFixedRows(
+            d, rough_fixed_rows, d.channels * rough_num_cells,
+            state.num_passes, &state.current_pass_assignment, pool);
+        state.assign_ns += reassign_result.timings.total_ns;
+        state.current_pass_assignment =
+            std::move(reassign_result.pass_assignment);
+
+        const NZBlockCache nz_cache =
+            BuildNZBlockCache(d, state.current_pass_assignment,
+                              state.num_passes);
+
+        auto start_build_rows = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            RowSliceState rough_state,
+            BuildRowSliceState(d, rough_thresholds, state.current_pass_assignment,
+                               state.num_passes, nz_cache));
+        auto end_build_rows = PlannerClock::now();
+        state.build_rows_ns += ElapsedNanos(start_build_rows, end_build_rows);
+
+        auto start_row_cluster = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            ClusterResult rough_cluster_result,
+            ClusterRowsBiclustered(d, rough_state.rows,
+                                   std::min(target_clusters,
+                                            effort.bicluster_row_budget)));
+        auto end_row_cluster = PlannerClock::now();
+        state.row_cluster_ns += ElapsedNanos(start_row_cluster,
+                                             end_row_cluster);
+
+        std::vector<uint32_t> rough_num_prototypes;
+        auto start_eval = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            ModelEvaluation rough_eval,
+            EvaluateBiclusterState(
+                d, rough_thresholds, rough_cluster_result.ctx_map,
+                rough_cluster_result.num_clusters,
+                state.current_pass_assignment, state.num_passes,
+                effort.bicluster_proto_budget_per_pass, rough_state.rows,
+                &rough_num_prototypes,
+                std::min(raced_best_result.total_cost,
+                         state.best_result.total_cost)));
+        auto end_eval = PlannerClock::now();
+        state.eval_ns += ElapsedNanos(start_eval, end_eval);
+
+        PrunedCtxMapResult pruned_rough = PruneDeadThresholdsFromCtxMap(
+            rough_thresholds, rough_cluster_result.ctx_map, d.channels);
+        ThresholdSet output_thresholds = rough_thresholds;
+        ClusterResult output_cluster_result = rough_cluster_result;
+        if (pruned_rough.thresholds.T != rough_thresholds.T) {
+          output_thresholds = std::move(pruned_rough.thresholds);
+          output_cluster_result.ctx_map = std::move(pruned_rough.ctx_map);
+        }
+
+        state.current_thresholds = output_thresholds;
+        if (rough_eval.total_cost() < state.best_result.total_cost) {
+          state.best_result.thresholds = output_thresholds;
+          state.best_result.ctx_map = output_cluster_result.ctx_map;
+          state.best_result.pass_assignment = state.current_pass_assignment;
+          state.best_result.num_passes = state.num_passes;
+          state.best_result.num_cells = static_cast<uint32_t>(
+              (output_thresholds.TY().size() + 1) *
+              (output_thresholds.TCb().size() + 1) *
+              (output_thresholds.TCr().size() + 1));
+          state.best_result.num_row_clusters =
+              output_cluster_result.num_clusters;
+          state.best_result.num_prototypes_per_pass = rough_num_prototypes;
+          state.best_result.total_num_prototypes = 0;
+          for (uint32_t n : rough_num_prototypes) {
+            state.best_result.total_num_prototypes += n;
+          }
+          state.best_result.ac_cost =
+              rough_eval.corrected_entropy_cost >= 0
+                  ? rough_eval.corrected_entropy_cost
+                  : rough_eval.ac_cost;
+          state.best_result.nz_cost = rough_eval.nz_cost;
+          state.best_result.signalling_overhead =
+              rough_eval.signalling_overhead;
+          state.best_result.total_cost = rough_eval.total_cost();
+          if (state.best_result.total_cost < raced_best_result.total_cost) {
+            raced_best_result = state.best_result;
+          }
+        }
+      }
+
+      std::vector<size_t> ranked_active;
+      ranked_active.reserve(states.size());
+      for (size_t i = 0; i < states.size(); ++i) {
+        if (states[i].alive &&
+            states[i].best_result.total_cost !=
+                std::numeric_limits<FixedPointCost>::max()) {
+          ranked_active.push_back(i);
+        }
+      }
+      if (ranked_active.empty()) break;
+
+      std::sort(
+          ranked_active.begin(), ranked_active.end(),
+          [&](size_t lhs_idx, size_t rhs_idx) {
+            const ThresholdFirstState& lhs = states[lhs_idx];
+            const ThresholdFirstState& rhs = states[rhs_idx];
+            if (lhs.best_result.total_cost != rhs.best_result.total_cost) {
+              return lhs.best_result.total_cost < rhs.best_result.total_cost;
+            }
+            if (lhs.candidate_idx != rhs.candidate_idx) {
+              return lhs.candidate_idx < rhs.candidate_idx;
+            }
+            return lhs.num_passes < rhs.num_passes;
+          });
+
+      fprintf(stderr,
+              "PLANNER: [bicluster-threshold-first] Best cost after round %u/%u = %.2f bits\n",
+              outer + 1, outer_iters, bit_cost(raced_best_result.total_cost));
+      fflush(stderr);
+
+      if (outer + 1 == outer_iters || ranked_active.size() <= 1) continue;
+
+      const size_t keep_target =
+          std::max<size_t>(4, (ranked_active.size() + 3) / 4);
+      std::vector<uint8_t> keep(states.size(), 0);
+      for (size_t i = 0; i < std::min(keep_target, ranked_active.size());
+           ++i) {
+        keep[ranked_active[i]] = 1;
+      }
+      for (uint32_t num_passes = min_num_passes; num_passes <= max_num_passes;
+           ++num_passes) {
+        for (size_t idx : ranked_active) {
+          if (states[idx].num_passes == num_passes) {
+            keep[idx] = 1;
+            break;
+          }
+        }
+      }
+
+      size_t kept_count = 0;
+      for (size_t i = 0; i < states.size(); ++i) {
+        if (!states[i].alive) continue;
+        states[i].alive = keep[i] != 0;
+        kept_count += static_cast<size_t>(states[i].alive);
+      }
+      fprintf(stderr,
+              "PLANNER: [bicluster-threshold-first] Racing kept %zu/%zu states for the next round\n",
+              kept_count, ranked_active.size());
+      fflush(stderr);
+    }
+
+    if (effort.bicluster_refine_thresholds) {
+      for (ThresholdFirstState& state : states) {
+        if (!state.alive ||
+            state.best_result.total_cost ==
+                std::numeric_limits<FixedPointCost>::max()) {
+          continue;
+        }
+
+        PartitioningCtx ctx(opt_data);
+        auto start_build_stream = PlannerClock::now();
+        std::vector<uint32_t> pass_offsets;
+        JXL_ASSIGN_OR_RETURN(
+            std::vector<ACEntry> pass_stream,
+            BuildPassStream(d, active, state.best_result.pass_assignment,
+                            state.num_passes, &pass_offsets, pool));
+        auto end_build_stream = PlannerClock::now();
+        state.build_stream_ns +=
+            ElapsedNanos(start_build_stream, end_build_stream);
+
+        auto start_rough_opt = PlannerClock::now();
+        ThresholdSet refined_thresholds = RefinePassAwareThresholds(
+            ctx, state.best_result.thresholds, pass_stream, effort);
+        auto end_rough_opt = PlannerClock::now();
+        state.rough_opt_ns += ElapsedNanos(start_rough_opt, end_rough_opt);
+
+        const uint32_t refined_num_cells = static_cast<uint32_t>(
+            (refined_thresholds.TY().size() + 1) *
+            (refined_thresholds.TCb().size() + 1) *
+            (refined_thresholds.TCr().size() + 1));
+        const FixedRows refined_fixed_rows =
+            BuildFixedRows(d, refined_thresholds);
+
+        AssignPassesResult refined_assign_result = AssignPassesGreedyFixedRows(
+            d, refined_fixed_rows, d.channels * refined_num_cells,
+            state.num_passes, &state.best_result.pass_assignment, pool);
+        state.assign_ns += refined_assign_result.timings.total_ns;
+        const PassAssignment& refined_pass_assignment =
+            refined_assign_result.pass_assignment;
+        const NZBlockCache refined_nz_cache =
+            BuildNZBlockCache(d, refined_pass_assignment, state.num_passes);
+
+        auto start_build_rows = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            RowSliceState refined_state,
+            BuildRowSliceState(d, refined_thresholds, refined_pass_assignment,
+                               state.num_passes, refined_nz_cache));
+        auto end_build_rows = PlannerClock::now();
+        state.build_rows_ns += ElapsedNanos(start_build_rows, end_build_rows);
+
+        auto start_row_cluster = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            ClusterResult refined_cluster_result,
+            ClusterRowsBiclustered(d, refined_state.rows,
+                                   std::min(target_clusters,
+                                            effort.bicluster_row_budget)));
+        auto end_row_cluster = PlannerClock::now();
+        state.row_cluster_ns += ElapsedNanos(start_row_cluster,
+                                             end_row_cluster);
+
+        std::vector<uint32_t> refined_num_prototypes;
+        auto start_eval = PlannerClock::now();
+        JXL_ASSIGN_OR_RETURN(
+            ModelEvaluation refined_eval,
+            EvaluateBiclusterState(
+                d, refined_thresholds, refined_cluster_result.ctx_map,
+                refined_cluster_result.num_clusters, refined_pass_assignment,
+                state.num_passes, effort.bicluster_proto_budget_per_pass,
+                refined_state.rows, &refined_num_prototypes,
+                std::min(raced_best_result.total_cost,
+                         state.best_result.total_cost)));
+        auto end_eval = PlannerClock::now();
+        state.eval_ns += ElapsedNanos(start_eval, end_eval);
+
+        PrunedCtxMapResult pruned_refined = PruneDeadThresholdsFromCtxMap(
+            refined_thresholds, refined_cluster_result.ctx_map, d.channels);
+        ThresholdSet output_thresholds = refined_thresholds;
+        ClusterResult output_cluster_result = refined_cluster_result;
+        if (pruned_refined.thresholds.T != refined_thresholds.T) {
+          output_thresholds = std::move(pruned_refined.thresholds);
+          output_cluster_result.ctx_map = std::move(pruned_refined.ctx_map);
+        }
+
+        if (refined_eval.total_cost() < state.best_result.total_cost) {
+          state.best_result.thresholds = output_thresholds;
+          state.best_result.ctx_map = output_cluster_result.ctx_map;
+          state.best_result.pass_assignment =
+              refined_assign_result.pass_assignment;
+          state.best_result.num_passes = state.num_passes;
+          state.best_result.num_cells = static_cast<uint32_t>(
+              (output_thresholds.TY().size() + 1) *
+              (output_thresholds.TCb().size() + 1) *
+              (output_thresholds.TCr().size() + 1));
+          state.best_result.num_row_clusters =
+              output_cluster_result.num_clusters;
+          state.best_result.num_prototypes_per_pass =
+              refined_num_prototypes;
+          state.best_result.total_num_prototypes = 0;
+          for (uint32_t n : refined_num_prototypes) {
+            state.best_result.total_num_prototypes += n;
+          }
+          state.best_result.ac_cost =
+              refined_eval.corrected_entropy_cost >= 0
+                  ? refined_eval.corrected_entropy_cost
+                  : refined_eval.ac_cost;
+          state.best_result.nz_cost = refined_eval.nz_cost;
+          state.best_result.signalling_overhead =
+              refined_eval.signalling_overhead;
+          state.best_result.total_cost = refined_eval.total_cost();
+          if (state.best_result.total_cost < raced_best_result.total_cost) {
+            raced_best_result = state.best_result;
+          }
+        }
+      }
+    }
+
+    for (size_t i = 0; i < states.size(); ++i) {
+      const ThresholdFirstState& state = states[i];
+      if (state.best_result.total_cost ==
+          std::numeric_limits<FixedPointCost>::max()) {
+        continue;
+      }
+      fprintf(stderr,
+              "PLANNER: [bicluster-threshold-first] Candidate %zu/%zu stages for %u passes: seed=%.2f ms build_stream=%.2f ms assign=%.2f ms rough_opt=%.2f ms build_rows=%.2f ms row_cluster=%.2f ms eval=%.2f ms%s\n",
+              state.candidate_idx + 1, candidates.size(), state.num_passes,
+              NanosToMs(state.seed_ns), NanosToMs(state.build_stream_ns),
+              NanosToMs(state.assign_ns), NanosToMs(state.rough_opt_ns),
+              NanosToMs(state.build_rows_ns), NanosToMs(state.row_cluster_ns),
+              NanosToMs(state.eval_ns), state.alive ? "" : " [pruned]");
+      fprintf(stderr,
+              "PLANNER: [bicluster-threshold-first] Candidate %zu/%zu best cost for %u passes = %.2f bits%s\n",
+              state.candidate_idx + 1, candidates.size(), state.num_passes,
+              bit_cost(state.best_result.total_cost),
+              state.alive ? "" : " [pruned]");
+    }
+    fflush(stderr);
+
+    if (raced_best_result.total_cost ==
+        std::numeric_limits<FixedPointCost>::max()) {
+      return JXL_FAILURE(
+          "Threshold-first biclustered search did not produce a result");
+    }
+    return raced_best_result;
+  }
 
   BiclusterSearchResult best_result;
   best_result.total_cost = std::numeric_limits<FixedPointCost>::max();
