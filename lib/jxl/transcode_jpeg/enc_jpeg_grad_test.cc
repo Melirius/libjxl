@@ -417,5 +417,165 @@ TEST(JpegGradTest, FullAnnealingReducesCostAndRoundsSanely) {
   }
 }
 
+// Hard-limit test for the total-cost path. At tiny temperatures the soft
+// forward should match `hard.ac_cost + hard.nz_cost + hard.signalling_overhead`
+// from `SearchPassAwareContextModel`, modulo floating-point accumulation.
+TEST(JpegGradTest, TotalCostHardLimitAgreesWithPassAwareModel) {
+  JPEGCtxEffortParams effort =
+      JPEGCtxEffortParams::FromSpeedTier(SpeedTier::kKitten);
+  effort.keep_top_k = 1;
+  effort.main_m_target = 16;
+  effort.main_iters = 1;
+  effort.refine_iters = 0;
+
+  std::shared_ptr<JPEGOptData> opt_data =
+      BuildOptDataFromFixture(effort.ac_hist_model);
+  ASSERT_NE(opt_data, nullptr);
+
+  JXL_TEST_ASSIGN_OR_DIE(
+      std::vector<FactorizationCandidate> candidates,
+      RankAndTrimFactorizations(opt_data, effort, nullptr));
+  ASSERT_FALSE(candidates.empty());
+  candidates.resize(1);
+
+  JXL_TEST_ASSIGN_OR_DIE(PassSearchResult hard,
+                         SearchPassAwareContextModel(opt_data, candidates,
+                                                     effort, nullptr));
+  ASSERT_GT(hard.ac_cost + hard.nz_cost, 0);
+
+  constexpr double kHardLogit = 40.0;
+  constexpr double kTinyTemp = 1e-6;
+  GradientJointState state = InitGradientJointStateFromHard(
+      *opt_data, hard, kHardLogit, kTinyTemp, kTinyTemp);
+
+  SoftCostResult soft = ComputeSoftTotalCost(*opt_data, state, hard.ctx_map,
+                                             hard.num_clusters,
+                                             hard.num_passes);
+  ASSERT_GT(soft.num_cp_slots, 0u);
+
+  const FixedPointCost hard_ac_nz = hard.ac_cost + hard.nz_cost;
+  const FixedPointCost soft_ac_nz = static_cast<FixedPointCost>(std::llround(
+      (soft.ac_cost_bits + soft.nz_cost_bits) * static_cast<double>(kFScale)));
+  const double rel_floor = 1e-9 * std::abs(static_cast<double>(hard_ac_nz));
+  const double tol =
+      std::max<double>(static_cast<double>(soft.num_cp_slots) * 32.0,
+                       rel_floor) +
+      1.0;
+  EXPECT_NEAR(static_cast<double>(soft_ac_nz),
+              static_cast<double>(hard_ac_nz), tol)
+      << "hard.ac+nz=" << hard_ac_nz << " soft.ac+nz=" << soft_ac_nz;
+
+  // Signalling overhead: rounded histograms produce nearly the same header
+  // cost as the hard evaluator. Allow 1 % relative + a small floor, since the
+  // rounding-to-int step in the soft pipeline can introduce a handful of bits
+  // difference per slot.
+  const double hard_overhead =
+      static_cast<double>(hard.signalling_overhead) /
+      static_cast<double>(kFScale);
+  EXPECT_NEAR(soft.signalling_overhead_bits, hard_overhead,
+              0.01 * std::abs(hard_overhead) +
+                  static_cast<double>(soft.num_cp_slots) * 2.0);
+}
+
+// Finite-difference check on the total-cost gradient. AC + NZ entropy terms
+// carry gradient; signalling overhead is treated as constant and does not. To
+// keep the FD signal distinguishable, we check gradient on both pass logits
+// (which NZ + AC both touch) and thresholds (AC only — thresholds don't affect
+// NZ histograms since pb is integer-rounded).
+TEST(JpegGradTest, TotalCostAnalyticGradientMatchesFiniteDifference) {
+  JPEGCtxEffortParams effort =
+      JPEGCtxEffortParams::FromSpeedTier(SpeedTier::kKitten);
+  effort.keep_top_k = 1;
+  effort.main_m_target = 16;
+  effort.main_iters = 1;
+  effort.refine_iters = 0;
+
+  std::shared_ptr<JPEGOptData> opt_data =
+      BuildOptDataFromFixture(effort.ac_hist_model);
+  ASSERT_NE(opt_data, nullptr);
+
+  JXL_TEST_ASSIGN_OR_DIE(
+      std::vector<FactorizationCandidate> candidates,
+      RankAndTrimFactorizations(opt_data, effort, nullptr));
+  ASSERT_FALSE(candidates.empty());
+  candidates.resize(1);
+
+  JXL_TEST_ASSIGN_OR_DIE(PassSearchResult hard,
+                         SearchPassAwareContextModel(opt_data, candidates,
+                                                     effort, nullptr));
+
+  constexpr double kHardLogit = 2.0;
+  constexpr double kPassTemp = 1.0;
+  constexpr double kThresholdTemp = 50.0;
+  GradientJointState state = InitGradientJointStateFromHard(
+      *opt_data, hard, kHardLogit, kThresholdTemp, kPassTemp);
+
+  GradientJointGrad grad;
+  ResetGradientJointGrad(state, &grad);
+  const SoftCostResult base =
+      ComputeSoftTotalCostWithGrad(*opt_data, state, hard.ctx_map,
+                                   hard.num_clusters, hard.num_passes, &grad);
+  ASSERT_GT(base.num_cp_slots, 0u);
+
+  // FD uses the ENTROPY-only subset of total cost (AC + NZ), because
+  // signalling overhead uses integer-rounded histograms whose finite-difference
+  // behaviour is piecewise-constant (every FD step lands in the same bucket
+  // rounding, then jumps). The analytic gradient excludes signalling anyway,
+  // so comparing against AC+NZ is apples-to-apples.
+  auto fd_entropy_grad = [&](double* param, double h) {
+    const double orig = *param;
+    *param = orig + h;
+    const SoftCostResult rp =
+        ComputeSoftTotalCost(*opt_data, state, hard.ctx_map, hard.num_clusters,
+                             hard.num_passes);
+    *param = orig - h;
+    const SoftCostResult rm =
+        ComputeSoftTotalCost(*opt_data, state, hard.ctx_map, hard.num_clusters,
+                             hard.num_passes);
+    *param = orig;
+    return ((rp.ac_cost_bits + rp.nz_cost_bits) -
+            (rm.ac_cost_bits + rm.nz_cost_bits)) /
+           (2.0 * h);
+  };
+
+  const double kLogitStep = 1e-4;
+  uint32_t pass_checks = 0;
+  for (uint32_t c = 0; c < opt_data->channels; ++c) {
+    const uint32_t nb = opt_data->num_blocks[c];
+    const uint32_t stride = hard.num_passes;
+    const uint32_t stop = std::min<uint32_t>(nb, 3u);
+    for (uint32_t b = 0; b < stop; ++b) {
+      for (uint32_t p = 0; p < hard.num_passes; ++p) {
+        const size_t idx = static_cast<size_t>(b) * stride + p;
+        double* param = &state.pass_logits[c][idx];
+        const double analytic = grad.pass_logits[c][idx];
+        const double numeric = fd_entropy_grad(param, kLogitStep);
+        const double tol =
+            1e-3 * (1.0 + std::abs(analytic) + std::abs(numeric)) + 1e-6;
+        EXPECT_NEAR(analytic, numeric, tol)
+            << "total pass_logits c=" << c << " b=" << b << " p=" << p;
+        ++pass_checks;
+      }
+    }
+  }
+  EXPECT_GT(pass_checks, 0u);
+
+  const double kThrStep = 0.5;
+  uint32_t thr_checks = 0;
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    for (size_t j = 0; j < state.thresholds[a].size(); ++j) {
+      double* param = &state.thresholds[a][j];
+      const double analytic = grad.thresholds[a][j];
+      const double numeric = fd_entropy_grad(param, kThrStep);
+      const double tol =
+          1e-3 * (1.0 + std::abs(analytic) + std::abs(numeric)) + 1e-4;
+      EXPECT_NEAR(analytic, numeric, tol)
+          << "total thresholds a=" << a << " j=" << j;
+      ++thr_checks;
+    }
+  }
+  EXPECT_GT(thr_checks, 0u);
+}
+
 }  // namespace
 }  // namespace jxl

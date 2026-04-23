@@ -3,12 +3,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Lane B iteration 2: soft forward and analytic backward pass for AC cost.
+// Lane B iteration 4: soft forward and analytic backward for AC + NZ cost,
+// plus signalling overhead. Builds on iterations 1-3.
 //
-// Iteration 1 established the forward pass (see plans/lane_b_progress.md).
-// Iteration 2 adds the analytic gradient wrt `pass_logits` and `thresholds`.
-// NZ cost, signalling overhead, and soft row->prototype assignment remain
-// deferred.
+// Iteration 1 established the AC forward pass.
+// Iteration 2 added the analytic gradient wrt `pass_logits` and `thresholds`.
+// Iteration 3 added the Adam optimizer, annealing, and rounding.
+// Iteration 4 (this file):
+//   - NZ entropy cost with soft neighbor pi for `predicted_nz`; pb is
+//     integer-rounded (no gradient through bucket selection) and the per-block
+//     h-contribution splits between bin_real = NZIndex(pb, nz_b) and
+//     bin_zero = NZIndex(pb, 0) with weights pi[p] and 1 - pi[p].
+//   - Signalling overhead = per-slot ANSPopulationCost - ShannonEntropy for
+//     AC and NZ histograms, plus a flat `ComputePassOverhead(d) * num_passes`.
+//     Treated as constant for gradient purposes.
 
 #include "lib/jxl/transcode_jpeg/enc_jpeg_grad.h"
 
@@ -17,10 +25,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "lib/jxl/ac_context.h"
+#include "lib/jxl/enc_ans_params.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
 
@@ -175,11 +186,120 @@ void BlockDCValues(const JPEGOptData& d, uint32_t c, uint32_t b, int out[3]) {
   out[2] = DCValueForAxis(d, c, y, x, 2);
 }
 
+enum class CostMode { kACOnly, kTotal };
+
+// Derives the integer predictor bucket `pb` from a fractional `predicted_nz`.
+// Mirrors the hard formula in `EvaluatePassAwareModel` exactly once the
+// fractional value is floored.
+inline uint32_t PredictorBucketFromPredictedNZ(double predicted_nz) {
+  int nz_int = static_cast<int>(std::floor(predicted_nz));
+  if (nz_int < 0) nz_int = 0;
+  uint32_t pb = (nz_int < 8) ? static_cast<uint32_t>(nz_int)
+                             : (4u + static_cast<uint32_t>(nz_int) / 2u);
+  if (pb >= kJPEGNonZeroBuckets) pb = kJPEGNonZeroBuckets - 1;
+  return pb;
+}
+
+// Flat per-pass overhead constant; duplicated from `ComputePassOverhead` in
+// enc_jpeg_pass_cluster.cc to avoid a circular include. Units: bits (not
+// fixed-point). Matches the legacy scorer within a `kFScale` conversion.
+inline double FlatPassOverheadBits(const JPEGOptData& d) {
+  const uint32_t groups_x = (d.w_max + 31) / 32;
+  const uint32_t groups_y = (d.h_max + 31) / 32;
+  const uint32_t groups = groups_x * groups_y;
+  return static_cast<double>(groups * 64u + 64000u);
+}
+
+// Computes the AC-histogram signalling overhead for one (cluster, pass) slot.
+// Buckets symbols by zdc into sub-histograms over tokens, then returns
+// `ANSPopulationCost - ShannonEntropy` per sub-histogram.
+//
+// Counts are rounded from soft `double` to integer via `std::llround`. The
+// overhead term is not differentiated — this integer projection is enough.
+double ACSignallingOverheadBitsForSlot(const JPEGOptData& d,
+                                       const std::vector<double>& ac_h) {
+  std::array<std::array<uint32_t, kACTokenCount>, kZeroDensityContextCount>
+      signalling_hist = {};
+  const auto& dense_to_symbol = d.ACHistogram().dense_to_zdcvalue;
+  const size_t dense_size = dense_to_symbol.size();
+  double overhead_bits = 0.0;
+  for (size_t idx = 0; idx < ac_h.size() && idx < dense_size; ++idx) {
+    const double v = ac_h[idx];
+    if (v <= 0.0) continue;
+    const uint32_t count =
+        static_cast<uint32_t>(std::llround(std::max<double>(v, 0.0)));
+    if (count == 0) continue;
+    const SignallingHistSymbol sym =
+        d.SignallingHistSymbolFromSymbol(dense_to_symbol[idx]);
+    signalling_hist[sym.zdc][sym.token] += count;
+  }
+  for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
+    size_t total = 0;
+    uint32_t max_token = 0;
+    for (uint32_t token = 0; token < kACTokenCount; ++token) {
+      if (signalling_hist[zdc][token] == 0) continue;
+      total += signalling_hist[zdc][token];
+      max_token = token;
+    }
+    if (total == 0) continue;
+    Histogram h(max_token + 1);
+    for (uint32_t token = 0; token <= max_token; ++token) {
+      h.counts[token] = static_cast<ANSHistBin>(signalling_hist[zdc][token]);
+    }
+    h.total_count = total;
+    auto ans_or = h.ANSPopulationCost();
+    if (!ans_or.ok()) continue;
+    const float ans_cost = std::move(ans_or).value_();
+    const float shannon = h.ShannonEntropy();
+    const float header_cost = ans_cost - shannon;
+    if (header_cost > 0.0f) overhead_bits += static_cast<double>(header_cost);
+  }
+  return overhead_bits;
+}
+
+// Signalling overhead for one NZ-histogram slot: per predictor bucket, build a
+// sub-histogram over `nz_count` and return `ANSPopulationCost - ShannonEntropy`.
+double NZSignallingOverheadBitsForSlot(const std::vector<double>& nz_h) {
+  double overhead_bits = 0.0;
+  for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+    uint32_t max_nz = 0;
+    size_t total = 0;
+    // First pass: find max symbol and total.
+    for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+      const double v = nz_h[NZHistogramIndex(pb, nz)];
+      if (v <= 0.0) continue;
+      const uint32_t count =
+          static_cast<uint32_t>(std::llround(std::max<double>(v, 0.0)));
+      if (count == 0) continue;
+      if (nz > max_nz) max_nz = nz;
+      total += count;
+    }
+    if (total == 0) continue;
+    Histogram h(max_nz + 1);
+    for (uint32_t nz = 0; nz <= max_nz; ++nz) {
+      const double v = nz_h[NZHistogramIndex(pb, nz)];
+      if (v <= 0.0) continue;
+      h.counts[nz] = static_cast<ANSHistBin>(
+          std::llround(std::max<double>(v, 0.0)));
+    }
+    h.total_count = total;
+    auto ans_or = h.ANSPopulationCost();
+    if (!ans_or.ok()) continue;
+    const float ans_cost = std::move(ans_or).value_();
+    const float shannon = h.ShannonEntropy();
+    const float header_cost = ans_cost - shannon;
+    if (header_cost > 0.0f) overhead_bits += static_cast<double>(header_cost);
+  }
+  return overhead_bits;
+}
+
 // Forward + optional backward. Shared body for both public entry points.
+// `mode` selects AC-only (iteration 2) or AC+NZ+overhead (iteration 4).
 SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
                                      const GradientJointState& state,
                                      const ContextMap& ctx_map,
                                      uint32_t num_clusters, uint32_t num_passes,
+                                     CostMode mode,
                                      GradientJointGrad* grad) {
   SoftCostResult result;
   if (num_clusters == 0 || num_passes == 0) return result;
@@ -196,14 +316,38 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   const uint32_t cp_count = num_clusters * num_passes;
   const uint32_t ac_alpha = d.ACHistogramSize();
   constexpr uint32_t kZDC = kZeroDensityContextCount;
+  constexpr uint32_t kNZBins = kNZHistogramsSize;       // 36 * 64 = 2304
+  constexpr uint32_t kNZBuckets = kJPEGNonZeroBuckets;  // 36
   const double inv_pass_t = 1.0 / state.pass_temperature;
   const double inv_thr_t = 1.0 / state.threshold_temperature;
+  const bool include_nz = (mode == CostMode::kTotal);
 
   // Forward accumulators.
   std::vector<std::vector<double>> ac_h(cp_count,
                                         std::vector<double>(ac_alpha, 0.0));
   std::vector<std::vector<double>> ac_N(cp_count,
                                         std::vector<double>(kZDC, 0.0));
+  std::vector<std::vector<double>> nz_h;
+  std::vector<std::vector<double>> nz_N;
+  if (include_nz) {
+    nz_h.assign(cp_count, std::vector<double>(kNZBins, 0.0));
+    nz_N.assign(cp_count, std::vector<double>(kNZBuckets, 0.0));
+  }
+
+  // Precompute block-pi vectors when NZ is needed (neighbor lookups).
+  std::array<std::vector<std::vector<double>>, kNumCh> pi_cache;
+  if (include_nz) {
+    for (uint32_t c = 0; c < d.channels; ++c) {
+      const uint32_t nb = d.num_blocks[c];
+      pi_cache[c].resize(nb);
+      for (uint32_t b = 0; b < nb; ++b) {
+        pi_cache[c][b].resize(num_passes);
+        Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
+                num_passes, state.pass_temperature,
+                pi_cache[c][b].data());
+      }
+    }
+  }
 
   // Per-block scratch.
   std::vector<uint32_t> h_scratch(ac_alpha, 0u);
@@ -212,14 +356,22 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   std::vector<uint32_t> N_touched;
   std::vector<double> w0, w1, w2;
   std::vector<double> cell_weight(num_cells, 0.0);
-  std::vector<double> pi(num_passes, 0.0);
+  std::vector<double> pi_local(num_passes, 0.0);
 
   // --- Forward pass ---------------------------------------------------------
   for (uint32_t c = 0; c < d.channels; ++c) {
     const uint32_t nb = d.num_blocks[c];
+    const uint32_t grid_w = d.block_grid_w[c];
     for (uint32_t b = 0; b < nb; ++b) {
-      Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
-              num_passes, state.pass_temperature, pi.data());
+      // Soft pass weights (use cache when NZ needs neighbors too).
+      const double* pi = nullptr;
+      if (include_nz) {
+        pi = pi_cache[c][b].data();
+      } else {
+        Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
+                num_passes, state.pass_temperature, pi_local.data());
+        pi = pi_local.data();
+      }
 
       int dc[3];
       BlockDCValues(d, c, b, dc);
@@ -242,6 +394,7 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           SummarizeBlockEvents(d, c, b, &h_scratch, &N_scratch, &h_touched,
                                &N_touched);
 
+      // AC accumulation.
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
         if (w_cell == 0.0) continue;
@@ -260,10 +413,62 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           }
         }
       }
+
+      // NZ accumulation (forward).
+      if (include_nz) {
+        const uint32_t y = b / grid_w;
+        const uint32_t x = b % grid_w;
+        const uint32_t nz_b = d.block_nonzeros[c][b];
+        const double* pi_top = nullptr;
+        const double* pi_left = nullptr;
+        uint32_t nz_top = 0;
+        uint32_t nz_left = 0;
+        if (y > 0) {
+          const uint32_t b_top = (y - 1) * grid_w + x;
+          pi_top = pi_cache[c][b_top].data();
+          nz_top = d.block_nonzeros[c][b_top];
+        }
+        if (x > 0) {
+          const uint32_t b_left = y * grid_w + (x - 1);
+          pi_left = pi_cache[c][b_left].data();
+          nz_left = d.block_nonzeros[c][b_left];
+        }
+        for (uint32_t cell = 0; cell < num_cells; ++cell) {
+          const double w_cell = cell_weight[cell];
+          if (w_cell == 0.0) continue;
+          const uint32_t cluster = ctx_map[c * num_cells + cell];
+          for (uint32_t p = 0; p < num_passes; ++p) {
+            const uint32_t cp = cluster * num_passes + p;
+            double pass_nz_top = (y > 0) ? pi_top[p] *
+                                                static_cast<double>(nz_top)
+                                         : 0.0;
+            double pass_nz_left = (x > 0) ? pi_left[p] *
+                                                 static_cast<double>(nz_left)
+                                          : 0.0;
+            double predicted_nz;
+            if (x == 0 && y == 0) {
+              predicted_nz = 32.0;
+            } else if (x == 0) {
+              predicted_nz = pass_nz_top;
+            } else if (y == 0) {
+              predicted_nz = pass_nz_left;
+            } else {
+              predicted_nz = (pass_nz_top + pass_nz_left + 1.0) / 2.0;
+            }
+            const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
+            const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
+            const uint32_t bin_zero = NZHistogramIndex(pb, 0);
+            const double pi_p = pi[p];
+            nz_N[cp][pb] += w_cell;
+            nz_h[cp][bin_real] += w_cell * pi_p;
+            nz_h[cp][bin_zero] += w_cell * (1.0 - pi_p);
+          }
+        }
+      }
     }
   }
 
-  // --- Cost reduction -------------------------------------------------------
+  // --- AC cost reduction ----------------------------------------------------
   double ac_cost = 0.0;
   uint32_t touched_slots = 0;
   for (uint32_t cp = 0; cp < cp_count; ++cp) {
@@ -286,6 +491,28 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   }
   result.ac_cost_bits = ac_cost;
   result.num_cp_slots = touched_slots;
+
+  // --- NZ cost + signalling overhead ---------------------------------------
+  double nz_cost = 0.0;
+  double overhead_bits = 0.0;
+  if (include_nz) {
+    for (uint32_t cp = 0; cp < cp_count; ++cp) {
+      for (uint32_t pb = 0; pb < kNZBuckets; ++pb) {
+        const double n = nz_N[cp][pb];
+        if (n > 0.0) nz_cost += SoftFTab(n);
+      }
+      for (uint32_t i = 0; i < kNZBins; ++i) {
+        const double n = nz_h[cp][i];
+        if (n > 0.0) nz_cost -= SoftFTab(n);
+      }
+      overhead_bits += ACSignallingOverheadBitsForSlot(d, ac_h[cp]);
+      overhead_bits += NZSignallingOverheadBitsForSlot(nz_h[cp]);
+    }
+    overhead_bits += FlatPassOverheadBits(d) * static_cast<double>(num_passes);
+    result.nz_cost_bits = nz_cost;
+    result.signalling_overhead_bits = overhead_bits;
+  }
+  result.total_cost_bits = ac_cost + nz_cost + overhead_bits;
 
   if (grad == nullptr) return result;
 
@@ -312,11 +539,34 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   std::vector<double> dL_dpi(num_passes, 0.0);
   std::vector<std::vector<double>> dL_dw_ax(3);
 
+  // NZ upstream gradients (only needed when include_nz).
+  std::vector<std::vector<double>> dL_dnz_N;
+  std::vector<std::vector<double>> dL_dnz_h;
+  if (include_nz) {
+    dL_dnz_N.assign(cp_count, std::vector<double>(kNZBuckets, 0.0));
+    dL_dnz_h.assign(cp_count, std::vector<double>(kNZBins, 0.0));
+    for (uint32_t cp = 0; cp < cp_count; ++cp) {
+      for (uint32_t pb = 0; pb < kNZBuckets; ++pb) {
+        dL_dnz_N[cp][pb] = SoftFTabPrime(nz_N[cp][pb]);
+      }
+      for (uint32_t i = 0; i < kNZBins; ++i) {
+        dL_dnz_h[cp][i] = -SoftFTabPrime(nz_h[cp][i]);
+      }
+    }
+  }
+
   for (uint32_t c = 0; c < d.channels; ++c) {
     const uint32_t nb = d.num_blocks[c];
+    const uint32_t grid_w = d.block_grid_w[c];
     for (uint32_t b = 0; b < nb; ++b) {
-      Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
-              num_passes, state.pass_temperature, pi.data());
+      const double* pi = nullptr;
+      if (include_nz) {
+        pi = pi_cache[c][b].data();
+      } else {
+        Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
+                num_passes, state.pass_temperature, pi_local.data());
+        pi = pi_local.data();
+      }
 
       int dc[3];
       BlockDCValues(d, c, b, dc);
@@ -343,7 +593,7 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       std::fill(dL_dcell.begin(), dL_dcell.end(), 0.0);
       std::fill(dL_dpi.begin(), dL_dpi.end(), 0.0);
 
-      // Accumulate dL/dpi[p] and dL/dcell[cell] from (cell, pass) events.
+      // AC contribution: dL/dpi[p] and dL/dcell[cell] from (cell, pass) events.
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
         const uint32_t cluster = ctx_map[c * num_cells + cell];
@@ -360,6 +610,62 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           }
           dL_dpi[p] += w_cell * delta;
           dL_dcell[cell] += pi[p] * delta;
+        }
+      }
+
+      // NZ contribution: pb is held constant (no gradient flows through
+      // predicted_nz); dL/dpi[p] picks up the h_real/h_zero split, dL/dcell
+      // picks up both h weighted by pi / (1-pi) and the N term.
+      if (include_nz) {
+        const uint32_t y = b / grid_w;
+        const uint32_t x = b % grid_w;
+        const uint32_t nz_b = d.block_nonzeros[c][b];
+        const double* pi_top = nullptr;
+        const double* pi_left = nullptr;
+        uint32_t nz_top = 0;
+        uint32_t nz_left = 0;
+        if (y > 0) {
+          const uint32_t b_top = (y - 1) * grid_w + x;
+          pi_top = pi_cache[c][b_top].data();
+          nz_top = d.block_nonzeros[c][b_top];
+        }
+        if (x > 0) {
+          const uint32_t b_left = y * grid_w + (x - 1);
+          pi_left = pi_cache[c][b_left].data();
+          nz_left = d.block_nonzeros[c][b_left];
+        }
+        for (uint32_t cell = 0; cell < num_cells; ++cell) {
+          const double w_cell = cell_weight[cell];
+          if (w_cell == 0.0) continue;
+          const uint32_t cluster = ctx_map[c * num_cells + cell];
+          for (uint32_t p = 0; p < num_passes; ++p) {
+            const uint32_t cp = cluster * num_passes + p;
+            double pass_nz_top = (y > 0) ? pi_top[p] *
+                                                static_cast<double>(nz_top)
+                                         : 0.0;
+            double pass_nz_left = (x > 0) ? pi_left[p] *
+                                                 static_cast<double>(nz_left)
+                                          : 0.0;
+            double predicted_nz;
+            if (x == 0 && y == 0) {
+              predicted_nz = 32.0;
+            } else if (x == 0) {
+              predicted_nz = pass_nz_top;
+            } else if (y == 0) {
+              predicted_nz = pass_nz_left;
+            } else {
+              predicted_nz = (pass_nz_top + pass_nz_left + 1.0) / 2.0;
+            }
+            const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
+            const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
+            const uint32_t bin_zero = NZHistogramIndex(pb, 0);
+            const double h_real_g = dL_dnz_h[cp][bin_real];
+            const double h_zero_g = dL_dnz_h[cp][bin_zero];
+            const double N_g = dL_dnz_N[cp][pb];
+            dL_dpi[p] += w_cell * (h_real_g - h_zero_g);
+            dL_dcell[cell] +=
+                pi[p] * h_real_g + (1.0 - pi[p]) * h_zero_g + N_g;
+          }
         }
       }
 
@@ -453,7 +759,7 @@ SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
                                  const ContextMap& ctx_map,
                                  uint32_t num_clusters, uint32_t num_passes) {
   return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
-                               nullptr);
+                               CostMode::kACOnly, nullptr);
 }
 
 SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
@@ -463,7 +769,26 @@ SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
                                          uint32_t num_passes,
                                          GradientJointGrad* grad) {
   return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
-                               grad);
+                               CostMode::kACOnly, grad);
+}
+
+SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,
+                                    const GradientJointState& state,
+                                    const ContextMap& ctx_map,
+                                    uint32_t num_clusters,
+                                    uint32_t num_passes) {
+  return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
+                               CostMode::kTotal, nullptr);
+}
+
+SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
+                                            const GradientJointState& state,
+                                            const ContextMap& ctx_map,
+                                            uint32_t num_clusters,
+                                            uint32_t num_passes,
+                                            GradientJointGrad* grad) {
+  return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
+                               CostMode::kTotal, grad);
 }
 
 // --- Iteration 3: Adam optimizer, annealing schedule, optimize loop ---------
@@ -571,21 +896,23 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
 
   // Initial cost: compute with the initial temperatures as configured by the
   // caller on `state`. Do not apply the schedule's step 0 yet — caller may be
-  // using different temperatures to measure init cost.
+  // using different temperatures to measure init cost. Iteration 4 switched
+  // this to total cost (AC + NZ + signalling overhead + flat pass overhead)
+  // so Adam optimizes what the real encoder pays for.
   {
-    const SoftCostResult r = ComputeSoftACCost(d, *state, ctx_map,
-                                               num_clusters, num_passes);
-    result.init_cost_bits = r.ac_cost_bits;
+    const SoftCostResult r = ComputeSoftTotalCost(d, *state, ctx_map,
+                                                  num_clusters, num_passes);
+    result.init_cost_bits = r.total_cost_bits;
   }
 
   for (uint32_t t = 0; t < total_iters; ++t) {
     ApplyAnnealing(schedule, t, state);
     ResetGradientJointGrad(*state, &grad);
-    const SoftCostResult r = ComputeSoftACCostWithGrad(
+    const SoftCostResult r = ComputeSoftTotalCostWithGrad(
         d, *state, ctx_map, num_clusters, num_passes, &grad);
     AdamStep(grad, adam_cfg, &adam, state);
     ProjectThresholdsMonotonic(state);
-    result.final_cost_bits = r.ac_cost_bits;
+    result.final_cost_bits = r.total_cost_bits;
     ++result.iters_taken;
   }
   return result;

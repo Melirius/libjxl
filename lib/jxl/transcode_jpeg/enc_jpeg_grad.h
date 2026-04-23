@@ -79,6 +79,18 @@ struct SoftCostResult {
   // Multiply by `kFScale` and round to compare against `FixedPointCost`.
   double ac_cost_bits = 0.0;
 
+  // NZ entropy cost (iteration 4). Zero when computed via
+  // `ComputeSoftACCost` / `ComputeSoftACCostWithGrad`.
+  double nz_cost_bits = 0.0;
+
+  // Signalling overhead estimate: per-slot ANS-population-minus-Shannon plus a
+  // flat per-pass overhead. Treated as constant for gradient purposes. Zero
+  // when computed via `ComputeSoftACCost` / `ComputeSoftACCostWithGrad`.
+  double signalling_overhead_bits = 0.0;
+
+  // Sum of the three components. For AC-only entries, equals `ac_cost_bits`.
+  double total_cost_bits = 0.0;
+
   // Number of (cluster, pass) slots visited; zero-total slots are skipped in
   // the cost sum to match `EvaluatePassAwareModel`.
   uint32_t num_cp_slots = 0;
@@ -146,6 +158,48 @@ SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
                                          uint32_t num_clusters,
                                          uint32_t num_passes,
                                          GradientJointGrad* grad);
+
+// --- Iteration 4: NZ cost + signalling overhead + total cost ---------------
+
+// Computes soft total cost: AC entropy + NZ entropy + signalling overhead +
+// flat pass overhead. Mirrors `EvaluatePassAwareModel` fully (except for the
+// pass-stream-based AC path, which this implementation replaces by walking
+// `block_bins`). Returns all three components plus the sum.
+//
+// NZ forward:
+//   For each block at (c, b):
+//     predicted_nz is computed from the soft pass probabilities of the top
+//     and left neighbors (pass_nz_* = pi_{neighbor, p} * nz_neighbor, summed
+//     per the same position-dependent rule as `EvaluatePassAwareModel`), then
+//     rounded to integer; pb is derived from the integer predicted_nz exactly
+//     as in the hard code.
+//     Per cell, per pass p, the block contributes soft weight `gamma * 1` to
+//     `nz_hist_N[cp][pb]`, and splits between `bin_real = NZIndex(pb, nz_b)`
+//     and `bin_zero = NZIndex(pb, 0)` with weights `gamma * pi_{b,p}` and
+//     `gamma * (1 - pi_{b,p})` respectively.
+//
+// Signalling overhead:
+//   Rounded to integer counts per slot and fed to `SignalOverheadFromHist` /
+//   `SignalOverheadFromNZHist`-equivalent formulas. Added to the total plus a
+//   flat per-pass `ComputePassOverhead(d) * num_passes` constant.
+SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,
+                                    const GradientJointState& state,
+                                    const ContextMap& ctx_map,
+                                    uint32_t num_clusters,
+                                    uint32_t num_passes);
+
+// Total cost with analytic gradient. Gradient flows through the AC term
+// (iteration 2) and the NZ entropy term (block's own pi for the h split,
+// block's cell weight for both h and N). The `predicted_nz` derivation and
+// the pb bucket selection are treated as non-differentiable; likewise the
+// signalling overhead term. The optimizer still benefits from reducing AC + NZ
+// cost; signalling changes come along for the ride through rounding.
+SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
+                                            const GradientJointState& state,
+                                            const ContextMap& ctx_map,
+                                            uint32_t num_clusters,
+                                            uint32_t num_passes,
+                                            GradientJointGrad* grad);
 
 // --- Iteration 3: Adam optimizer, annealing schedule, optimize loop ---------
 
