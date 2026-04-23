@@ -293,15 +293,17 @@ double NZSignallingOverheadBitsForSlot(const std::vector<double>& nz_h) {
   return overhead_bits;
 }
 
-// Forward + optional backward. Shared body for both public entry points.
+// Forward + optional backward. Shared body for all public entry points.
 // `mode` selects AC-only (iteration 2) or AC+NZ+overhead (iteration 4).
+// Iteration 5 moved `ctx_map` and `num_clusters` into `state` and added soft
+// cluster membership via `state.cluster_logits`.
 SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
                                      const GradientJointState& state,
-                                     const ContextMap& ctx_map,
-                                     uint32_t num_clusters, uint32_t num_passes,
                                      CostMode mode,
                                      GradientJointGrad* grad) {
   SoftCostResult result;
+  const uint32_t num_passes = state.num_passes;
+  const uint32_t num_clusters = state.num_clusters;
   if (num_clusters == 0 || num_passes == 0) return result;
 
   const std::array<uint32_t, 3> n_axis = {
@@ -309,8 +311,12 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       static_cast<uint32_t>(state.thresholds[1].size()) + 1,
       static_cast<uint32_t>(state.thresholds[2].size()) + 1};
   const uint32_t num_cells = n_axis[0] * n_axis[1] * n_axis[2];
-  if (ctx_map.size() != static_cast<size_t>(d.channels) * num_cells) {
-    return result;  // Caller precondition failure; return zero cost.
+  if (state.num_cells != num_cells) return result;  // state inconsistent.
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    if (state.cluster_logits[c].size() !=
+        static_cast<size_t>(num_cells) * num_clusters) {
+      return result;  // cluster_logits not sized to match state.
+    }
   }
 
   const uint32_t cp_count = num_clusters * num_passes;
@@ -320,6 +326,7 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   constexpr uint32_t kNZBuckets = kJPEGNonZeroBuckets;  // 36
   const double inv_pass_t = 1.0 / state.pass_temperature;
   const double inv_thr_t = 1.0 / state.threshold_temperature;
+  const double inv_cluster_t = 1.0 / state.cluster_temperature;
   const bool include_nz = (mode == CostMode::kTotal);
 
   // Forward accumulators.
@@ -346,6 +353,21 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
                 num_passes, state.pass_temperature,
                 pi_cache[c][b].data());
       }
+    }
+  }
+
+  // Precompute per-(channel, cell) cluster-softmax `rho`. Iteration 5 softens
+  // the old `cluster = ctx_map[c*num_cells + cell]` lookup into a distribution
+  // over clusters: `rho_{c,cell,k} = softmax(cluster_logits[c][cell*K..],
+  // cluster_temperature)[k]`.
+  std::array<std::vector<double>, kNumCh> rho_cache;
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    rho_cache[c].assign(
+        static_cast<size_t>(num_cells) * num_clusters, 0.0);
+    for (uint32_t cell = 0; cell < num_cells; ++cell) {
+      Softmax(&state.cluster_logits[c][static_cast<size_t>(cell) * num_clusters],
+              num_clusters, state.cluster_temperature,
+              &rho_cache[c][static_cast<size_t>(cell) * num_clusters]);
     }
   }
 
@@ -394,22 +416,27 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           SummarizeBlockEvents(d, c, b, &h_scratch, &N_scratch, &h_touched,
                                &N_touched);
 
-      // AC accumulation.
+      // AC accumulation (iteration 5: soft cluster via `rho`).
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
         if (w_cell == 0.0) continue;
-        const uint32_t cluster = ctx_map[c * num_cells + cell];
+        const double* rho_cell =
+            &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
         for (uint32_t p = 0; p < num_passes; ++p) {
-          const double w = w_cell * pi[p];
-          if (w == 0.0) continue;
-          const uint32_t cp = cluster * num_passes + p;
-          std::vector<double>& h_row = ac_h[cp];
-          std::vector<double>& N_row = ac_N[cp];
-          for (const auto& entry : summary.h_entries) {
-            h_row[entry.first] += w * static_cast<double>(entry.second);
-          }
-          for (const auto& entry : summary.N_entries) {
-            N_row[entry.first] += w * static_cast<double>(entry.second);
+          const double w_cp_factor = w_cell * pi[p];
+          if (w_cp_factor == 0.0) continue;
+          for (uint32_t k = 0; k < num_clusters; ++k) {
+            const double w = w_cp_factor * rho_cell[k];
+            if (w == 0.0) continue;
+            const uint32_t cp = k * num_passes + p;
+            std::vector<double>& h_row = ac_h[cp];
+            std::vector<double>& N_row = ac_N[cp];
+            for (const auto& entry : summary.h_entries) {
+              h_row[entry.first] += w * static_cast<double>(entry.second);
+            }
+            for (const auto& entry : summary.N_entries) {
+              N_row[entry.first] += w * static_cast<double>(entry.second);
+            }
           }
         }
       }
@@ -436,9 +463,9 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         for (uint32_t cell = 0; cell < num_cells; ++cell) {
           const double w_cell = cell_weight[cell];
           if (w_cell == 0.0) continue;
-          const uint32_t cluster = ctx_map[c * num_cells + cell];
+          const double* rho_cell =
+              &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
           for (uint32_t p = 0; p < num_passes; ++p) {
-            const uint32_t cp = cluster * num_passes + p;
             double pass_nz_top = (y > 0) ? pi_top[p] *
                                                 static_cast<double>(nz_top)
                                          : 0.0;
@@ -459,9 +486,14 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
             const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
             const uint32_t bin_zero = NZHistogramIndex(pb, 0);
             const double pi_p = pi[p];
-            nz_N[cp][pb] += w_cell;
-            nz_h[cp][bin_real] += w_cell * pi_p;
-            nz_h[cp][bin_zero] += w_cell * (1.0 - pi_p);
+            for (uint32_t k = 0; k < num_clusters; ++k) {
+              const double weight = w_cell * rho_cell[k];
+              if (weight == 0.0) continue;
+              const uint32_t cp = k * num_passes + p;
+              nz_N[cp][pb] += weight;
+              nz_h[cp][bin_real] += weight * pi_p;
+              nz_h[cp][bin_zero] += weight * (1.0 - pi_p);
+            }
           }
         }
       }
@@ -539,6 +571,14 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   std::vector<double> dL_dpi(num_passes, 0.0);
   std::vector<std::vector<double>> dL_dw_ax(3);
 
+  // Channel-wide accumulator for `dL/drho[c][cell * K + k]`. Accumulates
+  // contributions from every block in channel `c`; converted to
+  // `dL/dcluster_logits[c]` via the softmax Jacobian after the block loop.
+  std::array<std::vector<double>, kNumCh> dL_drho;
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    dL_drho[c].assign(static_cast<size_t>(num_cells) * num_clusters, 0.0);
+  }
+
   // NZ upstream gradients (only needed when include_nz).
   std::vector<std::vector<double>> dL_dnz_N;
   std::vector<std::vector<double>> dL_dnz_h;
@@ -593,23 +633,40 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       std::fill(dL_dcell.begin(), dL_dcell.end(), 0.0);
       std::fill(dL_dpi.begin(), dL_dpi.end(), 0.0);
 
-      // AC contribution: dL/dpi[p] and dL/dcell[cell] from (cell, pass) events.
+      // AC contribution (iteration 5 soft cluster): sum over (cell, pass, k)
+      // tuples. For this block,
+      //   h contribution at (cp, bin) = gamma[cell] * pi[p] * rho[k] * count
+      // so partials at (cell, p, k) split as
+      //   dL/dgamma  += pi * rho * delta_ac
+      //   dL/dpi     += gamma * rho * delta_ac
+      //   dL/drho[k] += gamma * pi * delta_ac
+      // where delta_ac = sum_events count * dL/dh[cp][bin] +
+      //                  sum_events count * dL/dN[cp][zdc].
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
-        const uint32_t cluster = ctx_map[c * num_cells + cell];
+        const double* rho_cell =
+            &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
+        double* dL_drho_cell =
+            &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
         for (uint32_t p = 0; p < num_passes; ++p) {
-          const uint32_t cp = cluster * num_passes + p;
-          double delta = 0.0;
-          const std::vector<double>& h_row = dL_dh[cp];
-          const std::vector<double>& N_row = dL_dN[cp];
-          for (const auto& entry : summary.h_entries) {
-            delta += static_cast<double>(entry.second) * h_row[entry.first];
+          for (uint32_t k = 0; k < num_clusters; ++k) {
+            const uint32_t cp = k * num_passes + p;
+            double delta = 0.0;
+            const std::vector<double>& h_row = dL_dh[cp];
+            const std::vector<double>& N_row = dL_dN[cp];
+            for (const auto& entry : summary.h_entries) {
+              delta +=
+                  static_cast<double>(entry.second) * h_row[entry.first];
+            }
+            for (const auto& entry : summary.N_entries) {
+              delta +=
+                  static_cast<double>(entry.second) * N_row[entry.first];
+            }
+            const double rho_k = rho_cell[k];
+            dL_dpi[p] += w_cell * rho_k * delta;
+            dL_dcell[cell] += pi[p] * rho_k * delta;
+            dL_drho_cell[k] += w_cell * pi[p] * delta;
           }
-          for (const auto& entry : summary.N_entries) {
-            delta += static_cast<double>(entry.second) * N_row[entry.first];
-          }
-          dL_dpi[p] += w_cell * delta;
-          dL_dcell[cell] += pi[p] * delta;
         }
       }
 
@@ -637,9 +694,11 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         for (uint32_t cell = 0; cell < num_cells; ++cell) {
           const double w_cell = cell_weight[cell];
           if (w_cell == 0.0) continue;
-          const uint32_t cluster = ctx_map[c * num_cells + cell];
+          const double* rho_cell =
+              &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
+          double* dL_drho_cell =
+              &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
           for (uint32_t p = 0; p < num_passes; ++p) {
-            const uint32_t cp = cluster * num_passes + p;
             double pass_nz_top = (y > 0) ? pi_top[p] *
                                                 static_cast<double>(nz_top)
                                          : 0.0;
@@ -659,12 +718,20 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
             const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
             const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
             const uint32_t bin_zero = NZHistogramIndex(pb, 0);
-            const double h_real_g = dL_dnz_h[cp][bin_real];
-            const double h_zero_g = dL_dnz_h[cp][bin_zero];
-            const double N_g = dL_dnz_N[cp][pb];
-            dL_dpi[p] += w_cell * (h_real_g - h_zero_g);
-            dL_dcell[cell] +=
-                pi[p] * h_real_g + (1.0 - pi[p]) * h_zero_g + N_g;
+            const double pi_p = pi[p];
+            for (uint32_t k = 0; k < num_clusters; ++k) {
+              const uint32_t cp = k * num_passes + p;
+              const double h_real_g = dL_dnz_h[cp][bin_real];
+              const double h_zero_g = dL_dnz_h[cp][bin_zero];
+              const double N_g = dL_dnz_N[cp][pb];
+              // Common factor T = pi*h_real + (1-pi)*h_zero + N.
+              const double T =
+                  pi_p * h_real_g + (1.0 - pi_p) * h_zero_g + N_g;
+              const double rho_k = rho_cell[k];
+              dL_dpi[p] += w_cell * rho_k * (h_real_g - h_zero_g);
+              dL_dcell[cell] += rho_k * T;
+              dL_drho_cell[k] += w_cell * T;
+            }
           }
         }
       }
@@ -713,6 +780,27 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
     }
   }
 
+  // Softmax Jacobian for cluster logits: per (c, cell), convert
+  // `dL/drho[c][cell*K + k]` into `dL/dcluster_logits[c][cell*K + k]` via
+  //   dL/dlogit[m] = rho[m] * (dL/drho[m] - sum_k rho[k] * dL/drho[k])
+  //                  / cluster_temperature.
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    for (uint32_t cell = 0; cell < num_cells; ++cell) {
+      const size_t base = static_cast<size_t>(cell) * num_clusters;
+      const double* rho_cell = &rho_cache[c][base];
+      const double* dL_drho_cell = &dL_drho[c][base];
+      double s = 0.0;
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        s += rho_cell[k] * dL_drho_cell[k];
+      }
+      double* grad_cluster = &grad->cluster_logits[c][base];
+      for (uint32_t m = 0; m < num_clusters; ++m) {
+        grad_cluster[m] +=
+            inv_cluster_t * rho_cell[m] * (dL_drho_cell[m] - s);
+      }
+    }
+  }
+
   return result;
 }
 
@@ -720,16 +808,22 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
 
 GradientJointState InitGradientJointStateFromHard(
     const JPEGOptData& d, const PassSearchResult& hard, double hard_logit,
-    double threshold_temperature, double pass_temperature) {
+    double threshold_temperature, double pass_temperature,
+    double cluster_temperature) {
   GradientJointState state;
   state.num_passes = hard.num_passes;
+  state.num_clusters = hard.num_clusters;
   state.threshold_temperature = threshold_temperature;
   state.pass_temperature = pass_temperature;
+  state.cluster_temperature = cluster_temperature;
 
   for (uint32_t axis = 0; axis < kNumCh; ++axis) {
     const Thresholds& T = hard.thresholds.T[axis];
     state.thresholds[axis].assign(T.begin(), T.end());
   }
+  state.num_cells = static_cast<uint32_t>(
+      (state.thresholds[0].size() + 1) * (state.thresholds[1].size() + 1) *
+      (state.thresholds[2].size() + 1));
 
   const uint32_t P = hard.num_passes;
   for (uint32_t c = 0; c < kNumCh; ++c) {
@@ -743,6 +837,28 @@ GradientJointState InitGradientJointStateFromHard(
       }
     }
   }
+
+  // Cluster logits: one softmax vector per (channel, cell). Sized only for
+  // active channels. Assigned cluster from `hard.ctx_map` is set to
+  // +hard_logit, others to -hard_logit.
+  const uint32_t K = hard.num_clusters;
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    if (c >= d.channels) {
+      state.cluster_logits[c].clear();
+      continue;
+    }
+    state.cluster_logits[c].assign(
+        static_cast<size_t>(state.num_cells) * K, -hard_logit);
+    for (uint32_t cell = 0; cell < state.num_cells; ++cell) {
+      const size_t idx = c * static_cast<size_t>(state.num_cells) + cell;
+      if (idx >= hard.ctx_map.size()) continue;
+      const uint8_t assigned = hard.ctx_map[idx];
+      if (assigned < K) {
+        state.cluster_logits[c][static_cast<size_t>(cell) * K + assigned] =
+            hard_logit;
+      }
+    }
+  }
   return state;
 }
 
@@ -751,44 +867,30 @@ void ResetGradientJointGrad(const GradientJointState& state,
   for (uint32_t a = 0; a < kNumCh; ++a) {
     grad->thresholds[a].assign(state.thresholds[a].size(), 0.0);
     grad->pass_logits[a].assign(state.pass_logits[a].size(), 0.0);
+    grad->cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
   }
 }
 
 SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
-                                 const GradientJointState& state,
-                                 const ContextMap& ctx_map,
-                                 uint32_t num_clusters, uint32_t num_passes) {
-  return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
-                               CostMode::kACOnly, nullptr);
+                                 const GradientJointState& state) {
+  return ComputeSoftACCostImpl(d, state, CostMode::kACOnly, nullptr);
 }
 
 SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
                                          const GradientJointState& state,
-                                         const ContextMap& ctx_map,
-                                         uint32_t num_clusters,
-                                         uint32_t num_passes,
                                          GradientJointGrad* grad) {
-  return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
-                               CostMode::kACOnly, grad);
+  return ComputeSoftACCostImpl(d, state, CostMode::kACOnly, grad);
 }
 
 SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,
-                                    const GradientJointState& state,
-                                    const ContextMap& ctx_map,
-                                    uint32_t num_clusters,
-                                    uint32_t num_passes) {
-  return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
-                               CostMode::kTotal, nullptr);
+                                    const GradientJointState& state) {
+  return ComputeSoftACCostImpl(d, state, CostMode::kTotal, nullptr);
 }
 
 SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
                                             const GradientJointState& state,
-                                            const ContextMap& ctx_map,
-                                            uint32_t num_clusters,
-                                            uint32_t num_passes,
                                             GradientJointGrad* grad) {
-  return ComputeSoftACCostImpl(d, state, ctx_map, num_clusters, num_passes,
-                               CostMode::kTotal, grad);
+  return ComputeSoftACCostImpl(d, state, CostMode::kTotal, grad);
 }
 
 // --- Iteration 3: Adam optimizer, annealing schedule, optimize loop ---------
@@ -799,6 +901,8 @@ void InitAdamState(const GradientJointState& state, AdamState* adam) {
     adam->v_thresholds[a].assign(state.thresholds[a].size(), 0.0);
     adam->m_logits[a].assign(state.pass_logits[a].size(), 0.0);
     adam->v_logits[a].assign(state.pass_logits[a].size(), 0.0);
+    adam->m_cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
+    adam->v_cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
   }
   adam->step = 0;
 }
@@ -832,6 +936,11 @@ void AdamStep(const GradientJointGrad& grad, const AdamConfig& cfg,
                 &state->pass_logits[a][i], &adam->m_logits[a][i],
                 &adam->v_logits[a][i]);
     }
+    for (size_t i = 0; i < state->cluster_logits[a].size(); ++i) {
+      AdamApply(grad.cluster_logits[a][i], cfg, adam->step,
+                &state->cluster_logits[a][i], &adam->m_cluster_logits[a][i],
+                &adam->v_cluster_logits[a][i]);
+    }
   }
 }
 
@@ -840,12 +949,14 @@ void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
   if (step_index < schedule.hot_iters || schedule.anneal_iters == 0) {
     state->pass_temperature = schedule.pass_init;
     state->threshold_temperature = schedule.threshold_init;
+    state->cluster_temperature = schedule.cluster_init;
     return;
   }
   const uint32_t anneal_step = step_index - schedule.hot_iters;
   if (anneal_step >= schedule.anneal_iters) {
     state->pass_temperature = schedule.pass_final;
     state->threshold_temperature = schedule.threshold_final;
+    state->cluster_temperature = schedule.cluster_final;
     return;
   }
   const double t = static_cast<double>(anneal_step) /
@@ -857,8 +968,12 @@ void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
   const double log_thr =
       (1.0 - t) * std::log(schedule.threshold_init) +
       t * std::log(schedule.threshold_final);
+  const double log_clu =
+      (1.0 - t) * std::log(schedule.cluster_init) +
+      t * std::log(schedule.cluster_final);
   state->pass_temperature = std::exp(log_pass);
   state->threshold_temperature = std::exp(log_thr);
+  state->cluster_temperature = std::exp(log_clu);
 }
 
 void ProjectThresholdsMonotonic(GradientJointState* state, double epsilon) {
@@ -872,19 +987,15 @@ void ProjectThresholdsMonotonic(GradientJointState* state, double epsilon) {
 }
 
 OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
-                                     const ContextMap& ctx_map,
-                                     uint32_t num_clusters,
-                                     uint32_t num_passes,
                                      const AdamConfig& adam_cfg,
                                      const AnnealSchedule& schedule,
                                      GradientJointState* state) {
   OptimizeResult result;
   const uint32_t total_iters = schedule.hot_iters + schedule.anneal_iters;
   if (total_iters == 0) {
-    const SoftCostResult r = ComputeSoftACCost(d, *state, ctx_map,
-                                               num_clusters, num_passes);
-    result.init_cost_bits = r.ac_cost_bits;
-    result.final_cost_bits = r.ac_cost_bits;
+    const SoftCostResult r = ComputeSoftTotalCost(d, *state);
+    result.init_cost_bits = r.total_cost_bits;
+    result.final_cost_bits = r.total_cost_bits;
     return result;
   }
 
@@ -894,22 +1005,16 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
   GradientJointGrad grad;
   ResetGradientJointGrad(*state, &grad);
 
-  // Initial cost: compute with the initial temperatures as configured by the
-  // caller on `state`. Do not apply the schedule's step 0 yet — caller may be
-  // using different temperatures to measure init cost. Iteration 4 switched
-  // this to total cost (AC + NZ + signalling overhead + flat pass overhead)
-  // so Adam optimizes what the real encoder pays for.
+  // Initial cost at caller-configured temperatures (schedule not applied yet).
   {
-    const SoftCostResult r = ComputeSoftTotalCost(d, *state, ctx_map,
-                                                  num_clusters, num_passes);
+    const SoftCostResult r = ComputeSoftTotalCost(d, *state);
     result.init_cost_bits = r.total_cost_bits;
   }
 
   for (uint32_t t = 0; t < total_iters; ++t) {
     ApplyAnnealing(schedule, t, state);
     ResetGradientJointGrad(*state, &grad);
-    const SoftCostResult r = ComputeSoftTotalCostWithGrad(
-        d, *state, ctx_map, num_clusters, num_passes, &grad);
+    const SoftCostResult r = ComputeSoftTotalCostWithGrad(d, *state, &grad);
     AdamStep(grad, adam_cfg, &adam, state);
     ProjectThresholdsMonotonic(state);
     result.final_cost_bits = r.total_cost_bits;
@@ -919,14 +1024,36 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
 }
 
 PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
-                                       const GradientJointState& state,
-                                       const ContextMap& ctx_map,
-                                       uint32_t num_clusters,
-                                       uint32_t num_passes) {
+                                       const GradientJointState& state) {
   PassSearchResult r;
+  const uint32_t num_passes = state.num_passes;
+  const uint32_t num_clusters = state.num_clusters;
+  const uint32_t num_cells = state.num_cells;
   r.num_passes = num_passes;
   r.num_clusters = num_clusters;
-  r.ctx_map = ctx_map;
+
+  // ctx_map = argmax over cluster logits per (channel, cell).
+  r.ctx_map.assign(static_cast<size_t>(d.channels) * num_cells, 0);
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    const auto& logits = state.cluster_logits[c];
+    if (logits.size() !=
+        static_cast<size_t>(num_cells) * num_clusters) {
+      continue;
+    }
+    for (uint32_t cell = 0; cell < num_cells; ++cell) {
+      const double* base =
+          &logits[static_cast<size_t>(cell) * num_clusters];
+      uint32_t best = 0;
+      double best_v = base[0];
+      for (uint32_t k = 1; k < num_clusters; ++k) {
+        if (base[k] > best_v) {
+          best_v = base[k];
+          best = k;
+        }
+      }
+      r.ctx_map[c * num_cells + cell] = static_cast<uint8_t>(best);
+    }
+  }
 
   // Round thresholds to int16_t and enforce strict monotonicity.
   constexpr int16_t kMinDC = -1024;

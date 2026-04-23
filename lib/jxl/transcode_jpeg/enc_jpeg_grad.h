@@ -61,18 +61,41 @@ struct GradientJointState {
   // softmax collapses to one-hot argmax.
   double pass_temperature = 1.0;
 
+  // Cluster logits `[channel][cell * num_clusters + cluster]` (iteration 5).
+  // Softmax over the cluster axis per `(channel, cell)` gives soft cluster
+  // membership `rho_{c,cell,k}`. Sizes: `cluster_logits[c]` has length
+  // `num_cells * num_clusters` when `c < d.channels`, else empty.
+  std::array<std::vector<double>, kNumCh> cluster_logits;
+
+  // Softmax temperature for cluster assignment. As `cluster_temperature -> 0+`,
+  // `rho` collapses to one-hot argmax, matching the old hard `ctx_map`.
+  double cluster_temperature = 1.0;
+
   uint32_t num_passes = 1;
+
+  // Number of active clusters in the context map. Iteration 5 stores this in
+  // state so the cost functions no longer need a separate `num_clusters` arg.
+  uint32_t num_clusters = 1;
+
+  // Number of cells per channel. Iteration 5 stores this in state so the cost
+  // functions no longer need a separate `ctx_map` arg; the cell count is
+  // needed to decode `cluster_logits[c]` indexing. Equal to
+  // `(thresholds[0].size() + 1) * (thresholds[1].size() + 1) *
+  //  (thresholds[2].size() + 1)`.
+  uint32_t num_cells = 1;
 };
 
 // Initializes `GradientJointState` from a hard `PassSearchResult`. Thresholds
-// are cast to `double`. Pass logits are set to `+hard_logit` for the assigned
-// pass and `-hard_logit` elsewhere; `hard_logit` should be large enough that
-// softmax at `pass_temperature = 1` is numerically indistinguishable from
-// one-hot. `threshold_temperature` and `pass_temperature` are set to the
+// are cast to `double`. Pass logits are `+hard_logit` for the assigned pass,
+// `-hard_logit` elsewhere. Cluster logits are `+hard_logit` for the cluster
+// selected by `hard.ctx_map`, `-hard_logit` elsewhere. `hard_logit` should be
+// large enough that softmax at `temperature = 1` is numerically
+// indistinguishable from one-hot. All three temperatures are set to the
 // provided values (callers use a tiny value for hard-limit correctness tests).
 GradientJointState InitGradientJointStateFromHard(
     const JPEGOptData& d, const PassSearchResult& hard, double hard_logit,
-    double threshold_temperature, double pass_temperature);
+    double threshold_temperature, double pass_temperature,
+    double cluster_temperature);
 
 struct SoftCostResult {
   // AC entropy cost under the soft aggregation. Units: bits (not fixed-point).
@@ -96,13 +119,12 @@ struct SoftCostResult {
   uint32_t num_cp_slots = 0;
 };
 
-// Analytic gradient of the soft AC cost with respect to the optimizable
-// parameters. Shapes mirror `GradientJointState`: `thresholds[axis]` has the
-// same length as `state.thresholds[axis]`, and `pass_logits[c]` has length
-// `num_blocks[c] * num_passes`.
+// Analytic gradient of the soft cost with respect to the optimizable
+// parameters. Shapes mirror `GradientJointState`.
 struct GradientJointGrad {
   std::array<std::vector<double>, kNumCh> thresholds;
   std::array<std::vector<double>, kNumCh> pass_logits;
+  std::array<std::vector<double>, kNumCh> cluster_logits;
 };
 
 // Zeros the gradient and sizes it to match `state`. Callers that accumulate
@@ -110,53 +132,33 @@ struct GradientJointGrad {
 void ResetGradientJointGrad(const GradientJointState& state,
                             GradientJointGrad* grad);
 
-// Computes soft AC cost for the given state.
-//
-// Arguments:
-//   d          — opt data, provides per-block AC events and DC indices.
-//   state      — continuous variables; `thresholds` and `pass_logits` are read.
-//   ctx_map    — fixed hard clustering, layout `channel * num_cells + cell`.
-//   num_clusters — number of active clusters (upper bound on `ctx_map` values).
-//   num_passes — number of passes; must equal `state.num_passes`.
+// Computes soft AC cost for the given state. Cluster information comes from
+// `state.cluster_logits` / `state.num_clusters`; iteration 5 removed the
+// separate `ctx_map` / `num_clusters` parameters.
 //
 // The formula mirrors `EvaluatePassAwareModel`:
 //   ac_cost = sum over (cluster, pass) cp of
 //             [sum_zdc ftab(N_cp_zdc) - sum_hist_bin ftab(h_cp_hist_bin)]
-// where the soft count at (cp, zdc) is
-//   N_cp_zdc = sum over events in blocks of the block
-//                (event count at that zdc)
-//              * pi_{b, pass(cp)}
-//              * [sum over cells mapped to cluster(cp): gamma_{b, cell}]
-// and similarly for h_cp_hist_bin.
+// where the soft count at (cp, zdc) aggregates block-level contributions
+// weighted by three soft memberships:
+//   gamma_{b, cell} = cell membership via threshold sigmoids
+//   pi_{b, p}       = pass softmax per block
+//   rho_{c, cell, k} = cluster softmax per (channel, cell)
 //
 // `ftab` is evaluated on fractional counts via the continuous extension
 // `n * log2(n)`; at integer `n` this matches the precomputed `ftab` table up to
 // a half-ULP fixed-point rounding.
 SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
-                                 const GradientJointState& state,
-                                 const ContextMap& ctx_map,
-                                 uint32_t num_clusters, uint32_t num_passes);
+                                 const GradientJointState& state);
 
-// Forward pass plus analytic backward pass. Computes the same cost as
-// `ComputeSoftACCost` and additionally accumulates the gradient of the AC cost
-// wrt `state.pass_logits` and `state.thresholds` into `*grad`. The caller must
-// call `ResetGradientJointGrad` first (or otherwise zero and size `*grad`).
-//
-// Gradient accumulates rather than overwrites, so the same `grad` buffer can
-// be reused across mini-batches if future iterations introduce them.
-//
-// The threshold-gradient formula uses the sigmoid relaxation's analytic
-// derivative: for threshold `T[a][j]` with width `tau_t`,
-//   dL/dT[a][j] += sigmoid'((T[a][j] - DC_a) / tau_t) / tau_t
-//                    * (dL/dw[a][j] - dL/dw[a][j+1])
-// summed over every block whose `DC_a` is the block's DC value on axis `a`.
-// The softmax Jacobian for the pass logits uses the standard
-//   dL/dlogit[q] = pi[q] * (dL/dpi[q] - sum_p pi[p] dL/dpi[p]) / tau_pi.
+// Forward pass plus analytic backward pass. Gradient accumulates into `*grad`
+// (call `ResetGradientJointGrad` first). Gradient flows through `thresholds`
+// (AC only), `pass_logits` (AC + NZ), and `cluster_logits` (AC + NZ). The
+// threshold-gradient formula uses the sigmoid's analytic derivative, the
+// pass-logit gradient uses the softmax Jacobian scaled by 1/tau_pi, and the
+// cluster-logit gradient uses the softmax Jacobian scaled by 1/tau_cluster.
 SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
                                          const GradientJointState& state,
-                                         const ContextMap& ctx_map,
-                                         uint32_t num_clusters,
-                                         uint32_t num_passes,
                                          GradientJointGrad* grad);
 
 // --- Iteration 4: NZ cost + signalling overhead + total cost ---------------
@@ -183,22 +185,17 @@ SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
 //   `SignalOverheadFromNZHist`-equivalent formulas. Added to the total plus a
 //   flat per-pass `ComputePassOverhead(d) * num_passes` constant.
 SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,
-                                    const GradientJointState& state,
-                                    const ContextMap& ctx_map,
-                                    uint32_t num_clusters,
-                                    uint32_t num_passes);
+                                    const GradientJointState& state);
 
 // Total cost with analytic gradient. Gradient flows through the AC term
-// (iteration 2) and the NZ entropy term (block's own pi for the h split,
-// block's cell weight for both h and N). The `predicted_nz` derivation and
-// the pb bucket selection are treated as non-differentiable; likewise the
-// signalling overhead term. The optimizer still benefits from reducing AC + NZ
-// cost; signalling changes come along for the ride through rounding.
+// (iteration 2), the NZ entropy term (block's own pi for the h split, block's
+// cell weight for both h and N, cluster logits from iteration 5), and
+// `cluster_logits` on both AC and NZ. The `predicted_nz` derivation and the pb
+// bucket selection are treated as non-differentiable; likewise the signalling
+// overhead term. The optimizer still benefits from reducing AC + NZ cost;
+// signalling changes come along for the ride through rounding.
 SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
                                             const GradientJointState& state,
-                                            const ContextMap& ctx_map,
-                                            uint32_t num_clusters,
-                                            uint32_t num_passes,
                                             GradientJointGrad* grad);
 
 // --- Iteration 3: Adam optimizer, annealing schedule, optimize loop ---------
@@ -209,6 +206,8 @@ struct AdamState {
   std::array<std::vector<double>, kNumCh> v_thresholds;
   std::array<std::vector<double>, kNumCh> m_logits;
   std::array<std::vector<double>, kNumCh> v_logits;
+  std::array<std::vector<double>, kNumCh> m_cluster_logits;
+  std::array<std::vector<double>, kNumCh> v_cluster_logits;
   // 1-based step counter used for bias-corrected moment estimates.
   uint32_t step = 0;
 };
@@ -240,6 +239,8 @@ struct AnnealSchedule {
   double pass_final = 0.05;
   double threshold_init = 50.0;
   double threshold_final = 0.5;
+  double cluster_init = 1.0;
+  double cluster_final = 0.05;
 };
 
 // Sets `state->pass_temperature` and `state->threshold_temperature` according
@@ -269,21 +270,19 @@ struct OptimizeResult {
 // forward+backward + Adam step + annealing + monotonicity projection. Mutates
 // `state` in place. Returns init and final costs for smoke-test assertions.
 OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
-                                     const ContextMap& ctx_map,
-                                     uint32_t num_clusters,
-                                     uint32_t num_passes,
                                      const AdamConfig& adam_cfg,
                                      const AnnealSchedule& schedule,
                                      GradientJointState* state);
 
-// Rounds a soft `GradientJointState` to a hard `PassSearchResult`. Pass
-// assignment = argmax over logits per block. Thresholds are rounded to
-// `int16_t` and projected to strictly increasing.
+// Rounds a soft `GradientJointState` to a hard `PassSearchResult`.
+//   - Pass assignment: argmax over pass logits per block.
+//   - `ctx_map`:       argmax over cluster logits per (channel, cell). Size is
+//                      `d.channels * state.num_cells`.
+//   - Thresholds:      rounded to `int16_t` and projected to strictly
+//                      increasing.
+//   - `num_passes` and `num_clusters` are copied from `state`.
 PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
-                                       const GradientJointState& state,
-                                       const ContextMap& ctx_map,
-                                       uint32_t num_clusters,
-                                       uint32_t num_passes);
+                                       const GradientJointState& state);
 
 }  // namespace jxl
 
