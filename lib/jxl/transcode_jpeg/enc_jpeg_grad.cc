@@ -466,4 +466,182 @@ SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
                                grad);
 }
 
+// --- Iteration 3: Adam optimizer, annealing schedule, optimize loop ---------
+
+void InitAdamState(const GradientJointState& state, AdamState* adam) {
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    adam->m_thresholds[a].assign(state.thresholds[a].size(), 0.0);
+    adam->v_thresholds[a].assign(state.thresholds[a].size(), 0.0);
+    adam->m_logits[a].assign(state.pass_logits[a].size(), 0.0);
+    adam->v_logits[a].assign(state.pass_logits[a].size(), 0.0);
+  }
+  adam->step = 0;
+}
+
+namespace {
+
+inline void AdamApply(double grad, const AdamConfig& cfg, uint32_t step,
+                      double* param, double* m, double* v) {
+  const double b1 = cfg.beta1;
+  const double b2 = cfg.beta2;
+  *m = b1 * (*m) + (1.0 - b1) * grad;
+  *v = b2 * (*v) + (1.0 - b2) * grad * grad;
+  const double m_hat = *m / (1.0 - std::pow(b1, static_cast<double>(step)));
+  const double v_hat = *v / (1.0 - std::pow(b2, static_cast<double>(step)));
+  *param -= cfg.lr * m_hat / (std::sqrt(v_hat) + cfg.eps);
+}
+
+}  // namespace
+
+void AdamStep(const GradientJointGrad& grad, const AdamConfig& cfg,
+              AdamState* adam, GradientJointState* state) {
+  ++adam->step;
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    for (size_t j = 0; j < state->thresholds[a].size(); ++j) {
+      AdamApply(grad.thresholds[a][j], cfg, adam->step,
+                &state->thresholds[a][j], &adam->m_thresholds[a][j],
+                &adam->v_thresholds[a][j]);
+    }
+    for (size_t i = 0; i < state->pass_logits[a].size(); ++i) {
+      AdamApply(grad.pass_logits[a][i], cfg, adam->step,
+                &state->pass_logits[a][i], &adam->m_logits[a][i],
+                &adam->v_logits[a][i]);
+    }
+  }
+}
+
+void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
+                    GradientJointState* state) {
+  if (step_index < schedule.hot_iters || schedule.anneal_iters == 0) {
+    state->pass_temperature = schedule.pass_init;
+    state->threshold_temperature = schedule.threshold_init;
+    return;
+  }
+  const uint32_t anneal_step = step_index - schedule.hot_iters;
+  if (anneal_step >= schedule.anneal_iters) {
+    state->pass_temperature = schedule.pass_final;
+    state->threshold_temperature = schedule.threshold_final;
+    return;
+  }
+  const double t = static_cast<double>(anneal_step) /
+                   static_cast<double>(schedule.anneal_iters - 1);
+  // Geometric interpolation in log-space: final -> end, init -> start.
+  const double log_pass =
+      (1.0 - t) * std::log(schedule.pass_init) +
+      t * std::log(schedule.pass_final);
+  const double log_thr =
+      (1.0 - t) * std::log(schedule.threshold_init) +
+      t * std::log(schedule.threshold_final);
+  state->pass_temperature = std::exp(log_pass);
+  state->threshold_temperature = std::exp(log_thr);
+}
+
+void ProjectThresholdsMonotonic(GradientJointState* state, double epsilon) {
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    auto& T = state->thresholds[a];
+    for (size_t j = 1; j < T.size(); ++j) {
+      const double lower_bound = T[j - 1] + epsilon;
+      if (T[j] < lower_bound) T[j] = lower_bound;
+    }
+  }
+}
+
+OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
+                                     const ContextMap& ctx_map,
+                                     uint32_t num_clusters,
+                                     uint32_t num_passes,
+                                     const AdamConfig& adam_cfg,
+                                     const AnnealSchedule& schedule,
+                                     GradientJointState* state) {
+  OptimizeResult result;
+  const uint32_t total_iters = schedule.hot_iters + schedule.anneal_iters;
+  if (total_iters == 0) {
+    const SoftCostResult r = ComputeSoftACCost(d, *state, ctx_map,
+                                               num_clusters, num_passes);
+    result.init_cost_bits = r.ac_cost_bits;
+    result.final_cost_bits = r.ac_cost_bits;
+    return result;
+  }
+
+  AdamState adam;
+  InitAdamState(*state, &adam);
+
+  GradientJointGrad grad;
+  ResetGradientJointGrad(*state, &grad);
+
+  // Initial cost: compute with the initial temperatures as configured by the
+  // caller on `state`. Do not apply the schedule's step 0 yet — caller may be
+  // using different temperatures to measure init cost.
+  {
+    const SoftCostResult r = ComputeSoftACCost(d, *state, ctx_map,
+                                               num_clusters, num_passes);
+    result.init_cost_bits = r.ac_cost_bits;
+  }
+
+  for (uint32_t t = 0; t < total_iters; ++t) {
+    ApplyAnnealing(schedule, t, state);
+    ResetGradientJointGrad(*state, &grad);
+    const SoftCostResult r = ComputeSoftACCostWithGrad(
+        d, *state, ctx_map, num_clusters, num_passes, &grad);
+    AdamStep(grad, adam_cfg, &adam, state);
+    ProjectThresholdsMonotonic(state);
+    result.final_cost_bits = r.ac_cost_bits;
+    ++result.iters_taken;
+  }
+  return result;
+}
+
+PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
+                                       const GradientJointState& state,
+                                       const ContextMap& ctx_map,
+                                       uint32_t num_clusters,
+                                       uint32_t num_passes) {
+  PassSearchResult r;
+  r.num_passes = num_passes;
+  r.num_clusters = num_clusters;
+  r.ctx_map = ctx_map;
+
+  // Round thresholds to int16_t and enforce strict monotonicity.
+  constexpr int16_t kMinDC = -1024;
+  constexpr int16_t kMaxDC = 1023;
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    const auto& soft = state.thresholds[a];
+    Thresholds& out = r.thresholds.T[a];
+    out.clear();
+    out.reserve(soft.size());
+    int16_t prev = kMinDC - 1;
+    for (double v : soft) {
+      long vi = std::lround(v);
+      if (vi < kMinDC) vi = kMinDC;
+      if (vi > kMaxDC) vi = kMaxDC;
+      int16_t val = static_cast<int16_t>(vi);
+      if (val <= prev) val = static_cast<int16_t>(prev + 1);
+      if (val > kMaxDC) val = kMaxDC;
+      out.push_back(val);
+      prev = val;
+    }
+  }
+
+  // Argmax pass assignment per block.
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    const uint32_t nb = (c < d.channels) ? d.num_blocks[c] : 0u;
+    r.pass_assignment[c].assign(nb, 0);
+    if (nb == 0 || num_passes == 0) continue;
+    const auto& logits = state.pass_logits[c];
+    for (uint32_t b = 0; b < nb; ++b) {
+      const double* base = &logits[static_cast<size_t>(b) * num_passes];
+      uint32_t best = 0;
+      double best_v = base[0];
+      for (uint32_t p = 1; p < num_passes; ++p) {
+        if (base[p] > best_v) {
+          best_v = base[p];
+          best = p;
+        }
+      }
+      r.pass_assignment[c][b] = static_cast<uint8_t>(best);
+    }
+  }
+  return r;
+}
+
 }  // namespace jxl

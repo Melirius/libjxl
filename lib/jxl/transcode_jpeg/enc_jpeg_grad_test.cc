@@ -290,5 +290,132 @@ TEST(JpegGradTest, AnalyticGradientMatchesFiniteDifference) {
   EXPECT_GT(thr_checks, 0u);
 }
 
+// A single Adam step must reduce the cost when evaluated at the same
+// temperatures, as long as the gradient is non-trivial. This is the minimum
+// correctness assertion for the optimization primitive.
+TEST(JpegGradTest, AdamSingleStepDecreasesCost) {
+  JPEGCtxEffortParams effort =
+      JPEGCtxEffortParams::FromSpeedTier(SpeedTier::kKitten);
+  effort.keep_top_k = 1;
+  effort.main_m_target = 16;
+  effort.main_iters = 1;
+  effort.refine_iters = 0;
+
+  std::shared_ptr<JPEGOptData> opt_data =
+      BuildOptDataFromFixture(effort.ac_hist_model);
+  ASSERT_NE(opt_data, nullptr);
+
+  JXL_TEST_ASSIGN_OR_DIE(
+      std::vector<FactorizationCandidate> candidates,
+      RankAndTrimFactorizations(opt_data, effort, nullptr));
+  ASSERT_FALSE(candidates.empty());
+  candidates.resize(1);
+
+  JXL_TEST_ASSIGN_OR_DIE(PassSearchResult hard,
+                         SearchPassAwareContextModel(opt_data, candidates,
+                                                     effort, nullptr));
+
+  // Non-saturated state at moderate temperatures -> smooth, non-trivial grad.
+  GradientJointState state = InitGradientJointStateFromHard(
+      *opt_data, hard, /*hard_logit=*/0.5,
+      /*threshold_temperature=*/50.0, /*pass_temperature=*/1.0);
+
+  GradientJointGrad grad;
+  ResetGradientJointGrad(state, &grad);
+  const SoftCostResult before =
+      ComputeSoftACCostWithGrad(*opt_data, state, hard.ctx_map,
+                                hard.num_clusters, hard.num_passes, &grad);
+  ASSERT_GT(before.num_cp_slots, 0u);
+
+  AdamState adam;
+  InitAdamState(state, &adam);
+  AdamConfig cfg;
+  cfg.lr = 0.01;
+  AdamStep(grad, cfg, &adam, &state);
+  ProjectThresholdsMonotonic(&state);
+
+  const SoftCostResult after =
+      ComputeSoftACCost(*opt_data, state, hard.ctx_map, hard.num_clusters,
+                        hard.num_passes);
+  EXPECT_LT(after.ac_cost_bits, before.ac_cost_bits)
+      << "before=" << before.ac_cost_bits << " after=" << after.ac_cost_bits;
+}
+
+// End-to-end annealing smoke: run the full optimizer loop and check that (1)
+// it reduces the soft cost from init to final and (2) the hard-rounded result
+// is a valid `PassSearchResult` with the expected shapes.
+TEST(JpegGradTest, FullAnnealingReducesCostAndRoundsSanely) {
+  JPEGCtxEffortParams effort =
+      JPEGCtxEffortParams::FromSpeedTier(SpeedTier::kKitten);
+  effort.keep_top_k = 1;
+  effort.main_m_target = 16;
+  effort.main_iters = 1;
+  effort.refine_iters = 0;
+
+  std::shared_ptr<JPEGOptData> opt_data =
+      BuildOptDataFromFixture(effort.ac_hist_model);
+  ASSERT_NE(opt_data, nullptr);
+
+  JXL_TEST_ASSIGN_OR_DIE(
+      std::vector<FactorizationCandidate> candidates,
+      RankAndTrimFactorizations(opt_data, effort, nullptr));
+  ASSERT_FALSE(candidates.empty());
+  candidates.resize(1);
+
+  JXL_TEST_ASSIGN_OR_DIE(PassSearchResult hard,
+                         SearchPassAwareContextModel(opt_data, candidates,
+                                                     effort, nullptr));
+
+  // Initialize with non-optimal temperatures to leave room for improvement.
+  GradientJointState state = InitGradientJointStateFromHard(
+      *opt_data, hard, /*hard_logit=*/0.1,
+      /*threshold_temperature=*/200.0, /*pass_temperature=*/2.0);
+
+  AdamConfig adam_cfg;
+  adam_cfg.lr = 0.05;
+
+  AnnealSchedule sched;
+  sched.hot_iters = 5;
+  sched.anneal_iters = 15;
+  sched.pass_init = 2.0;
+  sched.pass_final = 0.1;
+  sched.threshold_init = 200.0;
+  sched.threshold_final = 1.0;
+
+  const OptimizeResult opt = RunGradientJointSolve(
+      *opt_data, hard.ctx_map, hard.num_clusters, hard.num_passes, adam_cfg,
+      sched, &state);
+  EXPECT_EQ(opt.iters_taken, sched.hot_iters + sched.anneal_iters);
+  EXPECT_LT(opt.final_cost_bits, opt.init_cost_bits)
+      << "init=" << opt.init_cost_bits << " final=" << opt.final_cost_bits;
+  fprintf(stderr,
+          "GRAD_OPT: init=%.3f bits  final=%.3f bits  reduction=%.3f bits "
+          "(%.2f%%)  iters=%u\n",
+          opt.init_cost_bits, opt.final_cost_bits,
+          opt.init_cost_bits - opt.final_cost_bits,
+          100.0 * (opt.init_cost_bits - opt.final_cost_bits) /
+              std::max(1.0, opt.init_cost_bits),
+          opt.iters_taken);
+
+  const PassSearchResult rounded = RoundToHardAssignment(
+      *opt_data, state, hard.ctx_map, hard.num_clusters, hard.num_passes);
+  EXPECT_EQ(rounded.num_passes, hard.num_passes);
+  EXPECT_EQ(rounded.num_clusters, hard.num_clusters);
+  EXPECT_EQ(rounded.ctx_map.size(), hard.ctx_map.size());
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    EXPECT_EQ(rounded.thresholds.T[a].size(), hard.thresholds.T[a].size());
+    // Strictly increasing.
+    for (size_t j = 1; j < rounded.thresholds.T[a].size(); ++j) {
+      EXPECT_GT(rounded.thresholds.T[a][j], rounded.thresholds.T[a][j - 1]);
+    }
+  }
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    EXPECT_EQ(rounded.pass_assignment[c].size(), opt_data->num_blocks[c]);
+    for (uint8_t p : rounded.pass_assignment[c]) {
+      EXPECT_LT(p, hard.num_passes);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace jxl

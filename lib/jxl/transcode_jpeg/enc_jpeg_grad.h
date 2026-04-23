@@ -147,6 +147,90 @@ SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
                                          uint32_t num_passes,
                                          GradientJointGrad* grad);
 
+// --- Iteration 3: Adam optimizer, annealing schedule, optimize loop ---------
+
+// Per-parameter Adam running statistics. Shapes mirror `GradientJointState`.
+struct AdamState {
+  std::array<std::vector<double>, kNumCh> m_thresholds;
+  std::array<std::vector<double>, kNumCh> v_thresholds;
+  std::array<std::vector<double>, kNumCh> m_logits;
+  std::array<std::vector<double>, kNumCh> v_logits;
+  // 1-based step counter used for bias-corrected moment estimates.
+  uint32_t step = 0;
+};
+
+// Standard Adam hyperparameters.
+struct AdamConfig {
+  double lr = 0.01;
+  double beta1 = 0.9;
+  double beta2 = 0.999;
+  double eps = 1e-8;
+};
+
+void InitAdamState(const GradientJointState& state, AdamState* adam);
+
+// Applies one Adam update to `state` from `grad`. Mutates `state` in place and
+// advances `adam->step`. The caller must have already computed `grad` via
+// `ComputeSoftACCostWithGrad` and not reset it between forward/backward and
+// this call.
+void AdamStep(const GradientJointGrad& grad, const AdamConfig& cfg,
+              AdamState* adam, GradientJointState* state);
+
+// Geometric annealing schedule driving `pass_temperature` and
+// `threshold_temperature` from their init values to their final values over
+// `hot_iters` (held constant) followed by `anneal_iters` (geometric decay).
+struct AnnealSchedule {
+  uint32_t hot_iters = 0;
+  uint32_t anneal_iters = 0;
+  double pass_init = 1.0;
+  double pass_final = 0.05;
+  double threshold_init = 50.0;
+  double threshold_final = 0.5;
+};
+
+// Sets `state->pass_temperature` and `state->threshold_temperature` according
+// to `schedule` for the given 0-based `step_index`.
+//   step_index < hot_iters              => init values
+//   step_index >= hot_iters + anneal_iters => final values (clamped)
+//   otherwise                            => geometric interpolation
+void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
+                    GradientJointState* state);
+
+// Projects thresholds to be strictly increasing. Required because gradient
+// updates can swap adjacent thresholds, which would produce negative bucket
+// weights in the forward pass. Uses `epsilon` as the minimum gap.
+void ProjectThresholdsMonotonic(GradientJointState* state,
+                                double epsilon = 1e-6);
+
+struct OptimizeResult {
+  // Cost (bits) at the very first forward pass, before any Adam step.
+  double init_cost_bits = 0.0;
+  // Cost (bits) at the final state after the full schedule.
+  double final_cost_bits = 0.0;
+  // Total number of forward+backward iterations executed.
+  uint32_t iters_taken = 0;
+};
+
+// Top-level optimizer loop. Runs `hot_iters + anneal_iters` rounds of
+// forward+backward + Adam step + annealing + monotonicity projection. Mutates
+// `state` in place. Returns init and final costs for smoke-test assertions.
+OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
+                                     const ContextMap& ctx_map,
+                                     uint32_t num_clusters,
+                                     uint32_t num_passes,
+                                     const AdamConfig& adam_cfg,
+                                     const AnnealSchedule& schedule,
+                                     GradientJointState* state);
+
+// Rounds a soft `GradientJointState` to a hard `PassSearchResult`. Pass
+// assignment = argmax over logits per block. Thresholds are rounded to
+// `int16_t` and projected to strictly increasing.
+PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
+                                       const GradientJointState& state,
+                                       const ContextMap& ctx_map,
+                                       uint32_t num_clusters,
+                                       uint32_t num_passes);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_
