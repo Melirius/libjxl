@@ -1136,6 +1136,41 @@ GradientJointState InitGradientJointStateFromFactorization(
   return state;
 }
 
+namespace {
+
+// Mirrors `ComputeMaxNumPasses` in `enc_jpeg_passes.cc` (not exported there).
+// Upper bound on pass count from image group geometry; JPEG XL standard caps
+// at 11 total passes.
+uint32_t ComputeMaxNumPassesLocal(const JPEGOptData& d) {
+  const double groups_x = static_cast<double>((d.w_max + 31) / 32);
+  const double groups_y = static_cast<double>((d.h_max + 31) / 32);
+  const double groups = std::max(1.0, groups_x * groups_y);
+  return static_cast<uint32_t>(
+      std::min(11.0, std::ceil(std::log2(groups)) + 1.0));
+}
+
+// Resolves `(min_passes, max_passes)` from `effort.optimize_passes_num`:
+//   -1  -> force 1 pass (disabled)
+//    0  -> sweep `[1, ComputeMaxNumPasses]`
+//    K  -> force exactly K passes
+std::pair<uint32_t, uint32_t> ResolvePassRange(
+    const JPEGOptData& d, const JPEGCtxEffortParams& effort) {
+  const uint32_t max_img = ComputeMaxNumPassesLocal(d);
+  const uint32_t min_passes =
+      effort.optimize_passes_num <= 0
+          ? 1
+          : static_cast<uint32_t>(effort.optimize_passes_num);
+  const uint32_t max_passes =
+      effort.optimize_passes_num < 0
+          ? 1
+          : (effort.optimize_passes_num == 0
+                 ? max_img
+                 : std::min<uint32_t>(effort.optimize_passes_num, max_img));
+  return {min_passes, std::max(min_passes, max_passes)};
+}
+
+}  // namespace
+
 StatusOr<PassSearchResult> SearchGradientJointContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool) {
@@ -1145,9 +1180,14 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
     return JXL_FAILURE("Gradient-joint search: no maximal factorizations");
   }
 
-  const uint32_t num_passes = 1;
   const uint32_t num_clusters =
       kMaxClusters - static_cast<uint32_t>(d.channels == 1);
+  const auto pass_range = ResolvePassRange(d, effort);
+  const uint32_t min_passes = pass_range.first;
+  const uint32_t max_passes = pass_range.second;
+  const uint32_t pass_count_steps = max_passes - min_passes + 1;
+  const uint32_t num_factorizations =
+      static_cast<uint32_t>(factorizations.size());
 
   AdamConfig adam_cfg;
   adam_cfg.lr = effort.grad_lr;
@@ -1162,20 +1202,25 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   sched.cluster_init = effort.grad_init_temperature;
   sched.cluster_final = effort.grad_init_temperature * 0.05;
 
-  // Per-factorization outputs. Each worker writes its own slot; no shared
-  // mutation across threads.
+  // Flat work list of `(factorization_idx, num_passes)` tuples. Each worker
+  // writes its own slot; no shared mutation across threads.
   struct Slot {
     PassSearchResult result;
     double final_cost_bits = std::numeric_limits<double>::max();
+    uint32_t factorization_idx = 0;
+    uint32_t num_passes = 0;
     bool valid = false;
   };
-  std::vector<Slot> slots(factorizations.size());
+  const uint32_t total_workers = num_factorizations * pass_count_steps;
+  std::vector<Slot> slots(total_workers);
 
   JXL_RETURN_IF_ERROR(RunOnPool(
-      pool, 0, static_cast<uint32_t>(factorizations.size()),
-      ThreadPool::NoInit,
+      pool, 0, total_workers, ThreadPool::NoInit,
       [&](uint32_t idx, size_t /*thread_id*/) -> Status {
-        const Factorization& f = factorizations[idx];
+        const uint32_t factorization_idx = idx / pass_count_steps;
+        const uint32_t num_passes =
+            min_passes + (idx % pass_count_steps);
+        const Factorization& f = factorizations[factorization_idx];
         GradientJointState state = InitGradientJointStateFromFactorization(
             d, f, num_passes, num_clusters, sched.threshold_init,
             sched.pass_init, sched.cluster_init);
@@ -1196,13 +1241,16 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
         slots[idx].result.total_cost = static_cast<FixedPointCost>(std::llround(
             final_cost.total_cost_bits * static_cast<double>(kFScale)));
         slots[idx].final_cost_bits = opt.final_cost_bits;
+        slots[idx].factorization_idx = factorization_idx;
+        slots[idx].num_passes = num_passes;
         slots[idx].valid = true;
         return true;
       },
       "JpegCtxGradSweep"));
 
-  // Pick the best. Deterministic tie-break: smaller factorization index wins.
-  size_t best_idx = factorizations.size();
+  // Pick the best. Deterministic tie-break: smaller flat index wins (which
+  // corresponds to smaller factorization_idx first, then smaller num_passes).
+  size_t best_idx = total_workers;
   double best_cost = std::numeric_limits<double>::max();
   for (size_t i = 0; i < slots.size(); ++i) {
     if (!slots[i].valid) continue;

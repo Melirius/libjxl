@@ -661,6 +661,10 @@ TEST(JpegGradTest, SearchGradientJointContextModelSmoke) {
   effort.grad_anneal_iters = 3;
   effort.grad_init_temperature = 1.0;
   effort.grad_lr = 0.05;
+  // Iteration 8: exercise the multi-pass sweep. 0 = planner chooses pass count
+  // (sweeps `[1, ComputeMaxNumPasses]`). At `-1` the sweep is disabled and
+  // only `num_passes = 1` is considered; this test covers the sweep path.
+  effort.optimize_passes_num = 0;
 
   // Load the smaller `sideways_bench.jpg` (15 KB) instead of the 550 KB flower
   // fixture — the sweep runs the optimizer once per factorization (~58 runs),
