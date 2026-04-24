@@ -26,6 +26,7 @@
 #include "lib/jxl/jpeg/jpeg_data.h"
 #include "lib/jxl/quantizer.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_cluster.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_grad.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_refine.h"
@@ -530,7 +531,15 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
 
   auto start_search = std::chrono::high_resolution_clock::now();
   PassSearchResult result;
-  if (effort.use_bicluster_search) {
+  if (effort.use_gradient_joint_search) {
+    fprintf(stderr,
+            "PLANNER: Running gradient-joint (Lane B) search path "
+            "(hot=%u anneal=%u lr=%.3f)\n",
+            effort.grad_hot_iters, effort.grad_anneal_iters, effort.grad_lr);
+    fflush(stderr);
+    JXL_ASSIGN_OR_RETURN(result, SearchGradientJointContextModel(opt_data,
+                                                                 effort, pool));
+  } else if (effort.use_bicluster_search) {
     if (effort.bicluster_threshold_first) {
       fprintf(stderr,
               "PLANNER: Running biclustered threshold-first search path (max %u passes)\n",

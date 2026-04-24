@@ -1181,7 +1181,20 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
             sched.pass_init, sched.cluster_init);
         const OptimizeResult opt =
             RunGradientJointSolve(d, adam_cfg, sched, &state);
+        // One extra forward pass at the final (low-temp) state to recover
+        // AC / NZ / overhead component breakdown for the rounded result.
+        const SoftCostResult final_cost = ComputeSoftTotalCost(d, state);
         slots[idx].result = RoundToHardAssignment(d, state);
+        slots[idx].result.ac_cost = static_cast<FixedPointCost>(std::llround(
+            final_cost.ac_cost_bits * static_cast<double>(kFScale)));
+        slots[idx].result.nz_cost = static_cast<FixedPointCost>(std::llround(
+            final_cost.nz_cost_bits * static_cast<double>(kFScale)));
+        slots[idx].result.signalling_overhead =
+            static_cast<FixedPointCost>(std::llround(
+                final_cost.signalling_overhead_bits *
+                static_cast<double>(kFScale)));
+        slots[idx].result.total_cost = static_cast<FixedPointCost>(std::llround(
+            final_cost.total_cost_bits * static_cast<double>(kFScale)));
         slots[idx].final_cost_bits = opt.final_cost_bits;
         slots[idx].valid = true;
         return true;
