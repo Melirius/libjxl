@@ -650,5 +650,70 @@ TEST(JpegGradTest, ClusterLogitsHardLimitAgreesWithPassAwareModel) {
   }
 }
 
+// Iteration 6: parallel sweep over MaximalFactorizations. The smoke test runs
+// the full orchestrator with a modest iteration budget on a small fixture.
+// This validates plumbing end-to-end. Deeper correctness is covered by the
+// iterations-1-5 tests on the flower fixture.
+TEST(JpegGradTest, SearchGradientJointContextModelSmoke) {
+  JPEGCtxEffortParams effort =
+      JPEGCtxEffortParams::FromSpeedTier(SpeedTier::kKitten);
+  effort.grad_hot_iters = 2;
+  effort.grad_anneal_iters = 3;
+  effort.grad_init_temperature = 1.0;
+  effort.grad_lr = 0.05;
+
+  // Load the smaller `sideways_bench.jpg` (15 KB) instead of the 550 KB flower
+  // fixture — the sweep runs the optimizer once per factorization (~58 runs),
+  // so fixture size dominates smoke runtime.
+  JxlMemoryManager* memory_manager = test::MemoryManager();
+  const std::vector<uint8_t> jpeg_bytes =
+      test::ReadTestData("jxl/jpeg_reconstruction/sideways_bench.jpg");
+  auto jpeg_data_or = jpeg::ParseJPG(memory_manager, Bytes(jpeg_bytes));
+  ASSERT_TRUE(jpeg_data_or.ok());
+  std::unique_ptr<jpeg::JPEGData> jpeg_data =
+      std::move(jpeg_data_or).value_();
+  ColorTransform color_transform;
+  ASSERT_TRUE(
+      jpeg::SetColorTransformFromJpegData(*jpeg_data, &color_transform));
+  const std::array<int, 3> plane_to_jpeg =
+      JpegOrder(color_transform, jpeg_data->components.size() == 1);
+  const JpegCflContext cfl_ctx = {plane_to_jpeg,
+                                  false,
+                                  {nullptr, nullptr},
+                                  {nullptr, nullptr}};
+  auto opt_data = std::make_shared<JPEGOptData>();
+  ASSERT_TRUE(opt_data->BuildFromJPEG(*jpeg_data, effort.ac_hist_model,
+                                       cfl_ctx, nullptr));
+
+  JXL_TEST_ASSIGN_OR_DIE(
+      PassSearchResult result,
+      SearchGradientJointContextModel(opt_data, effort, nullptr));
+
+  // Basic shape invariants. ctx_map size matches active channels × num_cells.
+  EXPECT_GE(result.num_passes, 1u);
+  EXPECT_GE(result.num_clusters, 1u);
+  EXPECT_LE(result.num_clusters, kMaxClusters);
+  const size_t num_cells = (result.thresholds.TY().size() + 1) *
+                           (result.thresholds.TCb().size() + 1) *
+                           (result.thresholds.TCr().size() + 1);
+  EXPECT_EQ(result.ctx_map.size(),
+            static_cast<size_t>(opt_data->channels) * num_cells);
+  for (uint8_t cluster : result.ctx_map) {
+    EXPECT_LT(cluster, result.num_clusters);
+  }
+  for (size_t c = 0; c < kNumCh; ++c) {
+    EXPECT_EQ(result.pass_assignment[c].size(), opt_data->num_blocks[c]);
+    for (uint8_t p : result.pass_assignment[c]) {
+      EXPECT_LT(p, result.num_passes);
+    }
+  }
+  // Thresholds strictly increasing on each axis.
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    for (size_t j = 1; j < result.thresholds.T[a].size(); ++j) {
+      EXPECT_GT(result.thresholds.T[a][j], result.thresholds.T[a][j - 1]);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace jxl

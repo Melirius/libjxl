@@ -284,6 +284,31 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
 PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
                                        const GradientJointState& state);
 
+// --- Iteration 6: Parallel factorization sweep --------------------------
+
+// Cold initialization for a factorization `(a, b, c)`. Thresholds are derived
+// from `InitThresh` per axis. Pass logits and cluster logits are all zero
+// (uniform softmax), so Adam discovers structure from scratch. Temperatures
+// and `num_clusters` / `num_passes` are set from the caller's arguments.
+GradientJointState InitGradientJointStateFromFactorization(
+    const JPEGOptData& d, const Factorization& f, uint32_t num_passes,
+    uint32_t num_clusters, double threshold_temperature,
+    double pass_temperature, double cluster_temperature);
+
+// Runs the gradient-based Lane B optimizer on every maximal factorization of
+// `opt_data` in parallel, rounds each to a hard `PassSearchResult`, and
+// returns the one with the lowest final soft total cost.
+//
+// Effort hyperparameters read from `effort`:
+//   grad_hot_iters, grad_anneal_iters, grad_init_temperature, grad_lr.
+// `num_passes = 1` for iteration 6 — multi-pass sweep is a follow-up.
+// `num_clusters = kMaxClusters - (d.channels == 1)`, matching the hard path.
+//
+// Returns an error if `MaximalFactorizations(opt_data)` is empty.
+StatusOr<PassSearchResult> SearchGradientJointContextModel(
+    std::shared_ptr<const JPEGOptData> opt_data,
+    const JPEGCtxEffortParams& effort, ThreadPool* pool);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_

@@ -1098,4 +1098,110 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
   return r;
 }
 
+// --- Iteration 6: Parallel factorization sweep --------------------------
+
+GradientJointState InitGradientJointStateFromFactorization(
+    const JPEGOptData& d, const Factorization& f, uint32_t num_passes,
+    uint32_t num_clusters, double threshold_temperature,
+    double pass_temperature, double cluster_temperature) {
+  GradientJointState state;
+  state.num_passes = num_passes;
+  state.num_clusters = num_clusters;
+  state.threshold_temperature = threshold_temperature;
+  state.pass_temperature = pass_temperature;
+  state.cluster_temperature = cluster_temperature;
+
+  // Per-axis thresholds via `InitThresh` (same starting point as the hard
+  // search's factorization-to-candidate init).
+  for (uint32_t axis = 0; axis < kNumCh; ++axis) {
+    const Thresholds T = InitThresh(d, axis, f[axis]);
+    state.thresholds[axis].assign(T.begin(), T.end());
+  }
+  state.num_cells = static_cast<uint32_t>(
+      (state.thresholds[0].size() + 1) * (state.thresholds[1].size() + 1) *
+      (state.thresholds[2].size() + 1));
+
+  // Uniform pass and cluster logits (all zero). Softmax at any positive
+  // temperature yields 1/P or 1/K — maximum entropy starting point.
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    const uint32_t nb = d.num_blocks[c];
+    state.pass_logits[c].assign(static_cast<size_t>(nb) * num_passes, 0.0);
+    if (c < d.channels) {
+      state.cluster_logits[c].assign(
+          static_cast<size_t>(state.num_cells) * num_clusters, 0.0);
+    } else {
+      state.cluster_logits[c].clear();
+    }
+  }
+  return state;
+}
+
+StatusOr<PassSearchResult> SearchGradientJointContextModel(
+    std::shared_ptr<const JPEGOptData> opt_data,
+    const JPEGCtxEffortParams& effort, ThreadPool* pool) {
+  const JPEGOptData& d = *opt_data;
+  const auto factorizations = MaximalFactorizations(d);
+  if (factorizations.empty()) {
+    return JXL_FAILURE("Gradient-joint search: no maximal factorizations");
+  }
+
+  const uint32_t num_passes = 1;
+  const uint32_t num_clusters =
+      kMaxClusters - static_cast<uint32_t>(d.channels == 1);
+
+  AdamConfig adam_cfg;
+  adam_cfg.lr = effort.grad_lr;
+
+  AnnealSchedule sched;
+  sched.hot_iters = effort.grad_hot_iters;
+  sched.anneal_iters = effort.grad_anneal_iters;
+  sched.pass_init = effort.grad_init_temperature;
+  sched.pass_final = effort.grad_init_temperature * 0.05;
+  sched.threshold_init = effort.grad_init_temperature * 50.0;
+  sched.threshold_final = effort.grad_init_temperature * 0.5;
+  sched.cluster_init = effort.grad_init_temperature;
+  sched.cluster_final = effort.grad_init_temperature * 0.05;
+
+  // Per-factorization outputs. Each worker writes its own slot; no shared
+  // mutation across threads.
+  struct Slot {
+    PassSearchResult result;
+    double final_cost_bits = std::numeric_limits<double>::max();
+    bool valid = false;
+  };
+  std::vector<Slot> slots(factorizations.size());
+
+  JXL_RETURN_IF_ERROR(RunOnPool(
+      pool, 0, static_cast<uint32_t>(factorizations.size()),
+      ThreadPool::NoInit,
+      [&](uint32_t idx, size_t /*thread_id*/) -> Status {
+        const Factorization& f = factorizations[idx];
+        GradientJointState state = InitGradientJointStateFromFactorization(
+            d, f, num_passes, num_clusters, sched.threshold_init,
+            sched.pass_init, sched.cluster_init);
+        const OptimizeResult opt =
+            RunGradientJointSolve(d, adam_cfg, sched, &state);
+        slots[idx].result = RoundToHardAssignment(d, state);
+        slots[idx].final_cost_bits = opt.final_cost_bits;
+        slots[idx].valid = true;
+        return true;
+      },
+      "JpegCtxGradSweep"));
+
+  // Pick the best. Deterministic tie-break: smaller factorization index wins.
+  size_t best_idx = factorizations.size();
+  double best_cost = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < slots.size(); ++i) {
+    if (!slots[i].valid) continue;
+    if (slots[i].final_cost_bits < best_cost) {
+      best_cost = slots[i].final_cost_bits;
+      best_idx = i;
+    }
+  }
+  if (best_idx >= slots.size()) {
+    return JXL_FAILURE("Gradient-joint search: no factorization succeeded");
+  }
+  return std::move(slots[best_idx].result);
+}
+
 }  // namespace jxl
