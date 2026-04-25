@@ -24,8 +24,8 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,6 +34,7 @@
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_pass_utils.h"
 
 namespace jxl {
 
@@ -989,7 +990,9 @@ void ProjectThresholdsMonotonic(GradientJointState* state, double epsilon) {
 OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
                                      const AdamConfig& adam_cfg,
                                      const AnnealSchedule& schedule,
-                                     GradientJointState* state) {
+                                     GradientJointState* state,
+                                     uint32_t fa, uint32_t fb,
+                                     uint32_t fc, uint32_t num_passes) {
   OptimizeResult result;
   const uint32_t total_iters = schedule.hot_iters + schedule.anneal_iters;
   if (total_iters == 0) {
@@ -999,6 +1002,8 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
     return result;
   }
 
+  auto start_solve = PlannerClock::now();
+
   AdamState adam;
   InitAdamState(*state, &adam);
 
@@ -1007,19 +1012,83 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
 
   // Initial cost at caller-configured temperatures (schedule not applied yet).
   {
+    auto start_init = PlannerClock::now();
     const SoftCostResult r = ComputeSoftTotalCost(d, *state);
     result.init_cost_bits = r.total_cost_bits;
+    auto end_init = PlannerClock::now();
+    fprintf(stderr,
+            "PLANNER: [gradient] [(%u,%u,%u) P=%u] Initial cost: %.2f bits "
+            "(took %.2f ms)\n",
+            fa, fb, fc, num_passes,
+            r.total_cost_bits,
+            NanosToMs(ElapsedNanos(start_init, end_init)));
+    fflush(stderr);
   }
 
+  int64_t total_fwd_ns = 0;
+  int64_t total_adam_ns = 0;
+  double prev_cost = result.init_cost_bits;
+
   for (uint32_t t = 0; t < total_iters; ++t) {
+    auto start_iter = PlannerClock::now();
+
     ApplyAnnealing(schedule, t, state);
     ResetGradientJointGrad(*state, &grad);
+
+    auto start_fwd = PlannerClock::now();
     const SoftCostResult r = ComputeSoftTotalCostWithGrad(d, *state, &grad);
+    auto end_fwd = PlannerClock::now();
+    total_fwd_ns += ElapsedNanos(start_fwd, end_fwd);
+
+    auto start_adam = PlannerClock::now();
     AdamStep(grad, adam_cfg, &adam, state);
     ProjectThresholdsMonotonic(state);
+    auto end_adam = PlannerClock::now();
+    total_adam_ns += ElapsedNanos(start_adam, end_adam);
+
     result.final_cost_bits = r.total_cost_bits;
     ++result.iters_taken;
+
+    auto end_iter = PlannerClock::now();
+    const bool is_hot = t < schedule.hot_iters;
+    const double delta = r.total_cost_bits - prev_cost;
+    const double pct = (prev_cost != 0.0) ? (delta / prev_cost) * 100.0 : 0.0;
+    fprintf(stderr,
+            "PLANNER: [gradient] [(%u,%u,%u) P=%u] Iter %u/%u (%s) "
+            "cost=%.2f bits delta=%+.2f (%+.3f%%) "
+            "fwd=%.2f ms adam=%.2f ms total=%.2f ms\n",
+            fa, fb, fc, num_passes,
+            t + 1, total_iters, is_hot ? "hot" : "anneal",
+            r.total_cost_bits, delta, pct,
+            NanosToMs(ElapsedNanos(start_fwd, end_fwd)),
+            NanosToMs(ElapsedNanos(start_adam, end_adam)),
+            NanosToMs(ElapsedNanos(start_iter, end_iter)));
+    fflush(stderr);
+    prev_cost = r.total_cost_bits;
   }
+
+  // Compute cost at the actual final state (after the last Adam step).
+  // The in-loop `final_cost_bits` is the cost before the last update.
+  {
+    const SoftCostResult final_r = ComputeSoftTotalCost(d, *state);
+    result.final_cost_bits = final_r.total_cost_bits;
+  }
+
+  auto end_solve = PlannerClock::now();
+  const double total_delta = result.final_cost_bits - result.init_cost_bits;
+  const double total_pct = (result.init_cost_bits != 0.0)
+                               ? (total_delta / result.init_cost_bits) * 100.0
+                               : 0.0;
+  fprintf(stderr,
+          "PLANNER: [gradient] [(%u,%u,%u) P=%u] Solve done: %u iters, "
+          "init=%.2f -> final=%.2f bits delta=%+.2f (%+.3f%%), "
+          "fwd_total=%.2f ms adam_total=%.2f ms wall=%.2f ms\n",
+          fa, fb, fc, num_passes,
+          total_iters, result.init_cost_bits, result.final_cost_bits,
+          total_delta, total_pct,
+          NanosToMs(total_fwd_ns), NanosToMs(total_adam_ns),
+          NanosToMs(ElapsedNanos(start_solve, end_solve)));
+  fflush(stderr);
   return result;
 }
 
@@ -1121,14 +1190,27 @@ GradientJointState InitGradientJointStateFromFactorization(
       (state.thresholds[0].size() + 1) * (state.thresholds[1].size() + 1) *
       (state.thresholds[2].size() + 1));
 
-  // Uniform pass and cluster logits (all zero). Softmax at any positive
-  // temperature yields 1/P or 1/K — maximum entropy starting point.
+  // Pass logits: small bias toward pass 0 to break symmetry (otherwise uniform
+  // zero logits produce identical histograms across passes → zero gradient).
+  // The bias is chosen to be noticeable at temperature ~1 but small enough
+  // that the optimizer can easily overcome it.
+  constexpr double kPassSymmetryBreak = 0.5;
   for (uint32_t c = 0; c < kNumCh; ++c) {
     const uint32_t nb = d.num_blocks[c];
     state.pass_logits[c].assign(static_cast<size_t>(nb) * num_passes, 0.0);
+    for (uint32_t b = 0; b < nb; ++b) {
+      state.pass_logits[c][static_cast<size_t>(b) * num_passes] =
+          kPassSymmetryBreak;
+    }
     if (c < d.channels) {
+      // Cluster logits: small bias toward cluster 0 to break symmetry.
+      constexpr double kClusterSymmetryBreak = 0.5;
       state.cluster_logits[c].assign(
           static_cast<size_t>(state.num_cells) * num_clusters, 0.0);
+      for (uint32_t cell = 0; cell < state.num_cells; ++cell) {
+        state.cluster_logits[c][static_cast<size_t>(cell) * num_clusters] =
+            kClusterSymmetryBreak;
+      }
     } else {
       state.cluster_logits[c].clear();
     }
@@ -1174,6 +1256,8 @@ std::pair<uint32_t, uint32_t> ResolvePassRange(
 StatusOr<PassSearchResult> SearchGradientJointContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool) {
+  auto start_total = PlannerClock::now();
+
   const JPEGOptData& d = *opt_data;
   const auto factorizations = MaximalFactorizations(d);
   if (factorizations.empty()) {
@@ -1189,6 +1273,13 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   const uint32_t num_factorizations =
       static_cast<uint32_t>(factorizations.size());
 
+  fprintf(stderr,
+          "PLANNER: [gradient] %u factorizations, pass range [%u, %u] "
+          "(%u workers), %u clusters\n",
+          num_factorizations, min_passes, max_passes,
+          num_factorizations * pass_count_steps, num_clusters);
+  fflush(stderr);
+
   AdamConfig adam_cfg;
   adam_cfg.lr = effort.grad_lr;
 
@@ -1202,6 +1293,17 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   sched.cluster_init = effort.grad_init_temperature;
   sched.cluster_final = effort.grad_init_temperature * 0.05;
 
+  fprintf(stderr,
+          "PLANNER: [gradient] Schedule: hot=%u anneal=%u total_iters=%u "
+          "lr=%.4f T_pass=%.4f->%.4f T_thresh=%.4f->%.4f T_cluster=%.4f->%.4f\n",
+          sched.hot_iters, sched.anneal_iters,
+          sched.hot_iters + sched.anneal_iters,
+          adam_cfg.lr,
+          sched.pass_init, sched.pass_final,
+          sched.threshold_init, sched.threshold_final,
+          sched.cluster_init, sched.cluster_final);
+  fflush(stderr);
+
   // Flat work list of `(factorization_idx, num_passes)` tuples. Each worker
   // writes its own slot; no shared mutation across threads.
   struct Slot {
@@ -1214,6 +1316,7 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   const uint32_t total_workers = num_factorizations * pass_count_steps;
   std::vector<Slot> slots(total_workers);
 
+  auto start_sweep = PlannerClock::now();
   JXL_RETURN_IF_ERROR(RunOnPool(
       pool, 0, total_workers, ThreadPool::NoInit,
       [&](uint32_t idx, size_t /*thread_id*/) -> Status {
@@ -1225,7 +1328,8 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
             d, f, num_passes, num_clusters, sched.threshold_init,
             sched.pass_init, sched.cluster_init);
         const OptimizeResult opt =
-            RunGradientJointSolve(d, adam_cfg, sched, &state);
+            RunGradientJointSolve(d, adam_cfg, sched, &state,
+                                  f[0], f[1], f[2], num_passes);
         // One extra forward pass at the final (low-temp) state to recover
         // AC / NZ / overhead component breakdown for the rounded result.
         const SoftCostResult final_cost = ComputeSoftTotalCost(d, state);
@@ -1247,6 +1351,7 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
         return true;
       },
       "JpegCtxGradSweep"));
+  auto end_sweep = PlannerClock::now();
 
   // Pick the best. Deterministic tie-break: smaller flat index wins (which
   // corresponds to smaller factorization_idx first, then smaller num_passes).
@@ -1262,6 +1367,37 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   if (best_idx >= slots.size()) {
     return JXL_FAILURE("Gradient-joint search: no factorization succeeded");
   }
+
+  // Report per-slot results.
+  for (size_t i = 0; i < slots.size(); ++i) {
+    if (!slots[i].valid) continue;
+    const Factorization& sf = factorizations[slots[i].factorization_idx];
+    fprintf(stderr,
+            "PLANNER: [gradient] [(%u,%u,%u) P=%u] cost=%.4f bits%s\n",
+            sf[0], sf[1], sf[2], slots[i].num_passes,
+            slots[i].final_cost_bits,
+            i == best_idx ? " ** BEST **" : "");
+  }
+  fflush(stderr);
+
+  const Slot& best = slots[best_idx];
+  const Factorization& bf = factorizations[best.factorization_idx];
+  fprintf(stderr,
+          "PLANNER: [gradient] Sweep done: %u workers in %.2f ms, "
+          "best=[(%u,%u,%u) P=%u] cost=%.4f bits "
+          "(ac=%.2f nz=%.2f overhead=%.2f)\n",
+          total_workers,
+          NanosToMs(ElapsedNanos(start_sweep, end_sweep)),
+          bf[0], bf[1], bf[2], best.num_passes,
+          best.final_cost_bits,
+          bit_cost(best.result.ac_cost),
+          bit_cost(best.result.nz_cost),
+          bit_cost(best.result.signalling_overhead));
+  auto end_total = PlannerClock::now();
+  fprintf(stderr, "PLANNER: [gradient] Total search took %.2f ms\n",
+          NanosToMs(ElapsedNanos(start_total, end_total)));
+  fflush(stderr);
+
   return std::move(slots[best_idx].result);
 }
 

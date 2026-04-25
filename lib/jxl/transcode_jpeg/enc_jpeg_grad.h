@@ -269,10 +269,15 @@ struct OptimizeResult {
 // Top-level optimizer loop. Runs `hot_iters + anneal_iters` rounds of
 // forward+backward + Adam step + annealing + monotonicity projection. Mutates
 // `state` in place. Returns init and final costs for smoke-test assertions.
+// `fa/fb/fc` are the DC interval counts per axis and `num_passes` is the pass
+// count; all four are used only for debug logging to identify which worker
+// slot is producing output.
 OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
                                      const AdamConfig& adam_cfg,
                                      const AnnealSchedule& schedule,
-                                     GradientJointState* state);
+                                     GradientJointState* state,
+                                     uint32_t fa = 0, uint32_t fb = 0,
+                                     uint32_t fc = 0, uint32_t num_passes = 0);
 
 // Rounds a soft `GradientJointState` to a hard `PassSearchResult`.
 //   - Pass assignment: argmax over pass logits per block.
