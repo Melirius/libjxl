@@ -193,12 +193,11 @@ enum class CostMode { kACOnly, kTotal };
 // Mirrors the hard formula in `EvaluatePassAwareModel` exactly once the
 // fractional value is floored.
 inline uint32_t PredictorBucketFromPredictedNZ(double predicted_nz) {
-  int nz_int = static_cast<int>(std::floor(predicted_nz));
-  if (nz_int < 0) nz_int = 0;
+  const int nz_int =
+      std::max(0, static_cast<int>(std::floor(predicted_nz)));
   uint32_t pb = (nz_int < 8) ? static_cast<uint32_t>(nz_int)
                              : (4u + static_cast<uint32_t>(nz_int) / 2u);
-  if (pb >= kJPEGNonZeroBuckets) pb = kJPEGNonZeroBuckets - 1;
-  return pb;
+  return std::min<uint32_t>(pb, kJPEGNonZeroBuckets - 1);
 }
 
 // Flat per-pass overhead constant; duplicated from `ComputePassOverhead` in
@@ -272,7 +271,7 @@ double NZSignallingOverheadBitsForSlot(const std::vector<double>& nz_h) {
       const uint32_t count =
           static_cast<uint32_t>(std::llround(std::max<double>(v, 0.0)));
       if (count == 0) continue;
-      if (nz > max_nz) max_nz = nz;
+      max_nz = std::max(max_nz, nz);
       total += count;
     }
     if (total == 0) continue;
@@ -377,9 +376,15 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   std::vector<uint32_t> N_scratch(kZDC, 0u);
   std::vector<uint32_t> h_touched;
   std::vector<uint32_t> N_touched;
-  std::vector<double> w0, w1, w2;
+  std::vector<double> w0;
+  std::vector<double> w1;
+  std::vector<double> w2;
   std::vector<double> cell_weight(num_cells, 0.0);
   std::vector<double> pi_local(num_passes, 0.0);
+  // Per-block per-cluster aggregate weight, B[k] = sum_cell w_cell·rho[c,cell,k].
+  // Reused by both AC and NZ forward and by the backward pass; sized to fit
+  // any cluster axis count, allocated once per call.
+  std::vector<double> block_B(num_clusters, 0.0);
 
   // --- Forward pass ---------------------------------------------------------
   for (uint32_t c = 0; c < d.channels; ++c) {
@@ -417,32 +422,45 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           SummarizeBlockEvents(d, c, b, &h_scratch, &N_scratch, &h_touched,
                                &N_touched);
 
-      // AC accumulation (iteration 5: soft cluster via `rho`).
+      // Per-block per-cluster aggregate `B[k] = sum_cell w_cell · rho[c,cell,k]`.
+      // This collapses the cell axis out of the inner accumulation, dropping a
+      // factor of `num_cells` from the AC and NZ inner loops.
+      std::vector<double>& B = block_B;
+      std::fill(B.begin(), B.begin() + num_clusters, 0.0);
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
         if (w_cell == 0.0) continue;
         const double* rho_cell =
             &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
+        for (uint32_t k = 0; k < num_clusters; ++k) {
+          B[k] += w_cell * rho_cell[k];
+        }
+      }
+
+      // AC accumulation: events loop is now (cluster, pass) → (event), with
+      // weight `B[k] · pi[p]` instead of per-cell weight. Result is the same
+      // sum, modulo floating-point summation order.
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        const double Bk = B[k];
+        if (Bk == 0.0) continue;
         for (uint32_t p = 0; p < num_passes; ++p) {
-          const double w_cp_factor = w_cell * pi[p];
-          if (w_cp_factor == 0.0) continue;
-          for (uint32_t k = 0; k < num_clusters; ++k) {
-            const double w = w_cp_factor * rho_cell[k];
-            if (w == 0.0) continue;
-            const uint32_t cp = k * num_passes + p;
-            std::vector<double>& h_row = ac_h[cp];
-            std::vector<double>& N_row = ac_N[cp];
-            for (const auto& entry : summary.h_entries) {
-              h_row[entry.first] += w * static_cast<double>(entry.second);
-            }
-            for (const auto& entry : summary.N_entries) {
-              N_row[entry.first] += w * static_cast<double>(entry.second);
-            }
+          const double w = Bk * pi[p];
+          if (w == 0.0) continue;
+          const uint32_t cp = k * num_passes + p;
+          std::vector<double>& h_row = ac_h[cp];
+          std::vector<double>& N_row = ac_N[cp];
+          for (const auto& entry : summary.h_entries) {
+            h_row[entry.first] += w * static_cast<double>(entry.second);
+          }
+          for (const auto& entry : summary.N_entries) {
+            N_row[entry.first] += w * static_cast<double>(entry.second);
           }
         }
       }
 
-      // NZ accumulation (forward).
+      // NZ accumulation: pb depends only on (block, pass), so precompute it
+      // outside the cluster loop. Same B[k] aggregation collapses the cell
+      // axis here too.
       if (include_nz) {
         const uint32_t y = b / grid_w;
         const uint32_t x = b % grid_w;
@@ -461,40 +479,35 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           pi_left = pi_cache[c][b_left].data();
           nz_left = d.block_nonzeros[c][b_left];
         }
-        for (uint32_t cell = 0; cell < num_cells; ++cell) {
-          const double w_cell = cell_weight[cell];
-          if (w_cell == 0.0) continue;
-          const double* rho_cell =
-              &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
-          for (uint32_t p = 0; p < num_passes; ++p) {
-            double pass_nz_top = (y > 0) ? pi_top[p] *
-                                                static_cast<double>(nz_top)
-                                         : 0.0;
-            double pass_nz_left = (x > 0) ? pi_left[p] *
-                                                 static_cast<double>(nz_left)
-                                          : 0.0;
-            double predicted_nz;
-            if (x == 0 && y == 0) {
-              predicted_nz = 32.0;
-            } else if (x == 0) {
-              predicted_nz = pass_nz_top;
-            } else if (y == 0) {
-              predicted_nz = pass_nz_left;
-            } else {
-              predicted_nz = (pass_nz_top + pass_nz_left + 1.0) / 2.0;
-            }
-            const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
-            const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
-            const uint32_t bin_zero = NZHistogramIndex(pb, 0);
-            const double pi_p = pi[p];
-            for (uint32_t k = 0; k < num_clusters; ++k) {
-              const double weight = w_cell * rho_cell[k];
-              if (weight == 0.0) continue;
-              const uint32_t cp = k * num_passes + p;
-              nz_N[cp][pb] += weight;
-              nz_h[cp][bin_real] += weight * pi_p;
-              nz_h[cp][bin_zero] += weight * (1.0 - pi_p);
-            }
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          double pass_nz_top = (y > 0) ? pi_top[p] *
+                                              static_cast<double>(nz_top)
+                                       : 0.0;
+          double pass_nz_left = (x > 0) ? pi_left[p] *
+                                               static_cast<double>(nz_left)
+                                        : 0.0;
+          double predicted_nz;
+          if (x == 0 && y == 0) {
+            predicted_nz = 32.0;
+          } else if (x == 0) {
+            predicted_nz = pass_nz_top;
+          } else if (y == 0) {
+            predicted_nz = pass_nz_left;
+          } else {
+            predicted_nz = (pass_nz_top + pass_nz_left + 1.0) / 2.0;
+          }
+          const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
+          const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
+          const uint32_t bin_zero = NZHistogramIndex(pb, 0);
+          const double pi_p = pi[p];
+          const double one_minus_pi_p = 1.0 - pi_p;
+          for (uint32_t k = 0; k < num_clusters; ++k) {
+            const double Bk = B[k];
+            if (Bk == 0.0) continue;
+            const uint32_t cp = k * num_passes + p;
+            nz_N[cp][pb] += Bk;
+            nz_h[cp][bin_real] += Bk * pi_p;
+            nz_h[cp][bin_zero] += Bk * one_minus_pi_p;
           }
         }
       }
@@ -567,7 +580,9 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   }
 
   // Per-block backward storage.
-  AxisBucketBackward back0, back1, back2;
+  AxisBucketBackward back0;
+  AxisBucketBackward back1;
+  AxisBucketBackward back2;
   std::vector<double> dL_dcell(num_cells, 0.0);
   std::vector<double> dL_dpi(num_passes, 0.0);
   std::vector<std::vector<double>> dL_dw_ax(3);
@@ -595,6 +610,15 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       }
     }
   }
+
+  // Per-block-per-(cluster, pass) scratch tables for the factored backward.
+  // `delta_ac_kp[cp]` is the events-aggregated AC gradient at slot cp;
+  // `nz_T_kp[cp]` and `nz_diff_h_kp[cp]` carry the NZ-derived per-(k,p)
+  // factors. `block_D[k]` is the per-block per-cluster reduction over passes.
+  std::vector<double> delta_ac_kp(cp_count, 0.0);
+  std::vector<double> nz_T_kp(include_nz ? cp_count : 0, 0.0);
+  std::vector<double> nz_diff_h_kp(include_nz ? cp_count : 0, 0.0);
+  std::vector<double> block_D(num_clusters, 0.0);
 
   for (uint32_t c = 0; c < d.channels; ++c) {
     const uint32_t nb = d.num_blocks[c];
@@ -634,46 +658,51 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       std::fill(dL_dcell.begin(), dL_dcell.end(), 0.0);
       std::fill(dL_dpi.begin(), dL_dpi.end(), 0.0);
 
-      // AC contribution (iteration 5 soft cluster): sum over (cell, pass, k)
-      // tuples. For this block,
-      //   h contribution at (cp, bin) = gamma[cell] * pi[p] * rho[k] * count
-      // so partials at (cell, p, k) split as
-      //   dL/dgamma  += pi * rho * delta_ac
-      //   dL/dpi     += gamma * rho * delta_ac
-      //   dL/drho[k] += gamma * pi * delta_ac
-      // where delta_ac = sum_events count * dL/dh[cp][bin] +
-      //                  sum_events count * dL/dN[cp][zdc].
+      // Per-block per-cluster aggregate `B[k] = sum_cell w_cell·rho[c,cell,k]`.
+      // Matches the forward pass; reused by both AC and NZ backward to factor
+      // the cell axis out of the inner loops.
+      std::vector<double>& B = block_B;
+      std::fill(B.begin(), B.begin() + num_clusters, 0.0);
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
+        if (w_cell == 0.0) continue;
         const double* rho_cell =
             &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
-        double* dL_drho_cell =
-            &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
-        for (uint32_t p = 0; p < num_passes; ++p) {
-          for (uint32_t k = 0; k < num_clusters; ++k) {
-            const uint32_t cp = k * num_passes + p;
-            double delta = 0.0;
-            const std::vector<double>& h_row = dL_dh[cp];
-            const std::vector<double>& N_row = dL_dN[cp];
-            for (const auto& entry : summary.h_entries) {
-              delta +=
-                  static_cast<double>(entry.second) * h_row[entry.first];
-            }
-            for (const auto& entry : summary.N_entries) {
-              delta +=
-                  static_cast<double>(entry.second) * N_row[entry.first];
-            }
-            const double rho_k = rho_cell[k];
-            dL_dpi[p] += w_cell * rho_k * delta;
-            dL_dcell[cell] += pi[p] * rho_k * delta;
-            dL_drho_cell[k] += w_cell * pi[p] * delta;
-          }
+        for (uint32_t k = 0; k < num_clusters; ++k) {
+          B[k] += w_cell * rho_cell[k];
         }
       }
 
-      // NZ contribution: pb is held constant (no gradient flows through
-      // predicted_nz); dL/dpi[p] picks up the h_real/h_zero split, dL/dcell
-      // picks up both h weighted by pi / (1-pi) and the N term.
+      // AC contribution: per-(k, p) `delta_ac[cp]` aggregates events once per
+      // (cluster, pass) — eliminating the cell axis from the events walk.
+      // Forward at (cp, bin) is `gamma·pi·rho·count`; partials wrt the three
+      // soft membership axes split as before but factor through B[k]:
+      //   dL/dpi[p]   = sum_k B[k] · delta_ac[k*P+p]
+      //   dL/dcell    = sum_k rho_cell[k] · D[k],  D[k] = sum_p pi[p]·delta
+      //   dL/drho[c,cell,k] += w_cell · D[k]
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          const uint32_t cp = k * num_passes + p;
+          double delta = 0.0;
+          const std::vector<double>& h_row = dL_dh[cp];
+          const std::vector<double>& N_row = dL_dN[cp];
+          for (const auto& entry : summary.h_entries) {
+            delta +=
+                static_cast<double>(entry.second) * h_row[entry.first];
+          }
+          for (const auto& entry : summary.N_entries) {
+            delta +=
+                static_cast<double>(entry.second) * N_row[entry.first];
+          }
+          delta_ac_kp[cp] = delta;
+        }
+      }
+
+      // NZ contribution: pb is per-(block, pass), so precompute outside the
+      // cluster loop. For each (k, p) we record:
+      //   nz_diff_h[cp] = h_real_g − h_zero_g  (drives dL/dpi)
+      //   nz_T_kp[cp]   = pi_p·h_real_g + (1−pi_p)·h_zero_g + N_g
+      //                   (combines into D[k] for cell/rho gradients)
       if (include_nz) {
         const uint32_t y = b / grid_w;
         const uint32_t x = b % grid_w;
@@ -692,49 +721,77 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           pi_left = pi_cache[c][b_left].data();
           nz_left = d.block_nonzeros[c][b_left];
         }
-        for (uint32_t cell = 0; cell < num_cells; ++cell) {
-          const double w_cell = cell_weight[cell];
-          if (w_cell == 0.0) continue;
-          const double* rho_cell =
-              &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
-          double* dL_drho_cell =
-              &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
-          for (uint32_t p = 0; p < num_passes; ++p) {
-            double pass_nz_top = (y > 0) ? pi_top[p] *
-                                                static_cast<double>(nz_top)
-                                         : 0.0;
-            double pass_nz_left = (x > 0) ? pi_left[p] *
-                                                 static_cast<double>(nz_left)
-                                          : 0.0;
-            double predicted_nz;
-            if (x == 0 && y == 0) {
-              predicted_nz = 32.0;
-            } else if (x == 0) {
-              predicted_nz = pass_nz_top;
-            } else if (y == 0) {
-              predicted_nz = pass_nz_left;
-            } else {
-              predicted_nz = (pass_nz_top + pass_nz_left + 1.0) / 2.0;
-            }
-            const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
-            const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
-            const uint32_t bin_zero = NZHistogramIndex(pb, 0);
-            const double pi_p = pi[p];
-            for (uint32_t k = 0; k < num_clusters; ++k) {
-              const uint32_t cp = k * num_passes + p;
-              const double h_real_g = dL_dnz_h[cp][bin_real];
-              const double h_zero_g = dL_dnz_h[cp][bin_zero];
-              const double N_g = dL_dnz_N[cp][pb];
-              // Common factor T = pi*h_real + (1-pi)*h_zero + N.
-              const double T =
-                  pi_p * h_real_g + (1.0 - pi_p) * h_zero_g + N_g;
-              const double rho_k = rho_cell[k];
-              dL_dpi[p] += w_cell * rho_k * (h_real_g - h_zero_g);
-              dL_dcell[cell] += rho_k * T;
-              dL_drho_cell[k] += w_cell * T;
-            }
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          double pass_nz_top = (y > 0) ? pi_top[p] *
+                                              static_cast<double>(nz_top)
+                                       : 0.0;
+          double pass_nz_left = (x > 0) ? pi_left[p] *
+                                               static_cast<double>(nz_left)
+                                        : 0.0;
+          double predicted_nz;
+          if (x == 0 && y == 0) {
+            predicted_nz = 32.0;
+          } else if (x == 0) {
+            predicted_nz = pass_nz_top;
+          } else if (y == 0) {
+            predicted_nz = pass_nz_left;
+          } else {
+            predicted_nz = (pass_nz_top + pass_nz_left + 1.0) / 2.0;
+          }
+          const uint32_t pb = PredictorBucketFromPredictedNZ(predicted_nz);
+          const uint32_t bin_real = NZHistogramIndex(pb, nz_b);
+          const uint32_t bin_zero = NZHistogramIndex(pb, 0);
+          const double pi_p = pi[p];
+          const double one_minus_pi_p = 1.0 - pi_p;
+          for (uint32_t k = 0; k < num_clusters; ++k) {
+            const uint32_t cp = k * num_passes + p;
+            const double h_real_g = dL_dnz_h[cp][bin_real];
+            const double h_zero_g = dL_dnz_h[cp][bin_zero];
+            const double N_g = dL_dnz_N[cp][pb];
+            nz_diff_h_kp[cp] = h_real_g - h_zero_g;
+            nz_T_kp[cp] = pi_p * h_real_g + one_minus_pi_p * h_zero_g + N_g;
           }
         }
+      }
+
+      // Build D[k] = sum_p (pi[p] · delta_ac[cp] + nz_T_kp[cp]) and pi-axis
+      // gradient sums.
+      std::vector<double>& D = block_D;
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        double dk = 0.0;
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          const uint32_t cp = k * num_passes + p;
+          dk += pi[p] * delta_ac_kp[cp];
+          if (include_nz) dk += nz_T_kp[cp];
+        }
+        D[k] = dk;
+      }
+
+      // dL/dpi[p] from AC and NZ contributions, factored via B[k].
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        const double Bk = B[k];
+        if (Bk == 0.0) continue;
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          const uint32_t cp = k * num_passes + p;
+          dL_dpi[p] += Bk * delta_ac_kp[cp];
+          if (include_nz) dL_dpi[p] += Bk * nz_diff_h_kp[cp];
+        }
+      }
+
+      // dL/dcell[cell] = sum_k rho_cell[k] · D[k]; dL/drho[c,cell,k] +=
+      // w_cell · D[k]. Single per-cell pass over clusters covers both.
+      for (uint32_t cell = 0; cell < num_cells; ++cell) {
+        const double w_cell = cell_weight[cell];
+        const double* rho_cell =
+            &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
+        double* dL_drho_cell =
+            &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
+        double sum_rho_D = 0.0;
+        for (uint32_t k = 0; k < num_clusters; ++k) {
+          sum_rho_D += rho_cell[k] * D[k];
+          dL_drho_cell[k] += w_cell * D[k];
+        }
+        dL_dcell[cell] += sum_rho_D;
       }
 
       // Softmax Jacobian: dL/dlogit[q] = pi[q] * (dL/dpi[q] - s) / tau_pi,
@@ -1029,49 +1086,63 @@ OptimizeResult RunGradientJointSolve(const JPEGOptData& d,
   int64_t total_adam_ns = 0;
   double prev_cost = result.init_cost_bits;
 
-  for (uint32_t t = 0; t < total_iters; ++t) {
-    auto start_iter = PlannerClock::now();
-
-    ApplyAnnealing(schedule, t, state);
+  // Pre-loop forward+grad: applies anneal-step-0 and computes the gradient
+  // that iter 0's AdamStep will consume. Subsequent iters reuse the *next*
+  // iter's "after-step" forward as both their gradient computation and the
+  // post-step cost report — so the per-iter print reflects the cost AFTER
+  // this iter's update. The total number of forward+grad calls stays at
+  // `total_iters`; we add only one forward-only call at the very end.
+  if (total_iters > 0) {
+    ApplyAnnealing(schedule, 0, state);
     ResetGradientJointGrad(*state, &grad);
-
     auto start_fwd = PlannerClock::now();
-    const SoftCostResult r = ComputeSoftTotalCostWithGrad(d, *state, &grad);
+    SoftCostResult r = ComputeSoftTotalCostWithGrad(d, *state, &grad);
     auto end_fwd = PlannerClock::now();
     total_fwd_ns += ElapsedNanos(start_fwd, end_fwd);
 
-    auto start_adam = PlannerClock::now();
-    AdamStep(grad, adam_cfg, &adam, state);
-    ProjectThresholdsMonotonic(state);
-    auto end_adam = PlannerClock::now();
-    total_adam_ns += ElapsedNanos(start_adam, end_adam);
+    for (uint32_t t = 0; t < total_iters; ++t) {
+      auto start_iter = PlannerClock::now();
 
-    result.final_cost_bits = r.total_cost_bits;
-    ++result.iters_taken;
+      auto start_adam = PlannerClock::now();
+      AdamStep(grad, adam_cfg, &adam, state);
+      ProjectThresholdsMonotonic(state);
+      auto end_adam = PlannerClock::now();
+      total_adam_ns += ElapsedNanos(start_adam, end_adam);
 
-    auto end_iter = PlannerClock::now();
-    const bool is_hot = t < schedule.hot_iters;
-    const double delta = r.total_cost_bits - prev_cost;
-    const double pct = (prev_cost != 0.0) ? (delta / prev_cost) * 100.0 : 0.0;
-    fprintf(stderr,
-            "PLANNER: [gradient] [(%u,%u,%u) P=%u] Iter %u/%u (%s) "
-            "cost=%.2f bits delta=%+.2f (%+.3f%%) "
-            "fwd=%.2f ms adam=%.2f ms total=%.2f ms\n",
-            fa, fb, fc, num_passes,
-            t + 1, total_iters, is_hot ? "hot" : "anneal",
-            r.total_cost_bits, delta, pct,
-            NanosToMs(ElapsedNanos(start_fwd, end_fwd)),
-            NanosToMs(ElapsedNanos(start_adam, end_adam)),
-            NanosToMs(ElapsedNanos(start_iter, end_iter)));
-    fflush(stderr);
-    prev_cost = r.total_cost_bits;
-  }
+      // Forward at the post-step state. For all but the last iter this
+      // doubles as the next iter's gradient computation; for the last iter
+      // it is forward-only.
+      auto fwd_start = PlannerClock::now();
+      if (t + 1 < total_iters) {
+        ApplyAnnealing(schedule, t + 1, state);
+        ResetGradientJointGrad(*state, &grad);
+        r = ComputeSoftTotalCostWithGrad(d, *state, &grad);
+      } else {
+        r = ComputeSoftTotalCost(d, *state);
+      }
+      auto fwd_end = PlannerClock::now();
+      total_fwd_ns += ElapsedNanos(fwd_start, fwd_end);
 
-  // Compute cost at the actual final state (after the last Adam step).
-  // The in-loop `final_cost_bits` is the cost before the last update.
-  {
-    const SoftCostResult final_r = ComputeSoftTotalCost(d, *state);
-    result.final_cost_bits = final_r.total_cost_bits;
+      result.final_cost_bits = r.total_cost_bits;
+      ++result.iters_taken;
+
+      auto end_iter = PlannerClock::now();
+      const bool is_hot = t < schedule.hot_iters;
+      const double delta = r.total_cost_bits - prev_cost;
+      const double pct = (prev_cost != 0.0) ? (delta / prev_cost) * 100.0 : 0.0;
+      fprintf(stderr,
+              "PLANNER: [gradient] [(%u,%u,%u) P=%u] Iter %u/%u (%s) "
+              "cost=%.2f bits delta=%+.2f (%+.3f%%) "
+              "fwd=%.2f ms adam=%.2f ms total=%.2f ms\n",
+              fa, fb, fc, num_passes,
+              t + 1, total_iters, is_hot ? "hot" : "anneal",
+              r.total_cost_bits, delta, pct,
+              NanosToMs(ElapsedNanos(fwd_start, fwd_end)),
+              NanosToMs(ElapsedNanos(start_adam, end_adam)),
+              NanosToMs(ElapsedNanos(start_iter, end_iter)));
+      fflush(stderr);
+      prev_cost = r.total_cost_bits;
+    }
   }
 
   auto end_solve = PlannerClock::now();
@@ -1134,12 +1205,12 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
     out.reserve(soft.size());
     int16_t prev = kMinDC - 1;
     for (double v : soft) {
-      long vi = std::lround(v);
-      if (vi < kMinDC) vi = kMinDC;
-      if (vi > kMaxDC) vi = kMaxDC;
-      int16_t val = static_cast<int16_t>(vi);
-      if (val <= prev) val = static_cast<int16_t>(prev + 1);
-      if (val > kMaxDC) val = kMaxDC;
+      const int64_t vi64 = std::llround(v);
+      const int16_t clamped = static_cast<int16_t>(
+          std::min<int64_t>(kMaxDC, std::max<int64_t>(kMinDC, vi64)));
+      int16_t val = std::min<int16_t>(
+          kMaxDC,
+          std::max<int16_t>(clamped, static_cast<int16_t>(prev + 1)));
       out.push_back(val);
       prev = val;
     }
@@ -1190,25 +1261,34 @@ GradientJointState InitGradientJointStateFromFactorization(
       (state.thresholds[0].size() + 1) * (state.thresholds[1].size() + 1) *
       (state.thresholds[2].size() + 1));
 
-  // Pass logits: small bias toward pass 0 to break symmetry (otherwise uniform
-  // zero logits produce identical histograms across passes → zero gradient).
-  // The bias is chosen to be noticeable at temperature ~1 but small enough
-  // that the optimizer can easily overcome it.
+  // Pass logits: per-block round-robin bias so block `b` starts biased toward
+  // pass `b % num_passes`. The bias is chosen to be noticeable at temperature
+  // ~1 but small enough that the optimizer can easily overcome it. Per-block
+  // variation here mirrors the per-cell round-robin on cluster logits below;
+  // both are needed so the soft state isn't degenerate along any axis.
   constexpr double kPassSymmetryBreak = 0.5;
   for (uint32_t c = 0; c < kNumCh; ++c) {
     const uint32_t nb = d.num_blocks[c];
     state.pass_logits[c].assign(static_cast<size_t>(nb) * num_passes, 0.0);
     for (uint32_t b = 0; b < nb; ++b) {
-      state.pass_logits[c][static_cast<size_t>(b) * num_passes] =
+      const uint32_t p = b % num_passes;
+      state.pass_logits[c][static_cast<size_t>(b) * num_passes + p] =
           kPassSymmetryBreak;
     }
     if (c < d.channels) {
-      // Cluster logits: small bias toward cluster 0 to break symmetry.
+      // Cluster logits: per-cell round-robin bias so each cell starts biased
+      // toward a different cluster. Without per-cell variation `rho` is the
+      // same across cells, which collapses `dL_dcell[cell] = sum_k rho[k]·D[k]`
+      // to a constant — and that makes the threshold-axis gradient exactly
+      // zero (the cell-difference cancels in the axis decomposition). The
+      // round-robin ensures each cell sees a distinct rho profile, breaking
+      // the threshold saddle without RNG plumbing.
       constexpr double kClusterSymmetryBreak = 0.5;
       state.cluster_logits[c].assign(
           static_cast<size_t>(state.num_cells) * num_clusters, 0.0);
       for (uint32_t cell = 0; cell < state.num_cells; ++cell) {
-        state.cluster_logits[c][static_cast<size_t>(cell) * num_clusters] =
+        const uint32_t k = cell % num_clusters;
+        state.cluster_logits[c][static_cast<size_t>(cell) * num_clusters + k] =
             kClusterSymmetryBreak;
       }
     } else {
@@ -1220,24 +1300,13 @@ GradientJointState InitGradientJointStateFromFactorization(
 
 namespace {
 
-// Mirrors `ComputeMaxNumPasses` in `enc_jpeg_passes.cc` (not exported there).
-// Upper bound on pass count from image group geometry; JPEG XL standard caps
-// at 11 total passes.
-uint32_t ComputeMaxNumPassesLocal(const JPEGOptData& d) {
-  const double groups_x = static_cast<double>((d.w_max + 31) / 32);
-  const double groups_y = static_cast<double>((d.h_max + 31) / 32);
-  const double groups = std::max(1.0, groups_x * groups_y);
-  return static_cast<uint32_t>(
-      std::min(11.0, std::ceil(std::log2(groups)) + 1.0));
-}
-
 // Resolves `(min_passes, max_passes)` from `effort.optimize_passes_num`:
 //   -1  -> force 1 pass (disabled)
 //    0  -> sweep `[1, ComputeMaxNumPasses]`
 //    K  -> force exactly K passes
 std::pair<uint32_t, uint32_t> ResolvePassRange(
     const JPEGOptData& d, const JPEGCtxEffortParams& effort) {
-  const uint32_t max_img = ComputeMaxNumPassesLocal(d);
+  const uint32_t max_img = ComputeMaxNumPasses(d);
   const uint32_t min_passes =
       effort.optimize_passes_num <= 0
           ? 1

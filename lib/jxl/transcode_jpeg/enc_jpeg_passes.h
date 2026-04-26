@@ -64,6 +64,11 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool);
 
+// Upper bound on the number of progressive passes worth considering, derived
+// from image group geometry. JPEG XL caps total passes at 11; this returns
+// `min(11, ceil(log2(num_groups)) + 1)`.
+uint32_t ComputeMaxNumPasses(const JPEGOptData& d);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_PASSES_H_

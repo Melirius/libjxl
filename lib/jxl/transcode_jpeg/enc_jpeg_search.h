@@ -142,8 +142,8 @@ struct JPEGCtxEffortParams {
                 /*bicluster_refine_thresholds=*/false,
                 /*bicluster_threshold_first=*/true,
                 /*use_gradient_joint_search=*/true,
-                /*grad_hot_iters=*/20,
-                /*grad_anneal_iters=*/120,
+                /*grad_hot_iters=*/50,
+                /*grad_anneal_iters=*/250,
                 /*grad_init_temperature=*/0.1,
                 /*grad_lr=*/0.01};
       case SpeedTier::kGlacier:

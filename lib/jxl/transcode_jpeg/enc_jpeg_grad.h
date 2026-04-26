@@ -4,25 +4,30 @@
 // license that can be found in the LICENSE file.
 
 // Gradient-based joint-relaxation optimizer for JPEG lossless recompression
-// (Lane B from plans/in-the-pass-aware-scheme-keen-barto.md).
+// (Lane B from plans/in-the-pass-aware-scheme-keen-barto.md). See
+// plans/lane_b_progress.md for the iteration-by-iteration history.
 //
-// Iteration 1 status: forward pass for the AC cost component only. NZ cost,
-// signalling overhead, soft row->prototype assignment, analytic gradients, and
-// the Adam/annealing loop are deferred to later iterations (see
-// plans/lane_b_progress.md).
+// `GradientJointState` holds three continuous-variable bundles that the
+// optimizer can move through gradient descent:
+//   - `thresholds`      — per-axis DC thresholds, real-valued (rounded back to
+//                         int16_t when collapsing to a hard `PassSearchResult`).
+//   - `pass_logits`     — per-block pre-softmax pass weights.
+//   - `cluster_logits`  — per-(channel, cell) pre-softmax cluster weights.
+// Each bundle has its own sigmoid/softmax temperature; annealing all three
+// to ~0 collapses the soft state back to a hard one-hot assignment.
 //
-// The state `GradientJointState` holds the continuous variables being
-// optimized:
-//   - `thresholds` — DC thresholds per axis (continuous reals, shared storage
-//     with the existing integer `ThresholdSet` after rounding).
-//   - `threshold_temperature` — sigmoid temperature for soft cell membership.
-//   - `pass_logits` — per-block pre-softmax pass weights.
-//   - `pass_temperature` — softmax temperature for pass assignment.
+// `ComputeSoftTotalCost` is the load-bearing forward pass: it walks every
+// block of `JPEGOptData`, applies the three soft membership weights, and
+// reduces to AC entropy + NZ entropy + signalling overhead. Counts match the
+// existing `EvaluatePassAwareModel` at temperatures → 0; gradient flows
+// analytically through entropy terms, signalling overhead is held constant.
 //
-// The forward pass `ComputeSoftACCost` computes the AC entropy cost under the
-// current soft state, reusing the existing `ctx_map` as a fixed hard clustering.
-// The cost formula mirrors the hard version in `EvaluatePassAwareModel` but
-// aggregates counts with soft weights.
+// `RunGradientJointSolve` is the inner Adam + annealing loop for a single
+// `(factorization, num_passes)` configuration.
+// `SearchGradientJointContextModel` is the public entry point used by
+// `enc_jpeg_frame.cc` when `effort.use_gradient_joint_search` is set: it
+// sweeps `(factorization, num_passes)` tuples in parallel and returns the
+// hard-rounded `PassSearchResult` with the lowest final cost.
 
 #ifndef LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_
 #define LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_

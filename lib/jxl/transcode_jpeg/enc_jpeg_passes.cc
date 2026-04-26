@@ -125,6 +125,8 @@ StatusOr<PassAssignment> BuildRowClusterPassSeed(const JPEGOptData& d,
                                  num_passes);
 }
 
+}  // namespace (close anonymous namespace - exported functions follow)
+
 // Upper bound for the number of progressive passes worth considering from
 // the image size. 11 is a hard limit by the standard, and number of
 // histogram clusters is limited by max `num_hf_presets` which is written by
@@ -136,8 +138,6 @@ uint32_t ComputeMaxNumPasses(const JPEGOptData& d) {
   return static_cast<uint32_t>(
       std::min(11.0, std::ceil(std::log2(groups)) + 1.0));
 }
-
-}  // namespace (close anonymous namespace - exported functions follow)
 
 StatusOr<PassSearchResult> SearchPassAwareContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,

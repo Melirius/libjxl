@@ -444,18 +444,6 @@ ThresholdSet RefinePassAwareThresholds(
                                 effort.refine_iters, &ignored_cost);
 }
 
-// Upper bound for the number of progressive passes worth considering from
-// the image size. 11 is a hard limit by the standard, and number of
-// histogram clusters is limited by max `num_hf_presets` which is written by
-// `u(ceil(log2(num_groups))) + 1`.
-uint32_t ComputeMaxNumPasses(const JPEGOptData& d) {
-  const double groups_x = static_cast<double>((d.w_max + 31) / 32);
-  const double groups_y = static_cast<double>((d.h_max + 31) / 32);
-  const double groups = std::max(1.0, groups_x * groups_y);
-  return static_cast<uint32_t>(
-      std::min(11.0, std::ceil(std::log2(groups)) + 1.0));
-}
-
 FixedPointCost ComputePassOverhead(const JPEGOptData& d) {
   // Legacy flat estimate kept for the older pass-aware scorer.
   uint32_t groups_x = (d.w_max + 31) / 32;
