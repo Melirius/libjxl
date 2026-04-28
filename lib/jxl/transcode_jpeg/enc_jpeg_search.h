@@ -149,11 +149,11 @@ struct JPEGCtxEffortParams {
                 /*bicluster_refine_thresholds=*/false,
                 /*bicluster_threshold_first=*/true,
                 /*use_gradient_joint_search=*/true,
-                /*grad_hot_iters=*/50,
-                /*grad_anneal_iters=*/250,
+                /*grad_hot_iters=*/20,
+                /*grad_anneal_iters=*/30,
                 /*grad_init_temperature=*/0.1,
-                /*grad_lr=*/0.01,
-                /*grad_overhead_aware_reduce=*/true};
+                /*grad_lr=*/0.1,
+                /*grad_overhead_aware_reduce=*/false};
       case SpeedTier::kGlacier:
       case SpeedTier::kTectonicPlate:
       default:

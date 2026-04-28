@@ -12,11 +12,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -54,6 +59,7 @@
 #include "lib/jxl/enc_fields.h"
 #include "lib/jxl/enc_group.h"
 #include "lib/jxl/enc_heuristics.h"
+#include "lib/jxl/enc_icc_codec.h"
 #include "lib/jxl/enc_jpeg_frame.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
@@ -2040,6 +2046,180 @@ Status OutputGroups(std::vector<std::unique_ptr<BitWriter>>&& group_codes,
   return true;
 }
 
+std::string GradientCandidateDumpPrefix() {
+  // Debug-only hook for correlating the gradient optimizer's target with real
+  // encoded sizes. When set, every rounded gradient candidate is replayed
+  // through the normal one-shot frame encoder and written as
+  // `<prefix>_<idx>_fAA-BB-CC_pPP.jxl`, with a `<prefix>_manifest.csv`.
+  const char* env = std::getenv("JXL_DEBUG_GRADIENT_SAVE_PREFIX");
+  if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) {
+    return {};
+  }
+  std::string prefix = env;
+  if (prefix == "1") prefix = "gradient_candidate";
+  if (!prefix.empty() && prefix.back() == '/') {
+    prefix += "gradient_candidate";
+  }
+  return prefix;
+}
+
+std::string GradientCandidatePath(
+    const std::string& prefix, size_t index,
+    const JPEGPassEncodingDebugCandidate& candidate) {
+  char suffix[160];
+  std::snprintf(suffix, sizeof(suffix),
+                "_%03" PRIuS "_f%02u-%02u-%02u_p%02u%s.jxl", index,
+                candidate.factorization[0], candidate.factorization[1],
+                candidate.factorization[2], candidate.plan.num_passes,
+                candidate.is_best ? "_best" : "");
+  return prefix + suffix;
+}
+
+Status WriteBytesToFile(const std::string& path, const PaddedBytes& bytes) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (f == nullptr) {
+    return JXL_FAILURE("Failed to open %s for writing: %s", path.c_str(),
+                       std::strerror(errno));
+  }
+  const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), f);
+  const int close_result = std::fclose(f);
+  if (written != bytes.size()) {
+    return JXL_FAILURE("Failed to write %s: %s", path.c_str(),
+                       std::strerror(errno));
+  }
+  if (close_result != 0) {
+    return JXL_FAILURE("Failed to close %s: %s", path.c_str(),
+                       std::strerror(errno));
+  }
+  return true;
+}
+
+Status EncodeJPEGPassPlanFrameBytes(
+    JxlMemoryManager* memory_manager, const CompressParams& cparams,
+    const FrameInfo& frame_info, const CodecMetadata* metadata,
+    JxlEncoderChunkedFrameAdapter& frame_data, const jpeg::JPEGData* jpeg_data,
+    const JxlCmsInterface& cms, ThreadPool* pool,
+    const FrameHeader& base_frame_header, const JPEGPassEncodingPlan& plan,
+    PaddedBytes* frame_bytes) {
+  auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
+  enc_state->has_jpeg_pass_plan = true;
+  enc_state->jpeg_pass_plan = plan;
+
+  FrameHeader frame_header = base_frame_header;
+  frame_header.passes = plan.passes;
+
+  JXL_ASSIGN_OR_RETURN(auto enc_modular,
+                       ModularFrameEncoder::Create(memory_manager, frame_header,
+                                                   cparams, false));
+  std::vector<std::unique_ptr<BitWriter>> group_codes;
+  JXL_RETURN_IF_ERROR(ComputeEncodingData(
+      cparams, frame_info, metadata, frame_data, jpeg_data, 0, 0,
+      frame_data.xsize, frame_data.ysize, cms, pool, frame_header, *enc_modular,
+      *enc_state, &group_codes, /*aux_out=*/nullptr));
+
+  BitWriter writer{memory_manager};
+  JXL_RETURN_IF_ERROR(writer.AppendByteAligned(enc_state->special_frames));
+  JXL_RETURN_IF_ERROR(
+      WriteFrameHeader(frame_header, &writer, /*aux_out=*/nullptr));
+
+  std::vector<coeff_order_t> permutation;
+  JXL_RETURN_IF_ERROR(PermuteGroups(cparams, enc_state->shared.frame_dim,
+                                    plan.num_passes, &permutation,
+                                    &group_codes));
+
+  JXL_RETURN_IF_ERROR(
+      WriteGroupOffsets(group_codes, permutation, &writer, /*aux_out=*/nullptr));
+
+  JXL_RETURN_IF_ERROR(writer.AppendByteAligned(group_codes));
+  *frame_bytes = std::move(writer).TakeBytes();
+  return true;
+}
+
+Status BuildDebugCodestream(JxlMemoryManager* memory_manager,
+                            const CodecMetadata* metadata,
+                            const PaddedBytes& frame_bytes,
+                            PaddedBytes* codestream) {
+  CodecMetadata metadata_copy = *metadata;
+  BitWriter writer{memory_manager};
+  JXL_RETURN_IF_ERROR(
+      WriteCodestreamHeaders(&metadata_copy, &writer, /*aux_out=*/nullptr));
+  if (metadata_copy.m.color_encoding.WantICC()) {
+    JXL_RETURN_IF_ERROR(WriteICC(
+        Span<const uint8_t>(metadata_copy.m.color_encoding.ICC()), &writer,
+        LayerType::Header, /*aux_out=*/nullptr));
+  }
+  JXL_RETURN_IF_ERROR(
+      writer.WithMaxBits(8, LayerType::Header, /*aux_out=*/nullptr, [&] {
+        writer.ZeroPadToByte();
+        return true;
+      }));
+  *codestream = std::move(writer).TakeBytes();
+  JXL_RETURN_IF_ERROR(codestream->append(frame_bytes));
+  return true;
+}
+
+Status MaybeDumpGradientCandidateFiles(
+    JxlMemoryManager* memory_manager, const std::string& prefix,
+    const CompressParams& cparams, const FrameInfo& frame_info,
+    const CodecMetadata* metadata, JxlEncoderChunkedFrameAdapter& frame_data,
+    const jpeg::JPEGData* jpeg_data, const JxlCmsInterface& cms,
+    ThreadPool* pool, const FrameHeader& frame_header,
+    const std::vector<JPEGPassEncodingDebugCandidate>& candidates) {
+  if (prefix.empty() || candidates.empty()) return true;
+
+  const std::string manifest_path = prefix + "_manifest.csv";
+  FILE* manifest = std::fopen(manifest_path.c_str(), "wb");
+  if (manifest == nullptr) {
+    return JXL_FAILURE("Failed to open %s for writing: %s",
+                       manifest_path.c_str(), std::strerror(errno));
+  }
+  std::fprintf(manifest,
+               "index,path,real_size_bytes,target_bits,ac_bits,nz_bits,"
+               "overhead_bits,num_passes,num_clusters,fa,fb,fc,is_best\n");
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const JPEGPassEncodingDebugCandidate& candidate = candidates[i];
+    PaddedBytes frame_bytes{memory_manager};
+    JXL_RETURN_IF_ERROR(EncodeJPEGPassPlanFrameBytes(
+        memory_manager, cparams, frame_info, metadata, frame_data, jpeg_data,
+        cms, pool, frame_header, candidate.plan, &frame_bytes));
+
+    PaddedBytes codestream{memory_manager};
+    JXL_RETURN_IF_ERROR(
+        BuildDebugCodestream(memory_manager, metadata, frame_bytes,
+                             &codestream));
+
+    const std::string path = GradientCandidatePath(prefix, i, candidate);
+    JXL_RETURN_IF_ERROR(WriteBytesToFile(path, codestream));
+    std::fprintf(
+        manifest,
+        "%" PRIuS
+        ",%s,%" PRIuS ",%.6f,%.6f,%.6f,%.6f,%u,%u,%u,%u,%u,%u\n",
+        i, path.c_str(), codestream.size(), candidate.target_cost_bits,
+        candidate.ac_cost_bits, candidate.nz_cost_bits,
+        candidate.signalling_overhead_bits, candidate.plan.num_passes,
+        candidate.num_clusters, candidate.factorization[0],
+        candidate.factorization[1], candidate.factorization[2],
+        static_cast<uint32_t>(candidate.is_best));
+    std::fprintf(stderr,
+                 "PLANNER: [gradient] wrote candidate %" PRIuS
+                 " to %s (%" PRIuS " bytes, target=%.2f bits)%s\n",
+                 i, path.c_str(), codestream.size(),
+                 candidate.target_cost_bits,
+                 candidate.is_best ? " ** BEST **" : "");
+    std::fflush(stderr);
+  }
+  const int close_result = std::fclose(manifest);
+  if (close_result != 0) {
+    return JXL_FAILURE("Failed to close %s: %s", manifest_path.c_str(),
+                       std::strerror(errno));
+  }
+  std::fprintf(stderr, "PLANNER: [gradient] wrote candidate manifest to %s\n",
+               manifest_path.c_str());
+  std::fflush(stderr);
+  return true;
+}
+
 void RemoveUnusedHistograms(EntropyEncodingData& codes) {
   std::vector<int> remap(256, -1);
   std::vector<uint8_t> inv_remap;
@@ -2137,6 +2317,8 @@ JXL_NOINLINE Status EncodeFrameStreaming(
   // Pass-aware JPEG recompression: run the planner and overwrite passes.
   // The planner computes CfL maps internally when CfL is enabled.
   if (pass_aware_jpeg && jpeg_data) {
+    const std::string gradient_dump_prefix = GradientCandidateDumpPrefix();
+    std::vector<JPEGPassEncodingDebugCandidate> gradient_debug_candidates;
     auto jpeg_c_map = JpegOrder(frame_header.color_transform,
                                 jpeg_data->components.size() == 1);
     bool cfl_enabled = cparams.force_cfl_jpeg_recompression &&
@@ -2151,9 +2333,14 @@ JXL_NOINLINE Status EncodeFrameStreaming(
     JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
         memory_manager, *jpeg_data, cparams.speed_tier,
         cparams.jpeg_optimize_passes_num, cfl_ctx,
-        enc_state->jpeg_pass_plan, pool));
+        enc_state->jpeg_pass_plan, pool,
+        gradient_dump_prefix.empty() ? nullptr : &gradient_debug_candidates));
     enc_state->has_jpeg_pass_plan = true;
     frame_header.passes = enc_state->jpeg_pass_plan.passes;
+    JXL_RETURN_IF_ERROR(MaybeDumpGradientCandidateFiles(
+        memory_manager, gradient_dump_prefix, cparams, frame_info, metadata,
+        frame_data, jpeg_data.get(), cms, pool, frame_header,
+        gradient_debug_candidates));
   }
   const size_t num_passes = pass_aware_jpeg
                                 ? frame_header.passes.num_passes
@@ -2346,6 +2533,8 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
   // The planner computes CfL maps internally when CfL is enabled.
   if (pass_aware_jpeg && jpeg_data) {
     fprintf(stderr, "PASS-AWARE: entering planner\n"); fflush(stderr);
+    const std::string gradient_dump_prefix = GradientCandidateDumpPrefix();
+    std::vector<JPEGPassEncodingDebugCandidate> gradient_debug_candidates;
     auto jpeg_c_map = JpegOrder(frame_header.color_transform,
                                 jpeg_data->components.size() == 1);
     bool cfl_enabled = cparams.force_cfl_jpeg_recompression &&
@@ -2362,11 +2551,16 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
     JXL_RETURN_IF_ERROR(PlanJPEGPassAwareRecompression(
         memory_manager, *jpeg_data, cparams.speed_tier,
         cparams.jpeg_optimize_passes_num, cfl_ctx,
-        enc_state->jpeg_pass_plan, pool));
+        enc_state->jpeg_pass_plan, pool,
+        gradient_dump_prefix.empty() ? nullptr : &gradient_debug_candidates));
     fprintf(stderr, "PASS-AWARE: planner done, %u passes\n",
             enc_state->jpeg_pass_plan.num_passes);
     enc_state->has_jpeg_pass_plan = true;
     frame_header.passes = enc_state->jpeg_pass_plan.passes;
+    JXL_RETURN_IF_ERROR(MaybeDumpGradientCandidateFiles(
+        memory_manager, gradient_dump_prefix, cparams, frame_info, metadata,
+        frame_data, jpeg_data.get(), cms, pool, frame_header,
+        gradient_debug_candidates));
   }
   const size_t num_passes = pass_aware_jpeg
                                 ? frame_header.passes.num_passes

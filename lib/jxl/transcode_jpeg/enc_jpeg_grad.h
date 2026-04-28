@@ -271,6 +271,14 @@ struct OptimizeResult {
   uint32_t iters_taken = 0;
 };
 
+struct GradientSearchCandidate {
+  PassSearchResult result;
+  double target_cost_bits = 0.0;
+  uint32_t factorization[3] = {};
+  uint32_t num_passes = 0;
+  bool is_best = false;
+};
+
 // Top-level optimizer loop. Runs `hot_iters + anneal_iters` rounds of
 // forward+backward + Adam step + annealing + monotonicity projection. Mutates
 // `state` in place. Returns init and final costs for smoke-test assertions.
@@ -305,6 +313,19 @@ GradientJointState InitGradientJointStateFromFactorization(
     uint32_t num_clusters, double threshold_temperature,
     double pass_temperature, double cluster_temperature);
 
+// Removes thresholds that don't actually separate clusters: for each axis,
+// scans thresholds and drops the ones whose adjacent buckets map to the
+// same cluster across every (channel, perpendicular-cell) combination.
+// Updates `result.thresholds` and `result.ctx_map` in place; cluster
+// assignments per block are preserved exactly. Saves bitstream size by
+// shrinking the factorization metadata and ctx_map. Returns the total number
+// of thresholds removed across all axes.
+//
+// Typically run AFTER `ReduceClustersAgglomerative`: cluster merging makes
+// many thresholds redundant by collapsing distinct clusters into shared ids.
+uint32_t PruneRedundantThresholds(const JPEGOptData& d,
+                                  PassSearchResult* result);
+
 // Greedy agglomerative cluster reduction on a hard `PassSearchResult`. Runs
 // after `RoundToHardAssignment`: tries every pair of clusters `(i, j)` and
 // merges the pair whose merge produces the largest decrease in
@@ -335,7 +356,8 @@ StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
 // Returns an error if `MaximalFactorizations(opt_data)` is empty.
 StatusOr<PassSearchResult> SearchGradientJointContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
-    const JPEGCtxEffortParams& effort, ThreadPool* pool);
+    const JPEGCtxEffortParams& effort, ThreadPool* pool,
+    std::vector<GradientSearchCandidate>* debug_candidates = nullptr);
 
 }  // namespace jxl
 

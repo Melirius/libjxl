@@ -1430,9 +1430,116 @@ StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
   return merges;
 }
 
+uint32_t PruneRedundantThresholds(const JPEGOptData& d,
+                                  PassSearchResult* result) {
+  const uint32_t channels = d.channels;
+  uint32_t pruned_total = 0;
+
+  // Helper: produce current per-axis bucket count `n[a] = T[a].size() + 1`.
+  auto compute_n = [&]() {
+    std::array<uint32_t, kNumCh> n{};
+    for (uint32_t a = 0; a < kNumCh; ++a) {
+      n[a] = static_cast<uint32_t>(result->thresholds.T[a].size()) + 1;
+    }
+    return n;
+  };
+
+  for (uint32_t axis = 0; axis < kNumCh; ++axis) {
+    Thresholds& T = result->thresholds.T[axis];
+
+    // Walk thresholds high→low so dropping one doesn't shift the indices we
+    // still need to examine.
+    for (int j = static_cast<int>(T.size()) - 1; j >= 0; --j) {
+      const auto n = compute_n();
+      const uint32_t num_cells = n[0] * n[1] * n[2];
+
+      auto cell_at = [&](uint32_t k0, uint32_t k1, uint32_t k2) {
+        return (k1 * n[2] + k2) * n[0] + k0;
+      };
+
+      // Threshold T[axis][j] separates bucket j and bucket j+1 on this axis.
+      // It's redundant iff every (channel, perpendicular cell) sees the same
+      // cluster id at bucket j and bucket j+1.
+      bool redundant = true;
+      for (uint32_t c = 0; c < channels && redundant; ++c) {
+        if (axis == 0) {
+          for (uint32_t k1 = 0; k1 < n[1] && redundant; ++k1) {
+            for (uint32_t k2 = 0; k2 < n[2] && redundant; ++k2) {
+              const uint8_t a_id =
+                  result->ctx_map[c * num_cells +
+                                  cell_at(static_cast<uint32_t>(j), k1, k2)];
+              const uint8_t b_id = result->ctx_map[c * num_cells +
+                                                   cell_at(j + 1, k1, k2)];
+              if (a_id != b_id) redundant = false;
+            }
+          }
+        } else if (axis == 1) {
+          for (uint32_t k0 = 0; k0 < n[0] && redundant; ++k0) {
+            for (uint32_t k2 = 0; k2 < n[2] && redundant; ++k2) {
+              const uint8_t a_id =
+                  result->ctx_map[c * num_cells +
+                                  cell_at(k0, static_cast<uint32_t>(j), k2)];
+              const uint8_t b_id =
+                  result->ctx_map[c * num_cells + cell_at(k0, j + 1, k2)];
+              if (a_id != b_id) redundant = false;
+            }
+          }
+        } else {  // axis == 2
+          for (uint32_t k0 = 0; k0 < n[0] && redundant; ++k0) {
+            for (uint32_t k1 = 0; k1 < n[1] && redundant; ++k1) {
+              const uint8_t a_id =
+                  result->ctx_map[c * num_cells +
+                                  cell_at(k0, k1, static_cast<uint32_t>(j))];
+              const uint8_t b_id =
+                  result->ctx_map[c * num_cells + cell_at(k0, k1, j + 1)];
+              if (a_id != b_id) redundant = false;
+            }
+          }
+        }
+      }
+      if (!redundant) continue;
+
+      // Drop threshold j on `axis`. Bucket j and j+1 collapse into bucket j;
+      // higher buckets shift down by one. The map from new bucket back to a
+      // representative old bucket is `k_new <= j ? k_new : k_new + 1`.
+      auto new_n = n;
+      new_n[axis] -= 1;
+      const uint32_t new_num_cells = new_n[0] * new_n[1] * new_n[2];
+      ContextMap new_ctx(static_cast<size_t>(channels) * new_num_cells);
+
+      auto new_cell_at = [&](uint32_t k0, uint32_t k1, uint32_t k2) {
+        return (k1 * new_n[2] + k2) * new_n[0] + k0;
+      };
+      auto remap = [j](uint32_t k_new) -> uint32_t {
+        return k_new <= static_cast<uint32_t>(j) ? k_new : k_new + 1;
+      };
+      for (uint32_t c = 0; c < channels; ++c) {
+        for (uint32_t k0 = 0; k0 < new_n[0]; ++k0) {
+          for (uint32_t k1 = 0; k1 < new_n[1]; ++k1) {
+            for (uint32_t k2 = 0; k2 < new_n[2]; ++k2) {
+              const uint32_t k0_old = (axis == 0) ? remap(k0) : k0;
+              const uint32_t k1_old = (axis == 1) ? remap(k1) : k1;
+              const uint32_t k2_old = (axis == 2) ? remap(k2) : k2;
+              new_ctx[c * new_num_cells + new_cell_at(k0, k1, k2)] =
+                  result->ctx_map[c * num_cells +
+                                  cell_at(k0_old, k1_old, k2_old)];
+            }
+          }
+        }
+      }
+      result->ctx_map = std::move(new_ctx);
+      T.erase(T.begin() + j);
+      ++pruned_total;
+    }
+  }
+
+  return pruned_total;
+}
+
 StatusOr<PassSearchResult> SearchGradientJointContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
-    const JPEGCtxEffortParams& effort, ThreadPool* pool) {
+    const JPEGCtxEffortParams& effort, ThreadPool* pool,
+    std::vector<GradientSearchCandidate>* debug_candidates) {
   auto start_total = PlannerClock::now();
 
   const JPEGOptData& d = *opt_data;
@@ -1552,6 +1659,25 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
               fflush(stderr);
             }
           }
+          // Prune thresholds whose adjacent buckets all share the same
+          // cluster (post-merge, often most of them). This shrinks the
+          // bitstream factorization metadata and ctx_map size without
+          // changing per-block cluster assignment, so EvaluatePassAwareModel
+          // cost is unchanged but the actual bitstream is smaller.
+          const uint32_t pruned =
+              PruneRedundantThresholds(d, &slots[idx].result);
+          if (pruned > 0) {
+            const auto& T0 = slots[idx].result.thresholds.TY();
+            const auto& T1 = slots[idx].result.thresholds.TCb();
+            const auto& T2 = slots[idx].result.thresholds.TCr();
+            fprintf(stderr,
+                    "PLANNER: [gradient] [(%u,%u,%u) P=%u] "
+                    "Threshold pruning: %u redundant thresholds dropped, "
+                    "factorization now (%zu,%zu,%zu)\n",
+                    f[0], f[1], f[2], num_passes, pruned, T0.size() + 1,
+                    T1.size() + 1, T2.size() + 1);
+            fflush(stderr);
+          }
         }
         return true;
       },
@@ -1571,6 +1697,24 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   }
   if (best_idx >= slots.size()) {
     return JXL_FAILURE("Gradient-joint search: no factorization succeeded");
+  }
+
+  if (debug_candidates != nullptr) {
+    debug_candidates->clear();
+    debug_candidates->reserve(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+      if (!slots[i].valid) continue;
+      const Factorization& sf = factorizations[slots[i].factorization_idx];
+      GradientSearchCandidate candidate;
+      candidate.result = slots[i].result;
+      candidate.target_cost_bits = slots[i].final_cost_bits;
+      candidate.factorization[0] = sf[0];
+      candidate.factorization[1] = sf[1];
+      candidate.factorization[2] = sf[2];
+      candidate.num_passes = slots[i].num_passes;
+      candidate.is_best = i == best_idx;
+      debug_candidates->push_back(std::move(candidate));
+    }
   }
 
   // Report per-slot results.

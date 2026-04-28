@@ -73,6 +73,17 @@ struct JPEGPassEncodingPlan {
   uint32_t num_passes = 1;
 };
 
+struct JPEGPassEncodingDebugCandidate {
+  JPEGPassEncodingPlan plan;
+  double target_cost_bits = 0.0;
+  double ac_cost_bits = 0.0;
+  double nz_cost_bits = 0.0;
+  double signalling_overhead_bits = 0.0;
+  uint32_t factorization[3] = {};
+  uint32_t num_clusters = 0;
+  bool is_best = false;
+};
+
 // Run the pass-aware JPEG recompression planner.
 // Builds `JPEGOptData`, runs `SearchPassAwareContextModel`,
 // converts the result into a complete `JPEGPassEncodingPlan`.
@@ -83,7 +94,9 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
                                       int32_t optimize_passes_num,
                                       const JpegCflContext& cfl_ctx,
                                       JPEGPassEncodingPlan& plan,
-                                      ThreadPool* pool);
+                                      ThreadPool* pool,
+                                      std::vector<JPEGPassEncodingDebugCandidate>*
+                                          debug_candidates = nullptr);
 
 }  // namespace jxl
 

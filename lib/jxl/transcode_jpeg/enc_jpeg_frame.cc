@@ -188,6 +188,25 @@ Status ConvertToBlockCtxMap(const ThresholdSet& thr, const ContextMap& ctx,
   return true;
 }
 
+Status BuildJPEGPassEncodingPlan(const PassSearchResult& result,
+                                 const JPEGOptData& opt_data,
+                                 const JpegCflContext& cfl_ctx,
+                                 JPEGPassEncodingPlan* plan) {
+  plan->num_passes = result.num_passes;
+  plan->passes.num_passes = result.num_passes;
+  plan->passes.num_downsample = 0;
+  for (uint32_t i = 0; i < result.num_passes; ++i) {
+    plan->passes.shift[i] = 0;
+  }
+  JXL_RETURN_IF_ERROR(ConvertToBlockCtxMap(result.thresholds, result.ctx_map,
+                                           opt_data, cfl_ctx,
+                                           plan->block_ctx_map));
+  for (size_t c = 0; c < 3; ++c) {
+    plan->pass_assignment[c] = result.pass_assignment[c];
+  }
+  return true;
+}
+
 Status OptimizeJPEGContextMap(const jpeg::JPEGData& jpeg_data,
                               SpeedTier speed_tier,
                               const JpegCflContext& cfl_ctx,
@@ -462,7 +481,9 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
                                       int32_t optimize_passes_num,
                                       const JpegCflContext& cfl_ctx,
                                       JPEGPassEncodingPlan& plan,
-                                      ThreadPool* pool) {
+                                      ThreadPool* pool,
+                                      std::vector<JPEGPassEncodingDebugCandidate>*
+                                          debug_candidates) {
   fprintf(stderr, "PLANNER: Starting pass-aware recompression planning\n");
   auto start_total = std::chrono::high_resolution_clock::now();
   fflush(stderr);
@@ -537,8 +558,34 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
             "(hot=%u anneal=%u lr=%.3f)\n",
             effort.grad_hot_iters, effort.grad_anneal_iters, effort.grad_lr);
     fflush(stderr);
-    JXL_ASSIGN_OR_RETURN(result, SearchGradientJointContextModel(opt_data,
-                                                                 effort, pool));
+    std::vector<GradientSearchCandidate> gradient_debug_candidates;
+    JXL_ASSIGN_OR_RETURN(result,
+                         SearchGradientJointContextModel(
+                             opt_data, effort, pool,
+                             debug_candidates != nullptr
+                                 ? &gradient_debug_candidates
+                                 : nullptr));
+    if (debug_candidates != nullptr) {
+      debug_candidates->clear();
+      debug_candidates->reserve(gradient_debug_candidates.size());
+      for (const GradientSearchCandidate& candidate :
+           gradient_debug_candidates) {
+        JPEGPassEncodingDebugCandidate debug_candidate;
+        JXL_RETURN_IF_ERROR(BuildJPEGPassEncodingPlan(
+            candidate.result, *opt_data, planner_cfl, &debug_candidate.plan));
+        debug_candidate.target_cost_bits = candidate.target_cost_bits;
+        debug_candidate.ac_cost_bits = bit_cost(candidate.result.ac_cost);
+        debug_candidate.nz_cost_bits = bit_cost(candidate.result.nz_cost);
+        debug_candidate.signalling_overhead_bits =
+            bit_cost(candidate.result.signalling_overhead);
+        debug_candidate.factorization[0] = candidate.factorization[0];
+        debug_candidate.factorization[1] = candidate.factorization[1];
+        debug_candidate.factorization[2] = candidate.factorization[2];
+        debug_candidate.num_clusters = candidate.result.num_clusters;
+        debug_candidate.is_best = candidate.is_best;
+        debug_candidates->push_back(std::move(debug_candidate));
+      }
+    }
   } else if (effort.use_bicluster_search) {
     if (effort.bicluster_threshold_first) {
       fprintf(stderr,
@@ -580,23 +627,8 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
               bit_cost(result.signalling_overhead),
               bit_cost(result.total_cost));
 
-  // Build Passes struct: all zero-shift spatial passes, no downsampling.
-  plan.num_passes = result.num_passes;
-  plan.passes.num_passes = result.num_passes;
-  plan.passes.num_downsample = 0;
-  for (uint32_t i = 0; i < result.num_passes; ++i) {
-    plan.passes.shift[i] = 0;
-  }
-
-  // Convert thresholds + ctx_map into BlockCtxMap.
-  JXL_RETURN_IF_ERROR(ConvertToBlockCtxMap(result.thresholds, result.ctx_map,
-                                           *opt_data, planner_cfl,
-                                           plan.block_ctx_map));
-
-  // Copy pass assignment.
-  for (size_t c = 0; c < 3; ++c) {
-    plan.pass_assignment[c] = std::move(result.pass_assignment[c]);
-  }
+  JXL_RETURN_IF_ERROR(
+      BuildJPEGPassEncodingPlan(result, *opt_data, planner_cfl, &plan));
   MaybeDumpPassAssignmentImage(jpeg_data, plan.pass_assignment, plan.num_passes);
 
   auto end_total = std::chrono::high_resolution_clock::now();
