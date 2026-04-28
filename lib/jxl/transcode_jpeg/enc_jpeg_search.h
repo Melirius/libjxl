@@ -97,6 +97,12 @@ struct JPEGCtxEffortParams {
   double grad_init_temperature;
   // Adam learning rate.
   double grad_lr;
+  // Post-hoc agglomerative cluster reduction after rounding. Mirrors the
+  // biclustering path's `overhead_aware_tail`: greedily merges cluster pairs
+  // when the entropy increase is offset by signalling-overhead savings. Adam
+  // alone cannot pick this up because signalling overhead is piecewise-
+  // constant in the soft state and contributes zero gradient.
+  bool grad_overhead_aware_reduce;
 
   static JPEGCtxEffortParams FromSpeedTier(SpeedTier speed_tier) {
     switch (speed_tier) {
@@ -122,7 +128,8 @@ struct JPEGCtxEffortParams {
                 /*grad_hot_iters=*/0,
                 /*grad_anneal_iters=*/0,
                 /*grad_init_temperature=*/1.0,
-                /*grad_lr=*/0.01};
+                /*grad_lr=*/0.01,
+                /*grad_overhead_aware_reduce=*/true};
       case SpeedTier::kTortoise:
         // `kRawAI` is marginally slower here but did not give better results.
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kToken420,
@@ -145,7 +152,8 @@ struct JPEGCtxEffortParams {
                 /*grad_hot_iters=*/50,
                 /*grad_anneal_iters=*/250,
                 /*grad_init_temperature=*/0.1,
-                /*grad_lr=*/0.01};
+                /*grad_lr=*/0.01,
+                /*grad_overhead_aware_reduce=*/true};
       case SpeedTier::kGlacier:
       case SpeedTier::kTectonicPlate:
       default:
@@ -172,7 +180,8 @@ struct JPEGCtxEffortParams {
                 /*grad_hot_iters=*/0,
                 /*grad_anneal_iters=*/0,
                 /*grad_init_temperature=*/1.0,
-                /*grad_lr=*/0.01};
+                /*grad_lr=*/0.01,
+                /*grad_overhead_aware_reduce=*/true};
     }
   }
 };

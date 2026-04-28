@@ -305,6 +305,24 @@ GradientJointState InitGradientJointStateFromFactorization(
     uint32_t num_clusters, double threshold_temperature,
     double pass_temperature, double cluster_temperature);
 
+// Greedy agglomerative cluster reduction on a hard `PassSearchResult`. Runs
+// after `RoundToHardAssignment`: tries every pair of clusters `(i, j)` and
+// merges the pair whose merge produces the largest decrease in
+// `EvaluatePassAwareModel` total cost (entropy + NZ + signalling overhead +
+// flat pass overhead). Repeats until no merge reduces cost. Updates
+// `result.ctx_map`, `result.num_clusters`, and `result.{ac_cost, nz_cost,
+// signalling_overhead, total_cost}` in place.
+//
+// This mirrors the biclustering path's `overhead_aware_tail` semantics for
+// the gradient-search output: Adam minimizes entropy ignoring the
+// piecewise-constant overhead, and this pass cleans up the resulting
+// over-allocation of clusters when `entropy + overhead` favors fewer.
+//
+// Returns the number of merges accepted (0 if no improvement).
+StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
+                                               PassSearchResult* result,
+                                               ThreadPool* pool);
+
 // Runs the gradient-based Lane B optimizer on every maximal factorization of
 // `opt_data` in parallel, rounds each to a hard `PassSearchResult`, and
 // returns the one with the lowest final soft total cost.

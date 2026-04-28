@@ -33,6 +33,9 @@
 #include "lib/jxl/enc_ans_params.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_pass_assign.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_pass_cluster.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_pass_stream.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_utils.h"
 
@@ -1322,6 +1325,111 @@ std::pair<uint32_t, uint32_t> ResolvePassRange(
 
 }  // namespace
 
+StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
+                                               PassSearchResult* result,
+                                               ThreadPool* pool) {
+  if (result->num_clusters <= 1) return uint32_t{0};
+  const uint32_t num_cells =
+      static_cast<uint32_t>((result->thresholds.TY().size() + 1) *
+                            (result->thresholds.TCb().size() + 1) *
+                            (result->thresholds.TCr().size() + 1));
+  if (result->ctx_map.size() != static_cast<size_t>(d.channels) * num_cells) {
+    return JXL_FAILURE("ReduceClustersAgglomerative: ctx_map size mismatch");
+  }
+
+  // Build the pass-stream once. Pass assignment is fixed across merges, so
+  // the stream stays valid for every cost evaluation we do below.
+  const ActiveRawBins active = BuildActiveRawBins(d);
+  std::vector<uint32_t> pass_offsets;
+  JXL_ASSIGN_OR_RETURN(
+      std::vector<ACEntry> pass_stream,
+      BuildPassStream(d, active, result->pass_assignment, result->num_passes,
+                      &pass_offsets, pool));
+
+  // Initial cost (uses the same evaluator the encoder will).
+  JXL_ASSIGN_OR_RETURN(
+      ModelEvaluation current_eval,
+      EvaluatePassAwareModel(d, result->thresholds, result->ctx_map,
+                             result->num_clusters, result->pass_assignment,
+                             result->num_passes, pass_stream, pass_offsets));
+  FixedPointCost current_cost = current_eval.total_cost();
+  uint32_t current_K = result->num_clusters;
+  ContextMap working_ctx = result->ctx_map;
+
+  uint32_t merges = 0;
+  std::vector<uint8_t> remap(current_K, 0);
+  ContextMap trial_ctx(working_ctx.size(), 0);
+
+  while (current_K > 1) {
+    int best_i = -1;
+    int best_j = -1;
+    FixedPointCost best_cost = current_cost;
+    ModelEvaluation best_eval = current_eval;
+
+    for (uint32_t i = 0; i + 1 < current_K; ++i) {
+      for (uint32_t j = i + 1; j < current_K; ++j) {
+        // Build a remap that collapses j into i and shifts higher ids down.
+        for (uint32_t k = 0; k < current_K; ++k) {
+          if (k == j) {
+            remap[k] = static_cast<uint8_t>(i);
+          } else if (k > j) {
+            remap[k] = static_cast<uint8_t>(k - 1);
+          } else {
+            remap[k] = static_cast<uint8_t>(k);
+          }
+        }
+        for (size_t e = 0; e < working_ctx.size(); ++e) {
+          trial_ctx[e] = remap[working_ctx[e]];
+        }
+        const uint32_t trial_K = current_K - 1;
+        JXL_ASSIGN_OR_RETURN(
+            ModelEvaluation eval,
+            EvaluatePassAwareModel(d, result->thresholds, trial_ctx, trial_K,
+                                   result->pass_assignment, result->num_passes,
+                                   pass_stream, pass_offsets));
+        const FixedPointCost trial_cost = eval.total_cost();
+        if (trial_cost < best_cost) {
+          best_cost = trial_cost;
+          best_eval = eval;
+          best_i = static_cast<int>(i);
+          best_j = static_cast<int>(j);
+        }
+      }
+    }
+
+    if (best_i < 0) break;  // no improving merge
+
+    // Apply best merge permanently.
+    for (uint32_t k = 0; k < current_K; ++k) {
+      if (k == static_cast<uint32_t>(best_j)) {
+        remap[k] = static_cast<uint8_t>(best_i);
+      } else if (k > static_cast<uint32_t>(best_j)) {
+        remap[k] = static_cast<uint8_t>(k - 1);
+      } else {
+        remap[k] = static_cast<uint8_t>(k);
+      }
+    }
+    for (size_t e = 0; e < working_ctx.size(); ++e) {
+      working_ctx[e] = remap[working_ctx[e]];
+    }
+    --current_K;
+    remap.resize(current_K);
+    current_cost = best_cost;
+    current_eval = best_eval;
+    ++merges;
+  }
+
+  if (merges > 0) {
+    result->ctx_map = std::move(working_ctx);
+    result->num_clusters = current_K;
+    result->ac_cost = current_eval.ac_cost;
+    result->nz_cost = current_eval.nz_cost;
+    result->signalling_overhead = current_eval.signalling_overhead;
+    result->total_cost = current_eval.total_cost();
+  }
+  return merges;
+}
+
 StatusOr<PassSearchResult> SearchGradientJointContextModel(
     std::shared_ptr<const JPEGOptData> opt_data,
     const JPEGCtxEffortParams& effort, ThreadPool* pool) {
@@ -1417,6 +1525,34 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
         slots[idx].factorization_idx = factorization_idx;
         slots[idx].num_passes = num_passes;
         slots[idx].valid = true;
+
+        // Post-hoc agglomerative cluster reduction (Option C). Adam's
+        // gradient ignores signalling overhead, so it tends to keep all 16
+        // clusters even when overhead would be saved by merging. This pass
+        // greedily merges cluster pairs whose merge reduces the encoder's
+        // actual cost (entropy + overhead) and updates the slot's cost
+        // fields and tie-break key.
+        if (effort.grad_overhead_aware_reduce) {
+          auto merges_or = ReduceClustersAgglomerative(
+              d, &slots[idx].result, /*pool=*/nullptr);
+          if (merges_or.ok()) {
+            const uint32_t merges = std::move(merges_or).value_();
+            if (merges > 0) {
+              // Use the EvaluatePassAwareModel-derived total cost for the
+              // pick-best comparison; soft cost is now stale.
+              slots[idx].final_cost_bits =
+                  static_cast<double>(slots[idx].result.total_cost) /
+                  static_cast<double>(kFScale);
+              fprintf(stderr,
+                      "PLANNER: [gradient] [(%u,%u,%u) P=%u] "
+                      "Agglomerative merge: %u clusters dropped, "
+                      "final_cost=%.2f bits\n",
+                      f[0], f[1], f[2], num_passes, merges,
+                      slots[idx].final_cost_bits);
+              fflush(stderr);
+            }
+          }
+        }
         return true;
       },
       "JpegCtxGradSweep"));
