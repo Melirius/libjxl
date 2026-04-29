@@ -29,6 +29,14 @@
 #include <utility>
 #include <vector>
 
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "lib/jxl/transcode_jpeg/enc_jpeg_grad.cc"
+// clang-format off
+#include <hwy/foreach_target.h>
+#include <hwy/highway.h>
+#include <hwy/contrib/math/math-inl.h>
+// clang-format on
+
 #include "lib/jxl/ac_context.h"
 #include "lib/jxl/enc_ans_params.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
@@ -36,10 +44,122 @@
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_assign.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_cluster.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_stream.h"
-#include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_utils.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
+
+HWY_BEFORE_NAMESPACE();
+namespace jxl {
+namespace HWY_NAMESPACE {
+
+namespace hn = hwy::HWY_NAMESPACE;
+
+constexpr double kLog2E = 1.4426950408889634;
+
+// Returns sum_{i: data[i]>0} data[i]*log2(data[i]).
+double SoftFTabReduceVec(const double* HWY_RESTRICT data, size_t n) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const auto vzero = hn::Zero(d);
+  const auto vone = hn::Set(d, 1.0);
+  auto vsum = hn::Zero(d);
+  size_t i = 0;
+  for (; i + N <= n; i += N) {
+    const auto v = hn::LoadU(d, data + i);
+    const auto mask = hn::Gt(v, vzero);
+    const auto safe_v = hn::IfThenElse(mask, v, vone);
+    vsum = hn::Add(vsum,
+                   hn::IfThenElseZero(mask, hn::Mul(v, hn::Log2(d, safe_v))));
+  }
+  double sum = hn::ReduceSum(d, vsum);
+  for (; i < n; ++i) {
+    if (data[i] > 0.0) sum += data[i] * std::log2(data[i]);
+  }
+  return sum;
+}
+
+// Writes scale*(log2(src[i])+log2e) into dst[i] for src[i]>1e-18, else 0.
+void SoftFTabPrimeVec(const double* HWY_RESTRICT src, double* HWY_RESTRICT dst,
+                      double scale, size_t n) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const auto veps = hn::Set(d, 1e-18);
+  const auto vlog2e = hn::Set(d, kLog2E);
+  const auto vscale = hn::Set(d, scale);
+  const auto vone = hn::Set(d, 1.0);
+  size_t i = 0;
+  for (; i + N <= n; i += N) {
+    const auto v = hn::LoadU(d, src + i);
+    const auto mask = hn::Gt(v, veps);
+    const auto safe_v = hn::IfThenElse(mask, v, vone);
+    hn::StoreU(hn::IfThenElseZero(
+                   mask, hn::Mul(vscale, hn::Add(hn::Log2(d, safe_v), vlog2e))),
+               d, dst + i);
+  }
+  for (; i < n; ++i) {
+    dst[i] = (src[i] > 1e-18) ? scale * (std::log2(src[i]) + kLog2E) : 0.0;
+  }
+}
+
+// dst[k] += w * src[k] for k in [0, n).
+void AccumScaledVec(double* HWY_RESTRICT dst, double w,
+                    const double* HWY_RESTRICT src, size_t n) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const auto vw = hn::Set(d, w);
+  size_t k = 0;
+  for (; k + N <= n; k += N) {
+    hn::StoreU(hn::MulAdd(vw, hn::LoadU(d, src + k), hn::LoadU(d, dst + k)), d,
+               dst + k);
+  }
+  for (; k < n; ++k) dst[k] += w * src[k];
+}
+
+// Returns sum_k a[k]*b[k] for k in [0, n).
+double DotProductVec(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
+                     size_t n) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  auto vsum = hn::Zero(d);
+  size_t i = 0;
+  for (; i + N <= n; i += N) {
+    vsum = hn::MulAdd(hn::LoadU(d, a + i), hn::LoadU(d, b + i), vsum);
+  }
+  double sum = hn::ReduceSum(d, vsum);
+  for (; i < n; ++i) sum += a[i] * b[i];
+  return sum;
+}
+
+// dst[m] += scale * rho[m] * (drho[m] - s) for m in [0, n).
+void ClusterJacobianVec(double* HWY_RESTRICT dst, double scale,
+                        const double* HWY_RESTRICT rho,
+                        const double* HWY_RESTRICT drho, double s, size_t n) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const auto vscale = hn::Set(d, scale);
+  const auto vs = hn::Set(d, s);
+  size_t m = 0;
+  for (; m + N <= n; m += N) {
+    hn::StoreU(
+        hn::MulAdd(hn::Mul(vscale, hn::LoadU(d, rho + m)),
+                   hn::Sub(hn::LoadU(d, drho + m), vs), hn::LoadU(d, dst + m)),
+        d, dst + m);
+  }
+  for (; m < n; ++m) dst[m] += scale * rho[m] * (drho[m] - s);
+}
+
+}  // namespace HWY_NAMESPACE
+}  // namespace jxl
+HWY_AFTER_NAMESPACE();
+
+#if HWY_ONCE
 
 namespace jxl {
+
+HWY_EXPORT(SoftFTabReduceVec);
+HWY_EXPORT(SoftFTabPrimeVec);
+HWY_EXPORT(AccumScaledVec);
+HWY_EXPORT(DotProductVec);
+HWY_EXPORT(ClusterJacobianVec);
 
 namespace {
 
@@ -136,44 +256,6 @@ int DCValueForAxis(const JPEGOptData& d, uint32_t src_channel, uint32_t y,
   return d.DC_vals[dst_channel][d.block_DC_idx[dst_channel][b]];
 }
 
-// Per-block event histogram summary.
-struct BlockEventSummary {
-  std::vector<std::pair<uint32_t, uint32_t>> h_entries;  // (hist_bin, count)
-  std::vector<std::pair<uint32_t, uint32_t>> N_entries;  // (zdc, count)
-};
-
-BlockEventSummary SummarizeBlockEvents(const JPEGOptData& d, uint32_t c,
-                                       uint32_t b,
-                                       std::vector<uint32_t>* h_scratch,
-                                       std::vector<uint32_t>* N_scratch,
-                                       std::vector<uint32_t>* h_touched,
-                                       std::vector<uint32_t>* N_touched) {
-  const uint32_t start = d.block_offsets[c][b];
-  const uint32_t end = d.block_offsets[c][b + 1];
-  for (uint32_t e = start; e < end; ++e) {
-    const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
-    if (evt.hist_bin == kInvalidCompactH) continue;
-    if ((*h_scratch)[evt.hist_bin] == 0) h_touched->push_back(evt.hist_bin);
-    ++(*h_scratch)[evt.hist_bin];
-    if ((*N_scratch)[evt.zdc] == 0) N_touched->push_back(evt.zdc);
-    ++(*N_scratch)[evt.zdc];
-  }
-  BlockEventSummary s;
-  s.h_entries.reserve(h_touched->size());
-  for (uint32_t bin : *h_touched) {
-    s.h_entries.emplace_back(bin, (*h_scratch)[bin]);
-    (*h_scratch)[bin] = 0;
-  }
-  h_touched->clear();
-  s.N_entries.reserve(N_touched->size());
-  for (uint32_t zdc : *N_touched) {
-    s.N_entries.emplace_back(zdc, (*N_scratch)[zdc]);
-    (*N_scratch)[zdc] = 0;
-  }
-  N_touched->clear();
-  return s;
-}
-
 // Resolves the block's DC values on all three DC axes, honoring subsampling
 // and the grayscale fast path.
 void BlockDCValues(const JPEGOptData& d, uint32_t c, uint32_t b, int out[3]) {
@@ -219,14 +301,14 @@ inline double FlatPassOverheadBits(const JPEGOptData& d) {
 //
 // Counts are rounded from soft `double` to integer via `std::llround`. The
 // overhead term is not differentiated — this integer projection is enough.
-double ACSignallingOverheadBitsForSlot(const JPEGOptData& d,
-                                       const std::vector<double>& ac_h) {
+double ACSignallingOverheadBitsForSlot(const JPEGOptData& d, const double* ac_h,
+                                       size_t ac_h_size) {
   std::array<std::array<uint32_t, kACTokenCount>, kZeroDensityContextCount>
       signalling_hist = {};
   const auto& dense_to_symbol = d.ACHistogram().dense_to_zdcvalue;
   const size_t dense_size = dense_to_symbol.size();
   double overhead_bits = 0.0;
-  for (size_t idx = 0; idx < ac_h.size() && idx < dense_size; ++idx) {
+  for (size_t idx = 0; idx < ac_h_size && idx < dense_size; ++idx) {
     const double v = ac_h[idx];
     if (v <= 0.0) continue;
     const uint32_t count =
@@ -262,7 +344,7 @@ double ACSignallingOverheadBitsForSlot(const JPEGOptData& d,
 
 // Signalling overhead for one NZ-histogram slot: per predictor bucket, build a
 // sub-histogram over `nz_count` and return `ANSPopulationCost - ShannonEntropy`.
-double NZSignallingOverheadBitsForSlot(const std::vector<double>& nz_h) {
+double NZSignallingOverheadBitsForSlot(const double* nz_h) {
   double overhead_bits = 0.0;
   for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
     uint32_t max_nz = 0;
@@ -305,24 +387,23 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
                                      CostMode mode,
                                      GradientJointGrad* grad) {
   SoftCostResult result;
-  const uint32_t num_passes = state.num_passes;
-  const uint32_t num_clusters = state.num_clusters;
+  const size_t num_passes = state.num_passes;
+  const size_t num_clusters = state.num_clusters;
   if (num_clusters == 0 || num_passes == 0) return result;
 
   const std::array<uint32_t, 3> n_axis = {
       static_cast<uint32_t>(state.thresholds[0].size()) + 1,
       static_cast<uint32_t>(state.thresholds[1].size()) + 1,
       static_cast<uint32_t>(state.thresholds[2].size()) + 1};
-  const uint32_t num_cells = n_axis[0] * n_axis[1] * n_axis[2];
+  const size_t num_cells = n_axis[0] * n_axis[1] * n_axis[2];
   if (state.num_cells != num_cells) return result;  // state inconsistent.
   for (uint32_t c = 0; c < d.channels; ++c) {
-    if (state.cluster_logits[c].size() !=
-        static_cast<size_t>(num_cells) * num_clusters) {
+    if (state.cluster_logits[c].size() != num_cells * num_clusters) {
       return result;  // cluster_logits not sized to match state.
     }
   }
 
-  const uint32_t cp_count = num_clusters * num_passes;
+  const size_t cp_count = num_clusters * num_passes;
   const uint32_t ac_alpha = d.ACHistogramSize();
   constexpr uint32_t kZDC = kZeroDensityContextCount;
   constexpr uint32_t kNZBins = kNZHistogramsSize;       // 36 * 64 = 2304
@@ -332,29 +413,26 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   const double inv_cluster_t = 1.0 / state.cluster_temperature;
   const bool include_nz = (mode == CostMode::kTotal);
 
-  // Forward accumulators.
-  std::vector<std::vector<double>> ac_h(cp_count,
-                                        std::vector<double>(ac_alpha, 0.0));
-  std::vector<std::vector<double>> ac_N(cp_count,
-                                        std::vector<double>(kZDC, 0.0));
-  std::vector<std::vector<double>> nz_h;
-  std::vector<std::vector<double>> nz_N;
+  // Forward accumulators (flat: index = cp * stride + i).
+  std::vector<double> ac_h(cp_count * ac_alpha, 0.0);
+  std::vector<double> ac_N(cp_count * kZDC, 0.0);
+  std::vector<double> nz_h;
+  std::vector<double> nz_N;
   if (include_nz) {
-    nz_h.assign(cp_count, std::vector<double>(kNZBins, 0.0));
-    nz_N.assign(cp_count, std::vector<double>(kNZBuckets, 0.0));
+    nz_h.assign(cp_count * kNZBins, 0.0);
+    nz_N.assign(cp_count * kNZBuckets, 0.0);
   }
 
   // Precompute block-pi vectors when NZ is needed (neighbor lookups).
-  std::array<std::vector<std::vector<double>>, kNumCh> pi_cache;
+  // Flat: pi_cache[c][b * num_passes + p].
+  std::array<std::vector<double>, kNumCh> pi_cache;
   if (include_nz) {
     for (uint32_t c = 0; c < d.channels; ++c) {
-      const uint32_t nb = d.num_blocks[c];
-      pi_cache[c].resize(nb);
-      for (uint32_t b = 0; b < nb; ++b) {
-        pi_cache[c][b].resize(num_passes);
-        Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
-                num_passes, state.pass_temperature,
-                pi_cache[c][b].data());
+      const size_t nb = d.num_blocks[c];
+      pi_cache[c].resize(nb * num_passes);
+      for (size_t b = 0; b < nb; ++b) {
+        Softmax(&state.pass_logits[c][b * num_passes], num_passes,
+                state.pass_temperature, pi_cache[c].data() + b * num_passes);
       }
     }
   }
@@ -365,20 +443,14 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   // cluster_temperature)[k]`.
   std::array<std::vector<double>, kNumCh> rho_cache;
   for (uint32_t c = 0; c < d.channels; ++c) {
-    rho_cache[c].assign(
-        static_cast<size_t>(num_cells) * num_clusters, 0.0);
-    for (uint32_t cell = 0; cell < num_cells; ++cell) {
-      Softmax(&state.cluster_logits[c][static_cast<size_t>(cell) * num_clusters],
-              num_clusters, state.cluster_temperature,
-              &rho_cache[c][static_cast<size_t>(cell) * num_clusters]);
+    rho_cache[c].assign(num_cells * num_clusters, 0.0);
+    for (size_t cell = 0; cell < num_cells; ++cell) {
+      Softmax(&state.cluster_logits[c][cell * num_clusters], num_clusters,
+              state.cluster_temperature, &rho_cache[c][cell * num_clusters]);
     }
   }
 
   // Per-block scratch.
-  std::vector<uint32_t> h_scratch(ac_alpha, 0u);
-  std::vector<uint32_t> N_scratch(kZDC, 0u);
-  std::vector<uint32_t> h_touched;
-  std::vector<uint32_t> N_touched;
   std::vector<double> w0;
   std::vector<double> w1;
   std::vector<double> w2;
@@ -387,7 +459,7 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   // Per-block per-cluster aggregate weight, B[k] = sum_cell w_cell·rho[c,cell,k].
   // Reused by both AC and NZ forward and by the backward pass; sized to fit
   // any cluster axis count, allocated once per call.
-  std::vector<double> block_B(num_clusters, 0.0);
+  std::vector<double> B(num_clusters, 0.0);
 
   // --- Forward pass ---------------------------------------------------------
   for (uint32_t c = 0; c < d.channels; ++c) {
@@ -397,10 +469,10 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       // Soft pass weights (use cache when NZ needs neighbors too).
       const double* pi = nullptr;
       if (include_nz) {
-        pi = pi_cache[c][b].data();
+        pi = &pi_cache[c][b * num_passes];
       } else {
-        Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
-                num_passes, state.pass_temperature, pi_local.data());
+        Softmax(&state.pass_logits[c][b * num_passes], num_passes,
+                state.pass_temperature, pi_local.data());
         pi = pi_local.data();
       }
 
@@ -421,28 +493,22 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         }
       }
 
-      const BlockEventSummary summary =
-          SummarizeBlockEvents(d, c, b, &h_scratch, &N_scratch, &h_touched,
-                               &N_touched);
+      const uint32_t ev_start = d.block_offsets[c][b];
+      const uint32_t ev_end = d.block_offsets[c][b + 1];
 
       // Per-block per-cluster aggregate `B[k] = sum_cell w_cell · rho[c,cell,k]`.
       // This collapses the cell axis out of the inner accumulation, dropping a
       // factor of `num_cells` from the AC and NZ inner loops.
-      std::vector<double>& B = block_B;
-      std::fill(B.begin(), B.begin() + num_clusters, 0.0);
+      std::fill(B.begin(), B.end(), 0.0);
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
         if (w_cell == 0.0) continue;
-        const double* rho_cell =
-            &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
-        for (uint32_t k = 0; k < num_clusters; ++k) {
-          B[k] += w_cell * rho_cell[k];
-        }
+        const double* rho_cell = &rho_cache[c][cell * num_clusters];
+        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
+        (B.data(), w_cell, rho_cell, num_clusters);
       }
 
-      // AC accumulation: events loop is now (cluster, pass) → (event), with
-      // weight `B[k] · pi[p]` instead of per-cell weight. Result is the same
-      // sum, modulo floating-point summation order.
+      // AC accumulation.
       for (uint32_t k = 0; k < num_clusters; ++k) {
         const double Bk = B[k];
         if (Bk == 0.0) continue;
@@ -450,13 +516,13 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           const double w = Bk * pi[p];
           if (w == 0.0) continue;
           const uint32_t cp = k * num_passes + p;
-          std::vector<double>& h_row = ac_h[cp];
-          std::vector<double>& N_row = ac_N[cp];
-          for (const auto& entry : summary.h_entries) {
-            h_row[entry.first] += w * static_cast<double>(entry.second);
-          }
-          for (const auto& entry : summary.N_entries) {
-            N_row[entry.first] += w * static_cast<double>(entry.second);
+          double* h_row = &ac_h[cp * ac_alpha];
+          double* N_row = &ac_N[cp * kZDC];
+          for (uint32_t e = ev_start; e < ev_end; ++e) {
+            const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
+            if (evt.hist_bin == kInvalidCompactH) continue;
+            h_row[evt.hist_bin] += w;
+            N_row[evt.zdc] += w;
           }
         }
       }
@@ -470,25 +536,21 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         const uint32_t nz_b = d.block_nonzeros[c][b];
         const double* pi_top = nullptr;
         const double* pi_left = nullptr;
-        uint32_t nz_top = 0;
-        uint32_t nz_left = 0;
+        double nz_top = 0;
+        double nz_left = 0;
         if (y > 0) {
           const uint32_t b_top = (y - 1) * grid_w + x;
-          pi_top = pi_cache[c][b_top].data();
+          pi_top = &pi_cache[c][b_top * num_passes];
           nz_top = d.block_nonzeros[c][b_top];
         }
         if (x > 0) {
           const uint32_t b_left = y * grid_w + (x - 1);
-          pi_left = pi_cache[c][b_left].data();
+          pi_left = &pi_cache[c][b_left * num_passes];
           nz_left = d.block_nonzeros[c][b_left];
         }
         for (uint32_t p = 0; p < num_passes; ++p) {
-          double pass_nz_top = (y > 0) ? pi_top[p] *
-                                              static_cast<double>(nz_top)
-                                       : 0.0;
-          double pass_nz_left = (x > 0) ? pi_left[p] *
-                                               static_cast<double>(nz_left)
-                                        : 0.0;
+          double pass_nz_top = (y > 0) ? pi_top[p] * nz_top : 0.0;
+          double pass_nz_left = (x > 0) ? pi_left[p] * nz_left : 0.0;
           double predicted_nz;
           if (x == 0 && y == 0) {
             predicted_nz = 32.0;
@@ -507,10 +569,10 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           for (uint32_t k = 0; k < num_clusters; ++k) {
             const double Bk = B[k];
             if (Bk == 0.0) continue;
-            const uint32_t cp = k * num_passes + p;
-            nz_N[cp][pb] += Bk;
-            nz_h[cp][bin_real] += Bk * pi_p;
-            nz_h[cp][bin_zero] += Bk * one_minus_pi_p;
+            const size_t cp = k * num_passes + p;
+            nz_N[cp * kNZBuckets + pb] += Bk;
+            nz_h[cp * kNZBins + bin_real] += Bk * pi_p;
+            nz_h[cp * kNZBins + bin_zero] += Bk * one_minus_pi_p;
           }
         }
       }
@@ -521,22 +583,12 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   double ac_cost = 0.0;
   uint32_t touched_slots = 0;
   for (uint32_t cp = 0; cp < cp_count; ++cp) {
-    bool any = false;
-    for (uint32_t z = 0; z < kZDC; ++z) {
-      const double n = ac_N[cp][z];
-      if (n > 0.0) {
-        ac_cost += SoftFTab(n);
-        any = true;
-      }
-    }
-    for (uint32_t i = 0; i < ac_alpha; ++i) {
-      const double n = ac_h[cp][i];
-      if (n > 0.0) {
-        ac_cost -= SoftFTab(n);
-        any = true;
-      }
-    }
-    if (any) ++touched_slots;
+    const double N_sum =
+        HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&ac_N[cp * kZDC], kZDC);
+    const double h_sum =
+        HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&ac_h[cp * ac_alpha], ac_alpha);
+    ac_cost += N_sum - h_sum;
+    if (N_sum != 0.0 || h_sum != 0.0) ++touched_slots;
   }
   result.ac_cost_bits = ac_cost;
   result.num_cp_slots = touched_slots;
@@ -546,16 +598,13 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   double overhead_bits = 0.0;
   if (include_nz) {
     for (uint32_t cp = 0; cp < cp_count; ++cp) {
-      for (uint32_t pb = 0; pb < kNZBuckets; ++pb) {
-        const double n = nz_N[cp][pb];
-        if (n > 0.0) nz_cost += SoftFTab(n);
-      }
-      for (uint32_t i = 0; i < kNZBins; ++i) {
-        const double n = nz_h[cp][i];
-        if (n > 0.0) nz_cost -= SoftFTab(n);
-      }
-      overhead_bits += ACSignallingOverheadBitsForSlot(d, ac_h[cp]);
-      overhead_bits += NZSignallingOverheadBitsForSlot(nz_h[cp]);
+      nz_cost += HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&nz_N[cp * kNZBuckets],
+                                                         kNZBuckets);
+      nz_cost -=
+          HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&nz_h[cp * kNZBins], kNZBins);
+      overhead_bits +=
+          ACSignallingOverheadBitsForSlot(d, &ac_h[cp * ac_alpha], ac_alpha);
+      overhead_bits += NZSignallingOverheadBitsForSlot(&nz_h[cp * kNZBins]);
     }
     overhead_bits += FlatPassOverheadBits(d) * static_cast<double>(num_passes);
     result.nz_cost_bits = nz_cost;
@@ -569,17 +618,13 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   // Precompute upstream gradients wrt accumulators.
   //   dL/dN = +ftab'(N)
   //   dL/dh = -ftab'(h)
-  std::vector<std::vector<double>> dL_dN(cp_count,
-                                         std::vector<double>(kZDC, 0.0));
-  std::vector<std::vector<double>> dL_dh(cp_count,
-                                         std::vector<double>(ac_alpha, 0.0));
+  std::vector<double> dL_dN(cp_count * kZDC, 0.0);
+  std::vector<double> dL_dh(cp_count * ac_alpha, 0.0);
   for (uint32_t cp = 0; cp < cp_count; ++cp) {
-    for (uint32_t z = 0; z < kZDC; ++z) {
-      dL_dN[cp][z] = SoftFTabPrime(ac_N[cp][z]);
-    }
-    for (uint32_t i = 0; i < ac_alpha; ++i) {
-      dL_dh[cp][i] = -SoftFTabPrime(ac_h[cp][i]);
-    }
+    HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+    (&ac_N[cp * kZDC], &dL_dN[cp * kZDC], 1.0, kZDC);
+    HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+    (&ac_h[cp * ac_alpha], &dL_dh[cp * ac_alpha], -1.0, ac_alpha);
   }
 
   // Per-block backward storage.
@@ -588,7 +633,7 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   AxisBucketBackward back2;
   std::vector<double> dL_dcell(num_cells, 0.0);
   std::vector<double> dL_dpi(num_passes, 0.0);
-  std::vector<std::vector<double>> dL_dw_ax(3);
+  std::vector<double> dL_dw_ax[3];
 
   // Channel-wide accumulator for `dL/drho[c][cell * K + k]`. Accumulates
   // contributions from every block in channel `c`; converted to
@@ -599,18 +644,16 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   }
 
   // NZ upstream gradients (only needed when include_nz).
-  std::vector<std::vector<double>> dL_dnz_N;
-  std::vector<std::vector<double>> dL_dnz_h;
+  std::vector<double> dL_dnz_N;
+  std::vector<double> dL_dnz_h;
   if (include_nz) {
-    dL_dnz_N.assign(cp_count, std::vector<double>(kNZBuckets, 0.0));
-    dL_dnz_h.assign(cp_count, std::vector<double>(kNZBins, 0.0));
+    dL_dnz_N.assign(static_cast<size_t>(cp_count) * kNZBuckets, 0.0);
+    dL_dnz_h.assign(static_cast<size_t>(cp_count) * kNZBins, 0.0);
     for (uint32_t cp = 0; cp < cp_count; ++cp) {
-      for (uint32_t pb = 0; pb < kNZBuckets; ++pb) {
-        dL_dnz_N[cp][pb] = SoftFTabPrime(nz_N[cp][pb]);
-      }
-      for (uint32_t i = 0; i < kNZBins; ++i) {
-        dL_dnz_h[cp][i] = -SoftFTabPrime(nz_h[cp][i]);
-      }
+      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+      (&nz_N[cp * kNZBuckets], &dL_dnz_N[cp * kNZBuckets], 1.0, kNZBuckets);
+      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+      (&nz_h[cp * kNZBins], &dL_dnz_h[cp * kNZBins], -1.0, kNZBins);
     }
   }
 
@@ -629,10 +672,10 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
     for (uint32_t b = 0; b < nb; ++b) {
       const double* pi = nullptr;
       if (include_nz) {
-        pi = pi_cache[c][b].data();
+        pi = &pi_cache[c][b * num_passes];
       } else {
-        Softmax(&state.pass_logits[c][static_cast<size_t>(b) * num_passes],
-                num_passes, state.pass_temperature, pi_local.data());
+        Softmax(&state.pass_logits[c][b * num_passes], num_passes,
+                state.pass_temperature, pi_local.data());
         pi = pi_local.data();
       }
 
@@ -653,33 +696,26 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         }
       }
 
-      const BlockEventSummary summary =
-          SummarizeBlockEvents(d, c, b, &h_scratch, &N_scratch, &h_touched,
-                               &N_touched);
-
       // Zero per-block accumulators.
       std::fill(dL_dcell.begin(), dL_dcell.end(), 0.0);
       std::fill(dL_dpi.begin(), dL_dpi.end(), 0.0);
 
+      const uint32_t ev_start = d.block_offsets[c][b];
+      const uint32_t ev_end = d.block_offsets[c][b + 1];
+
       // Per-block per-cluster aggregate `B[k] = sum_cell w_cell·rho[c,cell,k]`.
       // Matches the forward pass; reused by both AC and NZ backward to factor
       // the cell axis out of the inner loops.
-      std::vector<double>& B = block_B;
-      std::fill(B.begin(), B.begin() + num_clusters, 0.0);
+      std::fill(B.begin(), B.end(), 0.0);
       for (uint32_t cell = 0; cell < num_cells; ++cell) {
         const double w_cell = cell_weight[cell];
         if (w_cell == 0.0) continue;
-        const double* rho_cell =
-            &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
-        for (uint32_t k = 0; k < num_clusters; ++k) {
-          B[k] += w_cell * rho_cell[k];
-        }
+        const double* rho_cell = &rho_cache[c][cell * num_clusters];
+        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
+        (B.data(), w_cell, rho_cell, num_clusters);
       }
 
-      // AC contribution: per-(k, p) `delta_ac[cp]` aggregates events once per
-      // (cluster, pass) — eliminating the cell axis from the events walk.
-      // Forward at (cp, bin) is `gamma·pi·rho·count`; partials wrt the three
-      // soft membership axes split as before but factor through B[k]:
+      // AC contribution: per-(k, p) delta.
       //   dL/dpi[p]   = sum_k B[k] · delta_ac[k*P+p]
       //   dL/dcell    = sum_k rho_cell[k] · D[k],  D[k] = sum_p pi[p]·delta
       //   dL/drho[c,cell,k] += w_cell · D[k]
@@ -687,15 +723,13 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         for (uint32_t p = 0; p < num_passes; ++p) {
           const uint32_t cp = k * num_passes + p;
           double delta = 0.0;
-          const std::vector<double>& h_row = dL_dh[cp];
-          const std::vector<double>& N_row = dL_dN[cp];
-          for (const auto& entry : summary.h_entries) {
-            delta +=
-                static_cast<double>(entry.second) * h_row[entry.first];
-          }
-          for (const auto& entry : summary.N_entries) {
-            delta +=
-                static_cast<double>(entry.second) * N_row[entry.first];
+          const double* h_row =
+              dL_dh.data() + static_cast<size_t>(cp) * ac_alpha;
+          const double* N_row = dL_dN.data() + static_cast<size_t>(cp) * kZDC;
+          for (uint32_t e = ev_start; e < ev_end; ++e) {
+            const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
+            if (evt.hist_bin == kInvalidCompactH) continue;
+            delta += h_row[evt.hist_bin] + N_row[evt.zdc];
           }
           delta_ac_kp[cp] = delta;
         }
@@ -716,12 +750,13 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         uint32_t nz_left = 0;
         if (y > 0) {
           const uint32_t b_top = (y - 1) * grid_w + x;
-          pi_top = pi_cache[c][b_top].data();
+          pi_top = pi_cache[c].data() + static_cast<size_t>(b_top) * num_passes;
           nz_top = d.block_nonzeros[c][b_top];
         }
         if (x > 0) {
           const uint32_t b_left = y * grid_w + (x - 1);
-          pi_left = pi_cache[c][b_left].data();
+          pi_left =
+              pi_cache[c].data() + static_cast<size_t>(b_left) * num_passes;
           nz_left = d.block_nonzeros[c][b_left];
         }
         for (uint32_t p = 0; p < num_passes; ++p) {
@@ -748,9 +783,12 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
           const double one_minus_pi_p = 1.0 - pi_p;
           for (uint32_t k = 0; k < num_clusters; ++k) {
             const uint32_t cp = k * num_passes + p;
-            const double h_real_g = dL_dnz_h[cp][bin_real];
-            const double h_zero_g = dL_dnz_h[cp][bin_zero];
-            const double N_g = dL_dnz_N[cp][pb];
+            const double h_real_g =
+                dL_dnz_h[static_cast<size_t>(cp) * kNZBins + bin_real];
+            const double h_zero_g =
+                dL_dnz_h[static_cast<size_t>(cp) * kNZBins + bin_zero];
+            const double N_g =
+                dL_dnz_N[static_cast<size_t>(cp) * kNZBuckets + pb];
             nz_diff_h_kp[cp] = h_real_g - h_zero_g;
             nz_T_kp[cp] = pi_p * h_real_g + one_minus_pi_p * h_zero_g + N_g;
           }
@@ -789,12 +827,10 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
             &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
         double* dL_drho_cell =
             &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
-        double sum_rho_D = 0.0;
-        for (uint32_t k = 0; k < num_clusters; ++k) {
-          sum_rho_D += rho_cell[k] * D[k];
-          dL_drho_cell[k] += w_cell * D[k];
-        }
-        dL_dcell[cell] += sum_rho_D;
+        dL_dcell[cell] += HWY_DYNAMIC_DISPATCH(DotProductVec)(
+            rho_cell, D.data(), num_clusters);
+        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
+        (dL_drho_cell, w_cell, D.data(), num_clusters);
       }
 
       // Softmax Jacobian: dL/dlogit[q] = pi[q] * (dL/dpi[q] - s) / tau_pi,
@@ -850,15 +886,11 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       const size_t base = static_cast<size_t>(cell) * num_clusters;
       const double* rho_cell = &rho_cache[c][base];
       const double* dL_drho_cell = &dL_drho[c][base];
-      double s = 0.0;
-      for (uint32_t k = 0; k < num_clusters; ++k) {
-        s += rho_cell[k] * dL_drho_cell[k];
-      }
+      const double s = HWY_DYNAMIC_DISPATCH(DotProductVec)(
+          rho_cell, dL_drho_cell, num_clusters);
       double* grad_cluster = &grad->cluster_logits[c][base];
-      for (uint32_t m = 0; m < num_clusters; ++m) {
-        grad_cluster[m] +=
-            inv_cluster_t * rho_cell[m] * (dL_drho_cell[m] - s);
-      }
+      HWY_DYNAMIC_DISPATCH(ClusterJacobianVec)
+      (grad_cluster, inv_cluster_t, rho_cell, dL_drho_cell, s, num_clusters);
     }
   }
 
@@ -1751,3 +1783,5 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
 }
 
 }  // namespace jxl
+
+#endif  // HWY_ONCE
