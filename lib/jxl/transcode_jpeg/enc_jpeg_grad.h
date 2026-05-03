@@ -76,6 +76,19 @@ struct GradientJointState {
   // `rho` collapses to one-hot argmax, matching the old hard `ctx_map`.
   double cluster_temperature = 1.0;
 
+  // Soft context-map logits, flat: index = p*num_clusters*kZDC*H + k*kZDC*H +
+  // zdc*H + h, where H = num_hists. Softmax over h gives the probability that
+  // (cluster k, ZDC context zdc) routes to histogram h in pass p.
+  // Size: num_passes * num_clusters * kZDC * num_hists. Empty when
+  // num_hists<=1.
+  std::vector<double> ctx_logits;
+
+  // Softmax temperature for context-map assignment.
+  double ctx_temperature = 1.0;
+
+  // Number of histograms in the soft context map (≤ 128). Set to 1 to disable.
+  uint32_t num_hists = 1;
+
   uint32_t num_passes = 1;
 
   // Number of active clusters in the context map. Iteration 5 stores this in
@@ -101,6 +114,13 @@ GradientJointState InitGradientJointStateFromHard(
     const JPEGOptData& d, const PassSearchResult& hard, double hard_logit,
     double threshold_temperature, double pass_temperature,
     double cluster_temperature);
+
+// Fills `state->ctx_logits` with a round-robin hard assignment: for each
+// (pass, cluster k, zdc), the preferred histogram is `(k * kZDC + zdc) % H`
+// and receives `+hard_logit`; all other H−1 histograms receive `−hard_logit`.
+// Requires `state->num_hists`, `state->num_clusters`, and `state->num_passes`
+// to be set before calling. Replaces any existing `ctx_logits` content.
+void InitCtxLogitsRoundRobin(double hard_logit, GradientJointState* state);
 
 struct SoftCostResult {
   // AC entropy cost under the soft aggregation. Units: bits (not fixed-point).
@@ -130,6 +150,7 @@ struct GradientJointGrad {
   std::array<std::vector<double>, kNumCh> thresholds;
   std::array<std::vector<double>, kNumCh> pass_logits;
   std::array<std::vector<double>, kNumCh> cluster_logits;
+  std::vector<double> ctx_logits;  // flat, same layout as GradientJointState
 };
 
 // Zeros the gradient and sizes it to match `state`. Callers that accumulate
@@ -213,6 +234,8 @@ struct AdamState {
   std::array<std::vector<double>, kNumCh> v_logits;
   std::array<std::vector<double>, kNumCh> m_cluster_logits;
   std::array<std::vector<double>, kNumCh> v_cluster_logits;
+  std::vector<double> m_ctx_logits;  // flat, same layout as GradientJointState
+  std::vector<double> v_ctx_logits;
   // 1-based step counter used for bias-corrected moment estimates.
   uint32_t step = 0;
 };
@@ -246,6 +269,8 @@ struct AnnealSchedule {
   double threshold_final = 0.5;
   double cluster_init = 1.0;
   double cluster_final = 0.05;
+  double ctx_init = 1.0;
+  double ctx_final = 0.05;
 };
 
 // Sets `state->pass_temperature` and `state->threshold_temperature` according
@@ -311,7 +336,8 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
 GradientJointState InitGradientJointStateFromFactorization(
     const JPEGOptData& d, const Factorization& f, uint32_t num_passes,
     uint32_t num_clusters, double threshold_temperature,
-    double pass_temperature, double cluster_temperature);
+    double pass_temperature, double cluster_temperature,
+    uint32_t num_hists = 1);
 
 // Removes thresholds that don't actually separate clusters: for each axis,
 // scans thresholds and drops the ones whose adjacent buckets map to the

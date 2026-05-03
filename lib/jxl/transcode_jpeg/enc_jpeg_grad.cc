@@ -411,7 +411,12 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   const double inv_pass_t = 1.0 / state.pass_temperature;
   const double inv_thr_t = 1.0 / state.threshold_temperature;
   const double inv_cluster_t = 1.0 / state.cluster_temperature;
+  const double inv_ctx_t = 1.0 / state.ctx_temperature;
   const bool include_nz = (mode == CostMode::kTotal);
+  const uint32_t H = state.num_hists;
+  const bool use_ctx =
+      (H > 1 && state.ctx_logits.size() ==
+                    static_cast<size_t>(num_passes) * num_clusters * kZDC * H);
 
   // Forward accumulators (flat: index = cp * stride + i).
   std::vector<double> ac_h(cp_count * ac_alpha, 0.0);
@@ -421,6 +426,21 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   if (include_nz) {
     nz_h.assign(cp_count * kNZBins, 0.0);
     nz_N.assign(cp_count * kNZBuckets, 0.0);
+  }
+
+  // Lookup tables: dense bin -> zdc and token for ctx routing.
+  std::vector<uint32_t> dense_to_zdc_lut;
+  std::vector<uint32_t> dense_to_token_lut;
+  if (use_ctx) {
+    dense_to_zdc_lut.resize(ac_alpha);
+    dense_to_token_lut.resize(ac_alpha);
+    const CompactACHistogramData& hist = d.ACHistogram();
+    for (uint32_t di = 0; di < ac_alpha; ++di) {
+      const SignallingHistSymbol sym =
+          d.SignallingHistSymbolFromSymbol(hist.dense_to_zdcvalue[di]);
+      dense_to_zdc_lut[di] = sym.zdc;
+      dense_to_token_lut[di] = sym.token;
+    }
   }
 
   // Precompute block-pi vectors when NZ is needed (neighbor lookups).
@@ -447,6 +467,24 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
     for (size_t cell = 0; cell < num_cells; ++cell) {
       Softmax(&state.cluster_logits[c][cell * num_clusters], num_clusters,
               state.cluster_temperature, &rho_cache[c][cell * num_clusters]);
+    }
+  }
+
+  // Soft context-map sigma: softmax(ctx_logits[p,k,zdc,:], ctx_temperature).
+  // Flat layout: (p * K * kZDC + k * kZDC + zdc) * H + h.
+  std::vector<double> sigma;
+  if (use_ctx) {
+    sigma.resize(num_passes * num_clusters * kZDC * H);
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
+          const size_t off =
+              (static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC + zdc) *
+              H;
+          Softmax(&state.ctx_logits[off], H, state.ctx_temperature,
+                  &sigma[off]);
+        }
+      }
     }
   }
 
@@ -579,16 +617,65 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
     }
   }
 
+  // Context histograms: ctx_h[p, token, h] and ctx_N[p, h].
+  // Layouts: ctx_h index = p * kACTokenCount * H + token * H + h,
+  //          ctx_N index = p * H + h.
+  std::vector<double> ctx_h;
+  std::vector<double> ctx_N;
+  if (use_ctx) {
+    ctx_h.assign(num_passes * kACTokenCount * H, 0.0);
+    ctx_N.assign(num_passes * H, 0.0);
+    for (uint32_t k = 0; k < num_clusters; ++k) {
+      for (uint32_t p = 0; p < num_passes; ++p) {
+        const uint32_t cp = k * num_passes + p;
+        const double* ac_h_cp = &ac_h[static_cast<size_t>(cp) * ac_alpha];
+        double* ctx_h_p = &ctx_h[static_cast<size_t>(p) * kACTokenCount * H];
+        for (uint32_t di = 0; di < ac_alpha; ++di) {
+          const double v = ac_h_cp[di];
+          if (v == 0.0) continue;
+          const uint32_t zdc = dense_to_zdc_lut[di];
+          const uint32_t token = dense_to_token_lut[di];
+          const double* sig =
+              &sigma[(static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
+                      zdc) *
+                     H];
+          HWY_DYNAMIC_DISPATCH(AccumScaledVec)(&ctx_h_p[token * H], v, sig, H);
+        }
+      }
+    }
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      double* ctx_N_p = &ctx_N[p * H];
+      const double* ctx_h_p =
+          &ctx_h[static_cast<size_t>(p) * kACTokenCount * H];
+      for (uint32_t token = 0; token < kACTokenCount; ++token) {
+        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
+        (ctx_N_p, 1.0, &ctx_h_p[token * H], H);
+      }
+    }
+  }
+
   // --- AC cost reduction ----------------------------------------------------
   double ac_cost = 0.0;
   uint32_t touched_slots = 0;
-  for (uint32_t cp = 0; cp < cp_count; ++cp) {
-    const double N_sum =
-        HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&ac_N[cp * kZDC], kZDC);
-    const double h_sum =
-        HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&ac_h[cp * ac_alpha], ac_alpha);
-    ac_cost += N_sum - h_sum;
-    if (N_sum != 0.0 || h_sum != 0.0) ++touched_slots;
+  if (use_ctx) {
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      const double N_sum =
+          HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&ctx_N[p * H], H);
+      const double h_sum = HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(
+          &ctx_h[static_cast<size_t>(p) * kACTokenCount * H],
+          kACTokenCount * H);
+      ac_cost += N_sum - h_sum;
+      if (N_sum != 0.0 || h_sum != 0.0) ++touched_slots;
+    }
+  } else {
+    for (uint32_t cp = 0; cp < cp_count; ++cp) {
+      const double N_sum =
+          HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(&ac_N[cp * kZDC], kZDC);
+      const double h_sum = HWY_DYNAMIC_DISPATCH(SoftFTabReduceVec)(
+          &ac_h[cp * ac_alpha], ac_alpha);
+      ac_cost += N_sum - h_sum;
+      if (N_sum != 0.0 || h_sum != 0.0) ++touched_slots;
+    }
   }
   result.ac_cost_bits = ac_cost;
   result.num_cp_slots = touched_slots;
@@ -615,16 +702,107 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   if (grad == nullptr) return result;
 
   // --- Backward pass --------------------------------------------------------
-  // Precompute upstream gradients wrt accumulators.
-  //   dL/dN = +ftab'(N)
-  //   dL/dh = -ftab'(h)
+  // Precompute upstream gradients wrt ac_h / ac_N accumulators.
   std::vector<double> dL_dN(cp_count * kZDC, 0.0);
   std::vector<double> dL_dh(cp_count * ac_alpha, 0.0);
-  for (uint32_t cp = 0; cp < cp_count; ++cp) {
-    HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
-    (&ac_N[cp * kZDC], &dL_dN[cp * kZDC], 1.0, kZDC);
-    HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
-    (&ac_h[cp * ac_alpha], &dL_dh[cp * ac_alpha], -1.0, ac_alpha);
+  if (use_ctx) {
+    // Upstream from context histograms: dL/dctx_N = +ftab', dL/dctx_h = -ftab'.
+    std::vector<double> dL_dctx_N(num_passes * H, 0.0);
+    std::vector<double> dL_dctx_h(num_passes * kACTokenCount * H, 0.0);
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+      (&ctx_N[p * H], &dL_dctx_N[p * H], 1.0, H);
+      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+      (&ctx_h[static_cast<size_t>(p) * kACTokenCount * H],
+       &dL_dctx_h[static_cast<size_t>(p) * kACTokenCount * H], -1.0,
+       kACTokenCount * H);
+    }
+    // Propagate through sigma to get dL/dh[cp,di] and dL/dN[cp,zdc].
+    for (uint32_t k = 0; k < num_clusters; ++k) {
+      for (uint32_t p = 0; p < num_passes; ++p) {
+        const uint32_t cp = k * num_passes + p;
+        double* dh_cp = &dL_dh[static_cast<size_t>(cp) * ac_alpha];
+        double* dN_cp = &dL_dN[static_cast<size_t>(cp) * kZDC];
+        const double* dctx_h_p =
+            &dL_dctx_h[static_cast<size_t>(p) * kACTokenCount * H];
+        const double* dctx_N_p = &dL_dctx_N[p * H];
+        for (uint32_t di = 0; di < ac_alpha; ++di) {
+          const uint32_t zdc = dense_to_zdc_lut[di];
+          const uint32_t token = dense_to_token_lut[di];
+          const double* sig =
+              &sigma[(static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
+                      zdc) *
+                     H];
+          dh_cp[di] =
+              HWY_DYNAMIC_DISPATCH(DotProductVec)(sig, &dctx_h_p[token * H], H);
+        }
+        for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
+          const double* sig =
+              &sigma[(static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
+                      zdc) *
+                     H];
+          dN_cp[zdc] = HWY_DYNAMIC_DISPATCH(DotProductVec)(sig, dctx_N_p, H);
+        }
+      }
+    }
+    // dL/dsigma from ac_h and ac_N, then softmax Jacobian → grad->ctx_logits.
+    if (!grad->ctx_logits.empty()) {
+      std::vector<double> dL_dsigma(num_passes * num_clusters * kZDC * H, 0.0);
+      for (uint32_t k = 0; k < num_clusters; ++k) {
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          const uint32_t cp = k * num_passes + p;
+          const double* ac_h_cp = &ac_h[static_cast<size_t>(cp) * ac_alpha];
+          const double* ac_N_cp = &ac_N[static_cast<size_t>(cp) * kZDC];
+          const double* dctx_h_p =
+              &dL_dctx_h[static_cast<size_t>(p) * kACTokenCount * H];
+          const double* dctx_N_p = &dL_dctx_N[p * H];
+          for (uint32_t di = 0; di < ac_alpha; ++di) {
+            const double v = ac_h_cp[di];
+            if (v == 0.0) continue;
+            const uint32_t zdc = dense_to_zdc_lut[di];
+            const uint32_t token = dense_to_token_lut[di];
+            const size_t sig_off =
+                (static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
+                 zdc) *
+                H;
+            HWY_DYNAMIC_DISPATCH(AccumScaledVec)
+            (&dL_dsigma[sig_off], v, &dctx_h_p[token * H], H);
+          }
+          for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
+            const double v = ac_N_cp[zdc];
+            if (v == 0.0) continue;
+            const size_t sig_off =
+                (static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
+                 zdc) *
+                H;
+            HWY_DYNAMIC_DISPATCH(AccumScaledVec)
+            (&dL_dsigma[sig_off], v, dctx_N_p, H);
+          }
+        }
+      }
+      // Softmax Jacobian per (p, k, zdc) row.
+      for (uint32_t p = 0; p < num_passes; ++p) {
+        for (uint32_t k = 0; k < num_clusters; ++k) {
+          for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
+            const size_t off = (static_cast<size_t>(p) * num_clusters * kZDC +
+                                k * kZDC + zdc) *
+                               H;
+            const double* sig = &sigma[off];
+            const double* dsig = &dL_dsigma[off];
+            const double s = HWY_DYNAMIC_DISPATCH(DotProductVec)(sig, dsig, H);
+            HWY_DYNAMIC_DISPATCH(ClusterJacobianVec)
+            (&grad->ctx_logits[off], inv_ctx_t, sig, dsig, s, H);
+          }
+        }
+      }
+    }
+  } else {
+    for (uint32_t cp = 0; cp < cp_count; ++cp) {
+      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+      (&ac_N[cp * kZDC], &dL_dN[cp * kZDC], 1.0, kZDC);
+      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+      (&ac_h[cp * ac_alpha], &dL_dh[cp * ac_alpha], -1.0, ac_alpha);
+    }
   }
 
   // Per-block backward storage.
@@ -867,8 +1045,8 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
         const uint32_t Tlen = static_cast<uint32_t>(state.thresholds[a].size());
         if (Tlen == 0) continue;
         for (uint32_t j = 0; j < Tlen; ++j) {
-          const double sigma = axis_back[a]->sigma[j];
-          const double sigma_prime = sigma * (1.0 - sigma) * inv_thr_t;
+          const double sig_val = axis_back[a]->sigma[j];
+          const double sigma_prime = sig_val * (1.0 - sig_val) * inv_thr_t;
           grad->thresholds[a][j] +=
               sigma_prime *
               (dL_dw_ax[a][j] - dL_dw_ax[a][j + 1]);
@@ -952,7 +1130,28 @@ GradientJointState InitGradientJointStateFromHard(
       }
     }
   }
+  // ctx_logits: uniform (zero) — hard state has no per-zdc histogram routing.
+  // Caller sets num_hists and allocates ctx_logits if ctx-map optimization is
+  // desired; leave it empty here for backward compatibility.
   return state;
+}
+
+void InitCtxLogitsRoundRobin(double hard_logit, GradientJointState* state) {
+  const uint32_t H = state->num_hists;
+  const uint32_t K = state->num_clusters;
+  const uint32_t P = state->num_passes;
+  constexpr uint32_t kZDC = kZeroDensityContextCount;
+  state->ctx_logits.assign(static_cast<size_t>(P) * K * kZDC * H, -hard_logit);
+  for (uint32_t p = 0; p < P; ++p) {
+    for (uint32_t k = 0; k < K; ++k) {
+      for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
+        const uint32_t h = (k * kZDC + zdc) % H;
+        state->ctx_logits[(static_cast<size_t>(p) * K * kZDC + k * kZDC + zdc) *
+                              H +
+                          h] = hard_logit;
+      }
+    }
+  }
 }
 
 void ResetGradientJointGrad(const GradientJointState& state,
@@ -962,6 +1161,7 @@ void ResetGradientJointGrad(const GradientJointState& state,
     grad->pass_logits[a].assign(state.pass_logits[a].size(), 0.0);
     grad->cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
   }
+  grad->ctx_logits.assign(state.ctx_logits.size(), 0.0);
 }
 
 SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
@@ -997,6 +1197,8 @@ void InitAdamState(const GradientJointState& state, AdamState* adam) {
     adam->m_cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
     adam->v_cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
   }
+  adam->m_ctx_logits.assign(state.ctx_logits.size(), 0.0);
+  adam->v_ctx_logits.assign(state.ctx_logits.size(), 0.0);
   adam->step = 0;
 }
 
@@ -1035,6 +1237,10 @@ void AdamStep(const GradientJointGrad& grad, const AdamConfig& cfg,
                 &adam->v_cluster_logits[a][i]);
     }
   }
+  for (size_t i = 0; i < state->ctx_logits.size(); ++i) {
+    AdamApply(grad.ctx_logits[i], cfg, adam->step, &state->ctx_logits[i],
+              &adam->m_ctx_logits[i], &adam->v_ctx_logits[i]);
+  }
 }
 
 void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
@@ -1043,6 +1249,7 @@ void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
     state->pass_temperature = schedule.pass_init;
     state->threshold_temperature = schedule.threshold_init;
     state->cluster_temperature = schedule.cluster_init;
+    state->ctx_temperature = schedule.ctx_init;
     return;
   }
   const uint32_t anneal_step = step_index - schedule.hot_iters;
@@ -1050,6 +1257,7 @@ void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
     state->pass_temperature = schedule.pass_final;
     state->threshold_temperature = schedule.threshold_final;
     state->cluster_temperature = schedule.cluster_final;
+    state->ctx_temperature = schedule.ctx_final;
     return;
   }
   const double t = static_cast<double>(anneal_step) /
@@ -1064,9 +1272,12 @@ void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,
   const double log_clu =
       (1.0 - t) * std::log(schedule.cluster_init) +
       t * std::log(schedule.cluster_final);
+  const double log_ctx = (1.0 - t) * std::log(schedule.ctx_init) +
+                         t * std::log(schedule.ctx_final);
   state->pass_temperature = std::exp(log_pass);
   state->threshold_temperature = std::exp(log_thr);
   state->cluster_temperature = std::exp(log_clu);
+  state->ctx_temperature = std::exp(log_ctx);
 }
 
 void ProjectThresholdsMonotonic(GradientJointState* state, double epsilon) {
@@ -1278,7 +1489,7 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
 GradientJointState InitGradientJointStateFromFactorization(
     const JPEGOptData& d, const Factorization& f, uint32_t num_passes,
     uint32_t num_clusters, double threshold_temperature,
-    double pass_temperature, double cluster_temperature) {
+    double pass_temperature, double cluster_temperature, uint32_t num_hists) {
   GradientJointState state;
   state.num_passes = num_passes;
   state.num_clusters = num_clusters;
@@ -1329,6 +1540,11 @@ GradientJointState InitGradientJointStateFromFactorization(
     } else {
       state.cluster_logits[c].clear();
     }
+  }
+  state.num_hists = num_hists;
+  if (num_hists > 1) {
+    constexpr double kCtxSymmetryBreak = 0.5;
+    InitCtxLogitsRoundRobin(kCtxSymmetryBreak, &state);
   }
   return state;
 }
@@ -1608,16 +1824,20 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
   sched.threshold_final = effort.grad_init_temperature * 0.5;
   sched.cluster_init = effort.grad_init_temperature;
   sched.cluster_final = effort.grad_init_temperature * 0.05;
+  sched.ctx_init = effort.grad_init_temperature;
+  sched.ctx_final = effort.grad_init_temperature * 0.05;
+
+  const uint32_t num_hists = effort.grad_num_hists;
 
   fprintf(stderr,
           "PLANNER: [gradient] Schedule: hot=%u anneal=%u total_iters=%u "
-          "lr=%.4f T_pass=%.4f->%.4f T_thresh=%.4f->%.4f T_cluster=%.4f->%.4f\n",
+          "lr=%.4f T_pass=%.4f->%.4f T_thresh=%.4f->%.4f "
+          "T_cluster=%.4f->%.4f T_ctx=%.4f->%.4f num_hists=%u\n",
           sched.hot_iters, sched.anneal_iters,
-          sched.hot_iters + sched.anneal_iters,
-          adam_cfg.lr,
-          sched.pass_init, sched.pass_final,
-          sched.threshold_init, sched.threshold_final,
-          sched.cluster_init, sched.cluster_final);
+          sched.hot_iters + sched.anneal_iters, adam_cfg.lr, sched.pass_init,
+          sched.pass_final, sched.threshold_init, sched.threshold_final,
+          sched.cluster_init, sched.cluster_final, sched.ctx_init,
+          sched.ctx_final, num_hists);
   fflush(stderr);
 
   // Flat work list of `(factorization_idx, num_passes)` tuples. Each worker
@@ -1642,7 +1862,7 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
         const Factorization& f = factorizations[factorization_idx];
         GradientJointState state = InitGradientJointStateFromFactorization(
             d, f, num_passes, num_clusters, sched.threshold_init,
-            sched.pass_init, sched.cluster_init);
+            sched.pass_init, sched.cluster_init, num_hists);
         const OptimizeResult opt =
             RunGradientJointSolve(d, adam_cfg, sched, &state,
                                   f[0], f[1], f[2], num_passes);

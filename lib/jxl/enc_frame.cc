@@ -2167,6 +2167,30 @@ Status MaybeDumpGradientCandidateFiles(
     const std::vector<JPEGPassEncodingDebugCandidate>& candidates) {
   if (prefix.empty() || candidates.empty()) return true;
 
+  // Encode all candidates in parallel. Pass nullptr to the inner encode so it
+  // doesn't recurse into the same pool (nested RunOnPool on the same pool
+  // deadlocks). frame_data is read-only in JPEG recompression mode.
+  const uint32_t n = static_cast<uint32_t>(candidates.size());
+  std::vector<PaddedBytes> codestreams;
+  codestreams.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) codestreams.emplace_back(memory_manager);
+  JXL_RETURN_IF_ERROR(RunOnPool(
+      nullptr, 0, n, ThreadPool::NoInit,
+      [&](uint32_t i, size_t /*thread_id*/) -> Status {
+        PaddedBytes frame_bytes{memory_manager};
+        JXL_RETURN_IF_ERROR(EncodeJPEGPassPlanFrameBytes(
+            memory_manager, cparams, frame_info, metadata, frame_data,
+            jpeg_data, cms, /*pool=*/nullptr, frame_header, candidates[i].plan,
+            &frame_bytes));
+        JXL_RETURN_IF_ERROR(BuildDebugCodestream(memory_manager, metadata,
+                                                 frame_bytes, &codestreams[i]));
+        JXL_RETURN_IF_ERROR(WriteBytesToFile(
+            GradientCandidatePath(prefix, i, candidates[i]), codestreams[i]));
+        return true;
+      },
+      "GradientCandidateEncode"));
+
+  // Write manifest rows sequentially in index order.
   const std::string manifest_path = prefix + "_manifest.csv";
   FILE* manifest = std::fopen(manifest_path.c_str(), "wb");
   if (manifest == nullptr) {
@@ -2177,34 +2201,21 @@ Status MaybeDumpGradientCandidateFiles(
                "index,path,real_size_bytes,target_bits,ac_bits,nz_bits,"
                "overhead_bits,num_passes,num_clusters,fa,fb,fc,is_best\n");
 
-  for (size_t i = 0; i < candidates.size(); ++i) {
+  for (uint32_t i = 0; i < n; ++i) {
     const JPEGPassEncodingDebugCandidate& candidate = candidates[i];
-    PaddedBytes frame_bytes{memory_manager};
-    JXL_RETURN_IF_ERROR(EncodeJPEGPassPlanFrameBytes(
-        memory_manager, cparams, frame_info, metadata, frame_data, jpeg_data,
-        cms, pool, frame_header, candidate.plan, &frame_bytes));
-
-    PaddedBytes codestream{memory_manager};
-    JXL_RETURN_IF_ERROR(
-        BuildDebugCodestream(memory_manager, metadata, frame_bytes,
-                             &codestream));
-
     const std::string path = GradientCandidatePath(prefix, i, candidate);
-    JXL_RETURN_IF_ERROR(WriteBytesToFile(path, codestream));
     std::fprintf(
-        manifest,
-        "%" PRIuS
-        ",%s,%" PRIuS ",%.6f,%.6f,%.6f,%.6f,%u,%u,%u,%u,%u,%u\n",
-        i, path.c_str(), codestream.size(), candidate.target_cost_bits,
+        manifest, "%u,%s,%" PRIuS ",%.6f,%.6f,%.6f,%.6f,%u,%u,%u,%u,%u,%u\n", i,
+        path.c_str(), codestreams[i].size(), candidate.target_cost_bits,
         candidate.ac_cost_bits, candidate.nz_cost_bits,
         candidate.signalling_overhead_bits, candidate.plan.num_passes,
         candidate.num_clusters, candidate.factorization[0],
         candidate.factorization[1], candidate.factorization[2],
         static_cast<uint32_t>(candidate.is_best));
     std::fprintf(stderr,
-                 "PLANNER: [gradient] wrote candidate %" PRIuS
+                 "PLANNER: [gradient] wrote candidate %u"
                  " to %s (%" PRIuS " bytes, target=%.2f bits)%s\n",
-                 i, path.c_str(), codestream.size(),
+                 i, path.c_str(), codestreams[i].size(),
                  candidate.target_cost_bits,
                  candidate.is_best ? " ** BEST **" : "");
     std::fflush(stderr);

@@ -103,6 +103,11 @@ struct JPEGCtxEffortParams {
   // alone cannot pick this up because signalling overhead is piecewise-
   // constant in the soft state and contributes zero gradient.
   bool grad_overhead_aware_reduce;
+  // Number of soft context-map histograms per pass (≤ 128). 1 = disabled;
+  // the ctx_logits bundle is skipped entirely. When > 1, a round-robin
+  // hard init seeds each (cluster, zdc) pair into a distinct histogram
+  // before Adam starts.
+  uint32_t grad_num_hists;
 
   static JPEGCtxEffortParams FromSpeedTier(SpeedTier speed_tier) {
     switch (speed_tier) {
@@ -129,7 +134,8 @@ struct JPEGCtxEffortParams {
                 /*grad_anneal_iters=*/0,
                 /*grad_init_temperature=*/1.0,
                 /*grad_lr=*/0.01,
-                /*grad_overhead_aware_reduce=*/true};
+                /*grad_overhead_aware_reduce=*/true,
+                /*grad_num_hists=*/128};
       case SpeedTier::kTortoise:
         // `kRawAI` is marginally slower here but did not give better results.
         return {/*ac_hist_model=*/JPEGTranscodeACModel::kToken420,
@@ -149,11 +155,12 @@ struct JPEGCtxEffortParams {
                 /*bicluster_refine_thresholds=*/false,
                 /*bicluster_threshold_first=*/true,
                 /*use_gradient_joint_search=*/true,
-                /*grad_hot_iters=*/20,
-                /*grad_anneal_iters=*/30,
+                /*grad_hot_iters=*/30,
+                /*grad_anneal_iters=*/50,
                 /*grad_init_temperature=*/0.1,
                 /*grad_lr=*/0.1,
-                /*grad_overhead_aware_reduce=*/false};
+                /*grad_overhead_aware_reduce=*/false,
+                /*grad_num_hists=*/128};
       case SpeedTier::kGlacier:
       case SpeedTier::kTectonicPlate:
       default:
@@ -181,7 +188,8 @@ struct JPEGCtxEffortParams {
                 /*grad_anneal_iters=*/0,
                 /*grad_init_temperature=*/1.0,
                 /*grad_lr=*/0.01,
-                /*grad_overhead_aware_reduce=*/true};
+                /*grad_overhead_aware_reduce=*/true,
+                /*grad_num_hists=*/128};
     }
   }
 };
