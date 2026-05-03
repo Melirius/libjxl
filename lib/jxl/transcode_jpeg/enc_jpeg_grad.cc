@@ -148,6 +148,311 @@ void ClusterJacobianVec(double* HWY_RESTRICT dst, double scale,
   for (; m < n; ++m) dst[m] += scale * rho[m] * (drho[m] - s);
 }
 
+// B[k] = sum_cell cell_weight[cell] * rho[cell, k].
+void ClusterWeightsVec(const double* HWY_RESTRICT cell_weight,
+                       const double* HWY_RESTRICT rho,
+                       double* HWY_RESTRICT B, size_t num_cells,
+                       size_t num_clusters) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  size_t k = 0;
+  for (; k + N <= num_clusters; k += N) {
+    hn::StoreU(hn::Zero(d), d, B + k);
+  }
+  for (; k < num_clusters; ++k) B[k] = 0.0;
+
+  for (size_t cell = 0; cell < num_cells; ++cell) {
+    const double w = cell_weight[cell];
+    if (w == 0.0) continue;
+    const double* HWY_RESTRICT rho_cell = rho + cell * num_clusters;
+    const auto vw = hn::Set(d, w);
+    k = 0;
+    for (; k + N <= num_clusters; k += N) {
+      hn::StoreU(hn::MulAdd(vw, hn::LoadU(d, rho_cell + k),
+                            hn::LoadU(d, B + k)),
+                 d, B + k);
+    }
+    for (; k < num_clusters; ++k) B[k] += w * rho_cell[k];
+  }
+}
+
+// For each cell:
+//   dcell[cell] += dot(rho[cell, :], D)
+//   drho[cell, k] += cell_weight[cell] * D[k]
+void CellGradientVec(const double* HWY_RESTRICT cell_weight,
+                     const double* HWY_RESTRICT rho,
+                     const double* HWY_RESTRICT D,
+                     double* HWY_RESTRICT dcell,
+                     double* HWY_RESTRICT drho, size_t num_cells,
+                     size_t num_clusters) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  for (size_t cell = 0; cell < num_cells; ++cell) {
+    const double* HWY_RESTRICT rho_cell = rho + cell * num_clusters;
+    double* HWY_RESTRICT drho_cell = drho + cell * num_clusters;
+    auto vsum = hn::Zero(d);
+    size_t k = 0;
+    const double w = cell_weight[cell];
+    if (w == 0.0) {
+      for (; k + N <= num_clusters; k += N) {
+        vsum = hn::MulAdd(hn::LoadU(d, rho_cell + k), hn::LoadU(d, D + k),
+                          vsum);
+      }
+      double sum = hn::ReduceSum(d, vsum);
+      for (; k < num_clusters; ++k) sum += rho_cell[k] * D[k];
+      dcell[cell] += sum;
+      continue;
+    }
+
+    const auto vw = hn::Set(d, w);
+    for (; k + N <= num_clusters; k += N) {
+      const auto vd = hn::LoadU(d, D + k);
+      vsum = hn::MulAdd(hn::LoadU(d, rho_cell + k), vd, vsum);
+      hn::StoreU(hn::MulAdd(vw, vd, hn::LoadU(d, drho_cell + k)), d,
+                 drho_cell + k);
+    }
+    double sum = hn::ReduceSum(d, vsum);
+    for (; k < num_clusters; ++k) {
+      sum += rho_cell[k] * D[k];
+      drho_cell[k] += w * D[k];
+    }
+    dcell[cell] += sum;
+  }
+}
+
+// Converts row-wise softmax probability gradients into logit gradients:
+//   dst[row, m] += scale * prob[row, m] *
+//                  (dprob[row, m] - dot(prob[row, :], dprob[row, :])).
+void SoftmaxJacobianRowsVec(const double* HWY_RESTRICT prob,
+                            const double* HWY_RESTRICT dprob,
+                            double* HWY_RESTRICT dst, double scale,
+                            size_t num_rows, size_t row_size) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const auto vscale = hn::Set(d, scale);
+  for (size_t row = 0; row < num_rows; ++row) {
+    const double* HWY_RESTRICT p_row = prob + row * row_size;
+    const double* HWY_RESTRICT dp_row = dprob + row * row_size;
+    double* HWY_RESTRICT dst_row = dst + row * row_size;
+
+    auto vsum = hn::Zero(d);
+    size_t k = 0;
+    for (; k + N <= row_size; k += N) {
+      vsum = hn::MulAdd(hn::LoadU(d, p_row + k), hn::LoadU(d, dp_row + k),
+                        vsum);
+    }
+    double s = hn::ReduceSum(d, vsum);
+    for (; k < row_size; ++k) s += p_row[k] * dp_row[k];
+
+    const auto vs = hn::Set(d, s);
+    k = 0;
+    for (; k + N <= row_size; k += N) {
+      hn::StoreU(hn::MulAdd(hn::Mul(vscale, hn::LoadU(d, p_row + k)),
+                            hn::Sub(hn::LoadU(d, dp_row + k), vs),
+                            hn::LoadU(d, dst_row + k)),
+                 d, dst_row + k);
+    }
+    for (; k < row_size; ++k) {
+      dst_row[k] += scale * p_row[k] * (dp_row[k] - s);
+    }
+  }
+}
+
+void ContextForwardVec(const double* HWY_RESTRICT ac_h,
+                       const double* HWY_RESTRICT sigma,
+                       const uint32_t* HWY_RESTRICT dense_to_zdc,
+                       const uint32_t* HWY_RESTRICT dense_to_token,
+                       double* HWY_RESTRICT ctx_h,
+                       double* HWY_RESTRICT ctx_N, size_t num_clusters,
+                       size_t num_passes, size_t ac_alpha, size_t zdc_count,
+                       size_t token_count, size_t num_hists) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const size_t sigma_pk_stride = num_clusters * zdc_count * num_hists;
+  const size_t sigma_k_stride = zdc_count * num_hists;
+  const size_t ctx_h_p_stride = token_count * num_hists;
+
+  for (size_t p = 0; p < num_passes; ++p) {
+    double* HWY_RESTRICT ctx_h_p = ctx_h + p * ctx_h_p_stride;
+    for (size_t k = 0; k < num_clusters; ++k) {
+      const double* HWY_RESTRICT ac_h_cp =
+          ac_h + (k * num_passes + p) * ac_alpha;
+      const double* HWY_RESTRICT sigma_pk =
+          sigma + p * sigma_pk_stride + k * sigma_k_stride;
+      for (size_t di = 0; di < ac_alpha; ++di) {
+        const double v = ac_h_cp[di];
+        if (v == 0.0) continue;
+        const size_t zdc = dense_to_zdc[di];
+        const size_t token = dense_to_token[di];
+        const double* HWY_RESTRICT sig = sigma_pk + zdc * num_hists;
+        double* HWY_RESTRICT dst = ctx_h_p + token * num_hists;
+        const auto vv = hn::Set(d, v);
+        size_t h = 0;
+        for (; h + N <= num_hists; h += N) {
+          hn::StoreU(hn::MulAdd(vv, hn::LoadU(d, sig + h),
+                                hn::LoadU(d, dst + h)),
+                     d, dst + h);
+        }
+        for (; h < num_hists; ++h) dst[h] += v * sig[h];
+      }
+    }
+
+    double* HWY_RESTRICT ctx_N_p = ctx_N + p * num_hists;
+    size_t h = 0;
+    for (; h + N <= num_hists; h += N) {
+      auto vsum = hn::Zero(d);
+      for (size_t token = 0; token < token_count; ++token) {
+        vsum = hn::Add(vsum, hn::LoadU(d, ctx_h_p + token * num_hists + h));
+      }
+      hn::StoreU(vsum, d, ctx_N_p + h);
+    }
+    for (; h < num_hists; ++h) {
+      double sum = 0.0;
+      for (size_t token = 0; token < token_count; ++token) {
+        sum += ctx_h_p[token * num_hists + h];
+      }
+      ctx_N_p[h] = sum;
+    }
+  }
+}
+
+void ContextBackwardVec(const double* HWY_RESTRICT ac_h,
+                        const double* HWY_RESTRICT ac_N,
+                        const double* HWY_RESTRICT sigma,
+                        const double* HWY_RESTRICT dctx_h,
+                        const double* HWY_RESTRICT dctx_N,
+                        const uint32_t* HWY_RESTRICT dense_to_zdc,
+                        const uint32_t* HWY_RESTRICT dense_to_token,
+                        double* HWY_RESTRICT dL_dh,
+                        double* HWY_RESTRICT dL_dN,
+                        double* HWY_RESTRICT dL_dsigma, size_t num_clusters,
+                        size_t num_passes, size_t ac_alpha, size_t zdc_count,
+                        size_t token_count, size_t num_hists) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const size_t sigma_pk_stride = num_clusters * zdc_count * num_hists;
+  const size_t sigma_k_stride = zdc_count * num_hists;
+  const size_t ctx_h_p_stride = token_count * num_hists;
+
+  for (size_t k = 0; k < num_clusters; ++k) {
+    for (size_t p = 0; p < num_passes; ++p) {
+      const size_t cp = k * num_passes + p;
+      const double* HWY_RESTRICT ac_h_cp = ac_h + cp * ac_alpha;
+      const double* HWY_RESTRICT ac_N_cp = ac_N + cp * zdc_count;
+      const double* HWY_RESTRICT sigma_pk =
+          sigma + p * sigma_pk_stride + k * sigma_k_stride;
+      const double* HWY_RESTRICT dctx_h_p = dctx_h + p * ctx_h_p_stride;
+      const double* HWY_RESTRICT dctx_N_p = dctx_N + p * num_hists;
+      double* HWY_RESTRICT dh_cp = dL_dh + cp * ac_alpha;
+      double* HWY_RESTRICT dN_cp = dL_dN + cp * zdc_count;
+
+      for (size_t di = 0; di < ac_alpha; ++di) {
+        const size_t zdc = dense_to_zdc[di];
+        const size_t token = dense_to_token[di];
+        const double* HWY_RESTRICT sig = sigma_pk + zdc * num_hists;
+        const double* HWY_RESTRICT src = dctx_h_p + token * num_hists;
+        auto vsum = hn::Zero(d);
+        size_t h = 0;
+        for (; h + N <= num_hists; h += N) {
+          vsum = hn::MulAdd(hn::LoadU(d, sig + h), hn::LoadU(d, src + h),
+                            vsum);
+        }
+        double sum = hn::ReduceSum(d, vsum);
+        for (; h < num_hists; ++h) sum += sig[h] * src[h];
+        dh_cp[di] = sum;
+      }
+
+      for (size_t zdc = 0; zdc < zdc_count; ++zdc) {
+        const double* HWY_RESTRICT sig = sigma_pk + zdc * num_hists;
+        auto vsum = hn::Zero(d);
+        size_t h = 0;
+        for (; h + N <= num_hists; h += N) {
+          vsum = hn::MulAdd(hn::LoadU(d, sig + h),
+                            hn::LoadU(d, dctx_N_p + h), vsum);
+        }
+        double sum = hn::ReduceSum(d, vsum);
+        for (; h < num_hists; ++h) sum += sig[h] * dctx_N_p[h];
+        dN_cp[zdc] = sum;
+      }
+
+      if (dL_dsigma == nullptr) continue;
+
+      double* HWY_RESTRICT dsigma_pk =
+          dL_dsigma + p * sigma_pk_stride + k * sigma_k_stride;
+      for (size_t di = 0; di < ac_alpha; ++di) {
+        const double v = ac_h_cp[di];
+        if (v == 0.0) continue;
+        const size_t zdc = dense_to_zdc[di];
+        const size_t token = dense_to_token[di];
+        double* HWY_RESTRICT dst = dsigma_pk + zdc * num_hists;
+        const double* HWY_RESTRICT src = dctx_h_p + token * num_hists;
+        const auto vv = hn::Set(d, v);
+        size_t h = 0;
+        for (; h + N <= num_hists; h += N) {
+          hn::StoreU(hn::MulAdd(vv, hn::LoadU(d, src + h),
+                                hn::LoadU(d, dst + h)),
+                     d, dst + h);
+        }
+        for (; h < num_hists; ++h) dst[h] += v * src[h];
+      }
+      for (size_t zdc = 0; zdc < zdc_count; ++zdc) {
+        const double v = ac_N_cp[zdc];
+        if (v == 0.0) continue;
+        double* HWY_RESTRICT dst = dsigma_pk + zdc * num_hists;
+        const auto vv = hn::Set(d, v);
+        size_t h = 0;
+        for (; h + N <= num_hists; h += N) {
+          hn::StoreU(hn::MulAdd(vv, hn::LoadU(d, dctx_N_p + h),
+                                hn::LoadU(d, dst + h)),
+                     d, dst + h);
+        }
+        for (; h < num_hists; ++h) dst[h] += v * dctx_N_p[h];
+      }
+    }
+  }
+}
+
+void AdamApplyVec(const double* HWY_RESTRICT grad,
+                  double* HWY_RESTRICT param,
+                  double* HWY_RESTRICT m,
+                  double* HWY_RESTRICT v, size_t n, double beta1,
+                  double one_minus_beta1, double beta2,
+                  double one_minus_beta2, double lr, double inv_bias1,
+                  double inv_bias2, double eps) {
+  const hn::ScalableTag<double> d;
+  const size_t N = hn::Lanes(d);
+  const auto vb1 = hn::Set(d, beta1);
+  const auto vomb1 = hn::Set(d, one_minus_beta1);
+  const auto vb2 = hn::Set(d, beta2);
+  const auto vomb2 = hn::Set(d, one_minus_beta2);
+  const auto vlr = hn::Set(d, lr);
+  const auto vib1 = hn::Set(d, inv_bias1);
+  const auto vib2 = hn::Set(d, inv_bias2);
+  const auto veps = hn::Set(d, eps);
+  size_t i = 0;
+  for (; i + N <= n; i += N) {
+    const auto g = hn::LoadU(d, grad + i);
+    const auto new_m = hn::MulAdd(vomb1, g, hn::Mul(vb1, hn::LoadU(d, m + i)));
+    const auto new_v =
+        hn::MulAdd(vomb2, hn::Mul(g, g), hn::Mul(vb2, hn::LoadU(d, v + i)));
+    hn::StoreU(new_m, d, m + i);
+    hn::StoreU(new_v, d, v + i);
+
+    const auto m_hat = hn::Mul(new_m, vib1);
+    const auto v_hat = hn::Mul(new_v, vib2);
+    const auto denom = hn::Add(hn::Sqrt(v_hat), veps);
+    const auto update = hn::Mul(vlr, hn::Div(m_hat, denom));
+    hn::StoreU(hn::Sub(hn::LoadU(d, param + i), update), d, param + i);
+  }
+  for (; i < n; ++i) {
+    m[i] = beta1 * m[i] + one_minus_beta1 * grad[i];
+    v[i] = beta2 * v[i] + one_minus_beta2 * grad[i] * grad[i];
+    const double m_hat = m[i] * inv_bias1;
+    const double v_hat = v[i] * inv_bias2;
+    param[i] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+  }
+}
+
 }  // namespace HWY_NAMESPACE
 }  // namespace jxl
 HWY_AFTER_NAMESPACE();
@@ -161,6 +466,12 @@ HWY_EXPORT(SoftFTabPrimeVec);
 HWY_EXPORT(AccumScaledVec);
 HWY_EXPORT(DotProductVec);
 HWY_EXPORT(ClusterJacobianVec);
+HWY_EXPORT(ClusterWeightsVec);
+HWY_EXPORT(CellGradientVec);
+HWY_EXPORT(SoftmaxJacobianRowsVec);
+HWY_EXPORT(ContextForwardVec);
+HWY_EXPORT(ContextBackwardVec);
+HWY_EXPORT(AdamApplyVec);
 
 namespace {
 
@@ -538,14 +849,9 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       // Per-block per-cluster aggregate `B[k] = sum_cell w_cell · rho[c,cell,k]`.
       // This collapses the cell axis out of the inner accumulation, dropping a
       // factor of `num_cells` from the AC and NZ inner loops.
-      std::fill(B.begin(), B.end(), 0.0);
-      for (uint32_t cell = 0; cell < num_cells; ++cell) {
-        const double w_cell = cell_weight[cell];
-        if (w_cell == 0.0) continue;
-        const double* rho_cell = &rho_cache[c][cell * num_clusters];
-        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
-        (B.data(), w_cell, rho_cell, num_clusters);
-      }
+      HWY_DYNAMIC_DISPATCH(ClusterWeightsVec)
+      (cell_weight.data(), rho_cache[c].data(), B.data(), num_cells,
+       num_clusters);
 
       // AC accumulation.
       for (uint32_t k = 0; k < num_clusters; ++k) {
@@ -626,33 +932,10 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   if (use_ctx) {
     ctx_h.assign(num_passes * kACTokenCount * H, 0.0);
     ctx_N.assign(num_passes * H, 0.0);
-    for (uint32_t k = 0; k < num_clusters; ++k) {
-      for (uint32_t p = 0; p < num_passes; ++p) {
-        const uint32_t cp = k * num_passes + p;
-        const double* ac_h_cp = &ac_h[static_cast<size_t>(cp) * ac_alpha];
-        double* ctx_h_p = &ctx_h[static_cast<size_t>(p) * kACTokenCount * H];
-        for (uint32_t di = 0; di < ac_alpha; ++di) {
-          const double v = ac_h_cp[di];
-          if (v == 0.0) continue;
-          const uint32_t zdc = dense_to_zdc_lut[di];
-          const uint32_t token = dense_to_token_lut[di];
-          const double* sig =
-              &sigma[(static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
-                      zdc) *
-                     H];
-          HWY_DYNAMIC_DISPATCH(AccumScaledVec)(&ctx_h_p[token * H], v, sig, H);
-        }
-      }
-    }
-    for (uint32_t p = 0; p < num_passes; ++p) {
-      double* ctx_N_p = &ctx_N[p * H];
-      const double* ctx_h_p =
-          &ctx_h[static_cast<size_t>(p) * kACTokenCount * H];
-      for (uint32_t token = 0; token < kACTokenCount; ++token) {
-        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
-        (ctx_N_p, 1.0, &ctx_h_p[token * H], H);
-      }
-    }
+    HWY_DYNAMIC_DISPATCH(ContextForwardVec)
+    (ac_h.data(), sigma.data(), dense_to_zdc_lut.data(),
+     dense_to_token_lut.data(), ctx_h.data(), ctx_N.data(), num_clusters,
+     num_passes, ac_alpha, kZDC, kACTokenCount, H);
   }
 
   // --- AC cost reduction ----------------------------------------------------
@@ -710,92 +993,32 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
     // Upstream from context histograms: dL/dctx_N = +ftab', dL/dctx_h = -ftab'.
     std::vector<double> dL_dctx_N(num_passes * H, 0.0);
     std::vector<double> dL_dctx_h(num_passes * kACTokenCount * H, 0.0);
-    for (uint32_t p = 0; p < num_passes; ++p) {
-      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
-      (&ctx_N[p * H], &dL_dctx_N[p * H], 1.0, H);
-      HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
-      (&ctx_h[static_cast<size_t>(p) * kACTokenCount * H],
-       &dL_dctx_h[static_cast<size_t>(p) * kACTokenCount * H], -1.0,
-       kACTokenCount * H);
-    }
-    // Propagate through sigma to get dL/dh[cp,di] and dL/dN[cp,zdc].
-    for (uint32_t k = 0; k < num_clusters; ++k) {
-      for (uint32_t p = 0; p < num_passes; ++p) {
-        const uint32_t cp = k * num_passes + p;
-        double* dh_cp = &dL_dh[static_cast<size_t>(cp) * ac_alpha];
-        double* dN_cp = &dL_dN[static_cast<size_t>(cp) * kZDC];
-        const double* dctx_h_p =
-            &dL_dctx_h[static_cast<size_t>(p) * kACTokenCount * H];
-        const double* dctx_N_p = &dL_dctx_N[p * H];
-        for (uint32_t di = 0; di < ac_alpha; ++di) {
-          const uint32_t zdc = dense_to_zdc_lut[di];
-          const uint32_t token = dense_to_token_lut[di];
-          const double* sig =
-              &sigma[(static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
-                      zdc) *
-                     H];
-          dh_cp[di] =
-              HWY_DYNAMIC_DISPATCH(DotProductVec)(sig, &dctx_h_p[token * H], H);
-        }
-        for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
-          const double* sig =
-              &sigma[(static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
-                      zdc) *
-                     H];
-          dN_cp[zdc] = HWY_DYNAMIC_DISPATCH(DotProductVec)(sig, dctx_N_p, H);
-        }
-      }
-    }
-    // dL/dsigma from ac_h and ac_N, then softmax Jacobian → grad->ctx_logits.
+    HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+    (ctx_N.data(), dL_dctx_N.data(), 1.0, num_passes * H);
+    HWY_DYNAMIC_DISPATCH(SoftFTabPrimeVec)
+    (ctx_h.data(), dL_dctx_h.data(), -1.0,
+     static_cast<size_t>(num_passes) * kACTokenCount * H);
+
+    // Propagate through sigma to get dL/dh, dL/dN, and optionally dL/dsigma.
+    std::vector<double> dL_dsigma;
+    double* dL_dsigma_data = nullptr;
     if (!grad->ctx_logits.empty()) {
-      std::vector<double> dL_dsigma(num_passes * num_clusters * kZDC * H, 0.0);
-      for (uint32_t k = 0; k < num_clusters; ++k) {
-        for (uint32_t p = 0; p < num_passes; ++p) {
-          const uint32_t cp = k * num_passes + p;
-          const double* ac_h_cp = &ac_h[static_cast<size_t>(cp) * ac_alpha];
-          const double* ac_N_cp = &ac_N[static_cast<size_t>(cp) * kZDC];
-          const double* dctx_h_p =
-              &dL_dctx_h[static_cast<size_t>(p) * kACTokenCount * H];
-          const double* dctx_N_p = &dL_dctx_N[p * H];
-          for (uint32_t di = 0; di < ac_alpha; ++di) {
-            const double v = ac_h_cp[di];
-            if (v == 0.0) continue;
-            const uint32_t zdc = dense_to_zdc_lut[di];
-            const uint32_t token = dense_to_token_lut[di];
-            const size_t sig_off =
-                (static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
-                 zdc) *
-                H;
-            HWY_DYNAMIC_DISPATCH(AccumScaledVec)
-            (&dL_dsigma[sig_off], v, &dctx_h_p[token * H], H);
-          }
-          for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
-            const double v = ac_N_cp[zdc];
-            if (v == 0.0) continue;
-            const size_t sig_off =
-                (static_cast<size_t>(p) * num_clusters * kZDC + k * kZDC +
-                 zdc) *
-                H;
-            HWY_DYNAMIC_DISPATCH(AccumScaledVec)
-            (&dL_dsigma[sig_off], v, dctx_N_p, H);
-          }
-        }
-      }
+      dL_dsigma.assign(
+          static_cast<size_t>(num_passes) * num_clusters * kZDC * H, 0.0);
+      dL_dsigma_data = dL_dsigma.data();
+    }
+    HWY_DYNAMIC_DISPATCH(ContextBackwardVec)
+    (ac_h.data(), ac_N.data(), sigma.data(), dL_dctx_h.data(),
+     dL_dctx_N.data(), dense_to_zdc_lut.data(), dense_to_token_lut.data(),
+     dL_dh.data(), dL_dN.data(), dL_dsigma_data, num_clusters, num_passes,
+     ac_alpha, kZDC, kACTokenCount, H);
+
+    // dL/dsigma softmax Jacobian → grad->ctx_logits.
+    if (dL_dsigma_data != nullptr) {
       // Softmax Jacobian per (p, k, zdc) row.
-      for (uint32_t p = 0; p < num_passes; ++p) {
-        for (uint32_t k = 0; k < num_clusters; ++k) {
-          for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
-            const size_t off = (static_cast<size_t>(p) * num_clusters * kZDC +
-                                k * kZDC + zdc) *
-                               H;
-            const double* sig = &sigma[off];
-            const double* dsig = &dL_dsigma[off];
-            const double s = HWY_DYNAMIC_DISPATCH(DotProductVec)(sig, dsig, H);
-            HWY_DYNAMIC_DISPATCH(ClusterJacobianVec)
-            (&grad->ctx_logits[off], inv_ctx_t, sig, dsig, s, H);
-          }
-        }
-      }
+      HWY_DYNAMIC_DISPATCH(SoftmaxJacobianRowsVec)
+      (sigma.data(), dL_dsigma.data(), grad->ctx_logits.data(), inv_ctx_t,
+       static_cast<size_t>(num_passes) * num_clusters * kZDC, H);
     }
   } else {
     for (uint32_t cp = 0; cp < cp_count; ++cp) {
@@ -885,14 +1108,9 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
       // Per-block per-cluster aggregate `B[k] = sum_cell w_cell·rho[c,cell,k]`.
       // Matches the forward pass; reused by both AC and NZ backward to factor
       // the cell axis out of the inner loops.
-      std::fill(B.begin(), B.end(), 0.0);
-      for (uint32_t cell = 0; cell < num_cells; ++cell) {
-        const double w_cell = cell_weight[cell];
-        if (w_cell == 0.0) continue;
-        const double* rho_cell = &rho_cache[c][cell * num_clusters];
-        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
-        (B.data(), w_cell, rho_cell, num_clusters);
-      }
+      HWY_DYNAMIC_DISPATCH(ClusterWeightsVec)
+      (cell_weight.data(), rho_cache[c].data(), B.data(), num_cells,
+       num_clusters);
 
       // AC contribution: per-(k, p) delta.
       //   dL/dpi[p]   = sum_k B[k] · delta_ac[k*P+p]
@@ -1000,17 +1218,9 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
 
       // dL/dcell[cell] = sum_k rho_cell[k] · D[k]; dL/drho[c,cell,k] +=
       // w_cell · D[k]. Single per-cell pass over clusters covers both.
-      for (uint32_t cell = 0; cell < num_cells; ++cell) {
-        const double w_cell = cell_weight[cell];
-        const double* rho_cell =
-            &rho_cache[c][static_cast<size_t>(cell) * num_clusters];
-        double* dL_drho_cell =
-            &dL_drho[c][static_cast<size_t>(cell) * num_clusters];
-        dL_dcell[cell] += HWY_DYNAMIC_DISPATCH(DotProductVec)(
-            rho_cell, D.data(), num_clusters);
-        HWY_DYNAMIC_DISPATCH(AccumScaledVec)
-        (dL_drho_cell, w_cell, D.data(), num_clusters);
-      }
+      HWY_DYNAMIC_DISPATCH(CellGradientVec)
+      (cell_weight.data(), rho_cache[c].data(), D.data(), dL_dcell.data(),
+       dL_drho[c].data(), num_cells, num_clusters);
 
       // Softmax Jacobian: dL/dlogit[q] = pi[q] * (dL/dpi[q] - s) / tau_pi,
       // where s = sum_p pi[p] * dL/dpi[p].
@@ -1061,16 +1271,9 @@ SoftCostResult ComputeSoftACCostImpl(const JPEGOptData& d,
   //   dL/dlogit[m] = rho[m] * (dL/drho[m] - sum_k rho[k] * dL/drho[k])
   //                  / cluster_temperature.
   for (uint32_t c = 0; c < d.channels; ++c) {
-    for (uint32_t cell = 0; cell < num_cells; ++cell) {
-      const size_t base = static_cast<size_t>(cell) * num_clusters;
-      const double* rho_cell = &rho_cache[c][base];
-      const double* dL_drho_cell = &dL_drho[c][base];
-      const double s = HWY_DYNAMIC_DISPATCH(DotProductVec)(
-          rho_cell, dL_drho_cell, num_clusters);
-      double* grad_cluster = &grad->cluster_logits[c][base];
-      HWY_DYNAMIC_DISPATCH(ClusterJacobianVec)
-      (grad_cluster, inv_cluster_t, rho_cell, dL_drho_cell, s, num_clusters);
-    }
+    HWY_DYNAMIC_DISPATCH(SoftmaxJacobianRowsVec)
+    (rho_cache[c].data(), dL_drho[c].data(), grad->cluster_logits[c].data(),
+     inv_cluster_t, num_cells, num_clusters);
   }
 
   return result;
@@ -1203,45 +1406,37 @@ void InitAdamState(const GradientJointState& state, AdamState* adam) {
   adam->step = 0;
 }
 
-namespace {
-
-inline void AdamApply(double grad, const AdamConfig& cfg, uint32_t step,
-                      double* param, double* m, double* v) {
-  const double b1 = cfg.beta1;
-  const double b2 = cfg.beta2;
-  *m = b1 * (*m) + (1.0 - b1) * grad;
-  *v = b2 * (*v) + (1.0 - b2) * grad * grad;
-  const double m_hat = *m / (1.0 - std::pow(b1, static_cast<double>(step)));
-  const double v_hat = *v / (1.0 - std::pow(b2, static_cast<double>(step)));
-  *param -= cfg.lr * m_hat / (std::sqrt(v_hat) + cfg.eps);
-}
-
-}  // namespace
-
 void AdamStep(const GradientJointGrad& grad, const AdamConfig& cfg,
               AdamState* adam, GradientJointState* state) {
   ++adam->step;
+  const double beta1 = cfg.beta1;
+  const double beta2 = cfg.beta2;
+  const double one_minus_beta1 = 1.0 - beta1;
+  const double one_minus_beta2 = 1.0 - beta2;
+  const double inv_bias1 =
+      1.0 / (1.0 - std::pow(beta1, static_cast<double>(adam->step)));
+  const double inv_bias2 =
+      1.0 / (1.0 - std::pow(beta2, static_cast<double>(adam->step)));
+
+  auto apply = [&](const std::vector<double>& g, std::vector<double>* param,
+                   std::vector<double>* m, std::vector<double>* v) {
+    if (g.empty()) return;
+    HWY_DYNAMIC_DISPATCH(AdamApplyVec)
+    (g.data(), param->data(), m->data(), v->data(), g.size(), beta1,
+     one_minus_beta1, beta2, one_minus_beta2, cfg.lr, inv_bias1, inv_bias2,
+     cfg.eps);
+  };
+
   for (uint32_t a = 0; a < kNumCh; ++a) {
-    for (size_t j = 0; j < state->thresholds[a].size(); ++j) {
-      AdamApply(grad.thresholds[a][j], cfg, adam->step,
-                &state->thresholds[a][j], &adam->m_thresholds[a][j],
-                &adam->v_thresholds[a][j]);
-    }
-    for (size_t i = 0; i < state->pass_logits[a].size(); ++i) {
-      AdamApply(grad.pass_logits[a][i], cfg, adam->step,
-                &state->pass_logits[a][i], &adam->m_logits[a][i],
-                &adam->v_logits[a][i]);
-    }
-    for (size_t i = 0; i < state->cluster_logits[a].size(); ++i) {
-      AdamApply(grad.cluster_logits[a][i], cfg, adam->step,
-                &state->cluster_logits[a][i], &adam->m_cluster_logits[a][i],
-                &adam->v_cluster_logits[a][i]);
-    }
+    apply(grad.thresholds[a], &state->thresholds[a], &adam->m_thresholds[a],
+          &adam->v_thresholds[a]);
+    apply(grad.pass_logits[a], &state->pass_logits[a], &adam->m_logits[a],
+          &adam->v_logits[a]);
+    apply(grad.cluster_logits[a], &state->cluster_logits[a],
+          &adam->m_cluster_logits[a], &adam->v_cluster_logits[a]);
   }
-  for (size_t i = 0; i < state->ctx_logits.size(); ++i) {
-    AdamApply(grad.ctx_logits[i], cfg, adam->step, &state->ctx_logits[i],
-              &adam->m_ctx_logits[i], &adam->v_ctx_logits[i]);
-  }
+  apply(grad.ctx_logits, &state->ctx_logits, &adam->m_ctx_logits,
+        &adam->v_ctx_logits);
 }
 
 void ApplyAnnealing(const AnnealSchedule& schedule, uint32_t step_index,

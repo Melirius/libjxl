@@ -242,10 +242,11 @@ struct AdamState {
 };
 
 // Standard Adam hyperparameters.
+// TODO: try commented values
 struct AdamConfig {
   double lr = 0.01;
-  double beta1 = 0.9;
-  double beta2 = 0.999;
+  double beta1 = 0.9; // 0.8
+  double beta2 = 0.999; // 0.99. 0.95
   double eps = 1e-8;
 };
 
