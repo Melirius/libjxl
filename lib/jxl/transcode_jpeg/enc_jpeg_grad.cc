@@ -39,6 +39,7 @@
 
 #include "lib/jxl/ac_context.h"
 #include "lib/jxl/enc_ans_params.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_bicluster.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_pass_assign.h"
@@ -1571,6 +1572,56 @@ std::pair<uint32_t, uint32_t> ResolvePassRange(
   return {min_passes, std::max(min_passes, max_passes)};
 }
 
+Status RefreshHardCostWithBiclusterModel(const JPEGOptData& d,
+                                         uint32_t proto_budget_per_pass,
+                                         PassSearchResult* result) {
+  // The gradient search used in production currently runs with kToken420. For
+  // other AC models, keep the older pass-aware evaluator as a conservative
+  // fallback instead of failing an otherwise valid search path.
+  if (d.AC_hist_model != JPEGTranscodeACModel::kToken420) {
+    const ActiveRawBins active = BuildActiveRawBins(d);
+    std::vector<uint32_t> pass_offsets;
+    JXL_ASSIGN_OR_RETURN(
+        std::vector<ACEntry> pass_stream,
+        BuildPassStream(d, active, result->pass_assignment,
+                        result->num_passes, &pass_offsets, /*pool=*/nullptr));
+    JXL_ASSIGN_OR_RETURN(
+        ModelEvaluation eval,
+        EvaluatePassAwareModel(d, result->thresholds, result->ctx_map,
+                               result->num_clusters, result->pass_assignment,
+                               result->num_passes, pass_stream, pass_offsets));
+    result->ac_cost = eval.corrected_entropy_cost >= 0
+                          ? eval.corrected_entropy_cost
+                          : eval.ac_cost;
+    result->nz_cost = eval.nz_cost;
+    result->signalling_overhead = eval.signalling_overhead;
+    result->total_cost = eval.total_cost();
+    return true;
+  }
+
+  const uint32_t proto_budget = std::max<uint32_t>(1, proto_budget_per_pass);
+  const NZBlockCache nz_cache =
+      BuildNZBlockCache(d, result->pass_assignment, result->num_passes);
+  JXL_ASSIGN_OR_RETURN(
+      RowSliceState row_state,
+      BuildRowSliceState(d, result->thresholds, result->pass_assignment,
+                         result->num_passes, nz_cache));
+  std::vector<uint32_t> num_prototypes_per_pass(result->num_passes, 0);
+  JXL_ASSIGN_OR_RETURN(
+      ModelEvaluation eval,
+      EvaluateBiclusterState(d, result->thresholds, result->ctx_map,
+                             result->num_clusters, result->pass_assignment,
+                             result->num_passes, proto_budget,
+                             row_state.rows, &num_prototypes_per_pass));
+  result->ac_cost = eval.corrected_entropy_cost >= 0
+                        ? eval.corrected_entropy_cost
+                        : eval.ac_cost;
+  result->nz_cost = eval.nz_cost;
+  result->signalling_overhead = eval.signalling_overhead;
+  result->total_cost = eval.total_cost();
+  return true;
+}
+
 }  // namespace
 
 StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
@@ -1863,24 +1914,9 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
         GradientJointState state = InitGradientJointStateFromFactorization(
             d, f, num_passes, num_clusters, sched.threshold_init,
             sched.pass_init, sched.cluster_init, num_hists);
-        const OptimizeResult opt =
-            RunGradientJointSolve(d, adam_cfg, sched, &state,
-                                  f[0], f[1], f[2], num_passes);
-        // One extra forward pass at the final (low-temp) state to recover
-        // AC / NZ / overhead component breakdown for the rounded result.
-        const SoftCostResult final_cost = ComputeSoftTotalCost(d, state);
+        RunGradientJointSolve(d, adam_cfg, sched, &state,
+                              f[0], f[1], f[2], num_passes);
         slots[idx].result = RoundToHardAssignment(d, state);
-        slots[idx].result.ac_cost = static_cast<FixedPointCost>(std::llround(
-            final_cost.ac_cost_bits * static_cast<double>(kFScale)));
-        slots[idx].result.nz_cost = static_cast<FixedPointCost>(std::llround(
-            final_cost.nz_cost_bits * static_cast<double>(kFScale)));
-        slots[idx].result.signalling_overhead =
-            static_cast<FixedPointCost>(std::llround(
-                final_cost.signalling_overhead_bits *
-                static_cast<double>(kFScale)));
-        slots[idx].result.total_cost = static_cast<FixedPointCost>(std::llround(
-            final_cost.total_cost_bits * static_cast<double>(kFScale)));
-        slots[idx].final_cost_bits = opt.final_cost_bits;
         slots[idx].factorization_idx = factorization_idx;
         slots[idx].num_passes = num_passes;
         slots[idx].valid = true;
@@ -1931,6 +1967,9 @@ StatusOr<PassSearchResult> SearchGradientJointContextModel(
             fflush(stderr);
           }
         }
+        JXL_RETURN_IF_ERROR(RefreshHardCostWithBiclusterModel(
+            d, effort.bicluster_proto_budget_per_pass, &slots[idx].result));
+        slots[idx].final_cost_bits = bit_cost(slots[idx].result.total_cost);
         return true;
       },
       "JpegCtxGradSweep"));

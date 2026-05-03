@@ -26,8 +26,9 @@
 // `(factorization, num_passes)` configuration.
 // `SearchGradientJointContextModel` is the public entry point used by
 // `enc_jpeg_frame.cc` when `effort.use_gradient_joint_search` is set: it
-// sweeps `(factorization, num_passes)` tuples in parallel and returns the
-// hard-rounded `PassSearchResult` with the lowest final cost.
+// sweeps `(factorization, num_passes)` tuples in parallel, rounds each state to
+// a hard `PassSearchResult`, rescores it with the biclustering hard evaluator,
+// and returns the result with the lowest final hard cost.
 
 #ifndef LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_
 #define LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_
@@ -371,8 +372,8 @@ StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
                                                ThreadPool* pool);
 
 // Runs the gradient-based Lane B optimizer on every maximal factorization of
-// `opt_data` in parallel, rounds each to a hard `PassSearchResult`, and
-// returns the one with the lowest final soft total cost.
+// `opt_data` in parallel, rounds each to a hard `PassSearchResult`, rescoring
+// with the biclustering hard evaluator before ranking.
 //
 // Effort hyperparameters read from `effort`:
 //   grad_hot_iters, grad_anneal_iters, grad_init_temperature, grad_lr.
