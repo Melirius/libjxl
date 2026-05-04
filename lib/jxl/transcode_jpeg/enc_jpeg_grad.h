@@ -104,18 +104,6 @@ struct GradientJointState {
   uint32_t num_cells = 1;
 };
 
-// Initializes `GradientJointState` from a hard `PassSearchResult`. Thresholds
-// are cast to `double`. Pass logits are `+hard_logit` for the assigned pass,
-// `-hard_logit` elsewhere. Cluster logits are `+hard_logit` for the cluster
-// selected by `hard.ctx_map`, `-hard_logit` elsewhere. `hard_logit` should be
-// large enough that softmax at `temperature = 1` is numerically
-// indistinguishable from one-hot. All three temperatures are set to the
-// provided values (callers use a tiny value for hard-limit correctness tests).
-GradientJointState InitGradientJointStateFromHard(
-    const JPEGOptData& d, const PassSearchResult& hard, double hard_logit,
-    double threshold_temperature, double pass_temperature,
-    double cluster_temperature);
-
 // Fills `state->ctx_logits` with a round-robin hard assignment: for each
 // (pass, cluster k, zdc), the preferred histogram is `(k * kZDC + zdc) % H`
 // and receives `+hard_logit`; all other H−1 histograms receive `−hard_logit`.
@@ -157,26 +145,6 @@ struct GradientJointGrad {
 void ResetGradientJointGrad(const GradientJointState& state,
                             GradientJointGrad* grad);
 
-// Computes soft total cost for the given state. Kept under the historical AC
-// name for compatibility; new callers should use `ComputeSoftTotalCost`.
-// Cluster information comes from `state.cluster_logits` / `state.num_clusters`;
-// iteration 5 removed the separate `ctx_map` / `num_clusters` parameters.
-//
-// The formula mirrors `EvaluatePassAwareModel`:
-//   ac_cost = sum over (cluster, pass) cp of
-//             [sum_zdc ftab(N_cp_zdc) - sum_hist_bin ftab(h_cp_hist_bin)]
-// where the soft count at (cp, zdc) aggregates block-level contributions
-// weighted by three soft memberships:
-//   gamma_{b, cell} = cell membership via threshold sigmoids
-//   pi_{b, p}       = pass softmax per block
-//   rho_{c, cell, k} = cluster softmax per (channel, cell)
-//
-// `ftab` is evaluated on fractional counts via the continuous extension
-// `n * log2(n)`; at integer `n` this matches the precomputed `ftab` table up to
-// a half-ULP fixed-point rounding.
-SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
-                                 const GradientJointState& state);
-
 // Forward pass plus analytic backward pass for total cost. Kept under the
 // historical AC name for compatibility. Gradient accumulates into `*grad`
 // (call `ResetGradientJointGrad` first). Gradient flows through `thresholds`
@@ -184,9 +152,9 @@ SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
 // threshold-gradient formula uses the sigmoid's analytic derivative, the
 // pass-logit gradient uses the softmax Jacobian scaled by 1/tau_pi, and the
 // cluster-logit gradient uses the softmax Jacobian scaled by 1/tau_cluster.
-SoftCostResult ComputeSoftACCostWithGrad(const JPEGOptData& d,
-                                         const GradientJointState& state,
-                                         GradientJointGrad* grad);
+SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
+                                            const GradientJointState& state,
+                                            GradientJointGrad* grad);
 
 // --- Iteration 4: NZ cost + signalling overhead + total cost ---------------
 
@@ -254,7 +222,7 @@ void InitAdamState(const GradientJointState& state, AdamState* adam);
 
 // Applies one Adam update to `state` from `grad`. Mutates `state` in place and
 // advances `adam->step`. The caller must have already computed `grad` via
-// `ComputeSoftACCostWithGrad` and not reset it between forward/backward and
+// `ComputeSoftTotalCostWithGrad` and not reset it between forward/backward and
 // this call.
 void AdamStep(const GradientJointGrad& grad, const AdamConfig& cfg,
               AdamState* adam, GradientJointState* state);
