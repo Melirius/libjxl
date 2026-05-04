@@ -128,16 +128,14 @@ struct SoftCostResult {
   // Multiply by `kFScale` and round to compare against `FixedPointCost`.
   double ac_cost_bits = 0.0;
 
-  // NZ entropy cost (iteration 4). Zero when computed via
-  // `ComputeSoftACCost` / `ComputeSoftACCostWithGrad`.
+  // NZ entropy cost (iteration 4).
   double nz_cost_bits = 0.0;
 
   // Signalling overhead estimate: per-slot ANS-population-minus-Shannon plus a
-  // flat per-pass overhead. Treated as constant for gradient purposes. Zero
-  // when computed via `ComputeSoftACCost` / `ComputeSoftACCostWithGrad`.
+  // flat per-pass overhead. Treated as constant for gradient purposes.
   double signalling_overhead_bits = 0.0;
 
-  // Sum of the three components. For AC-only entries, equals `ac_cost_bits`.
+  // Sum of the three components.
   double total_cost_bits = 0.0;
 
   // Number of (cluster, pass) slots visited; zero-total slots are skipped in
@@ -159,9 +157,10 @@ struct GradientJointGrad {
 void ResetGradientJointGrad(const GradientJointState& state,
                             GradientJointGrad* grad);
 
-// Computes soft AC cost for the given state. Cluster information comes from
-// `state.cluster_logits` / `state.num_clusters`; iteration 5 removed the
-// separate `ctx_map` / `num_clusters` parameters.
+// Computes soft total cost for the given state. Kept under the historical AC
+// name for compatibility; new callers should use `ComputeSoftTotalCost`.
+// Cluster information comes from `state.cluster_logits` / `state.num_clusters`;
+// iteration 5 removed the separate `ctx_map` / `num_clusters` parameters.
 //
 // The formula mirrors `EvaluatePassAwareModel`:
 //   ac_cost = sum over (cluster, pass) cp of
@@ -178,7 +177,8 @@ void ResetGradientJointGrad(const GradientJointState& state,
 SoftCostResult ComputeSoftACCost(const JPEGOptData& d,
                                  const GradientJointState& state);
 
-// Forward pass plus analytic backward pass. Gradient accumulates into `*grad`
+// Forward pass plus analytic backward pass for total cost. Kept under the
+// historical AC name for compatibility. Gradient accumulates into `*grad`
 // (call `ResetGradientJointGrad` first). Gradient flows through `thresholds`
 // (AC only), `pass_logits` (AC + NZ), and `cluster_logits` (AC + NZ). The
 // threshold-gradient formula uses the sigmoid's analytic derivative, the
@@ -245,8 +245,8 @@ struct AdamState {
 // TODO: try commented values
 struct AdamConfig {
   double lr = 0.01;
-  double beta1 = 0.9; // 0.8
-  double beta2 = 0.999; // 0.99. 0.95
+  double beta1 = 0.8;//0.9; // 
+  double beta2 = 0.95;//0.999; // 0.99
   double eps = 1e-8;
 };
 
