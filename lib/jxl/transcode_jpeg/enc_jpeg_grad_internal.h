@@ -231,6 +231,13 @@ inline float OverheadBits(Histogram* hist) {
   return std::move(ans_cost).value_() - hist->ShannonEntropy();
 }
 
+// Computes the AC-histogram signalling overhead for one actual soft context-map
+// histogram `(pass, h)`. The input is `ctx_h[p, token, h]`, i.e. after
+// `(cluster, zdc)` slots have been routed into the shared budget of `H`
+// histograms.
+//
+// Counts are rounded from soft `double` to integer via `std::llround`. The
+// overhead term is not differentiated; this integer projection is enough.
 inline double ACSignallingOverheadBits(const double* ctx_h, size_t p, size_t h,
                                        size_t H, uint32_t* touched_slots,
                                        Histogram* hist) {

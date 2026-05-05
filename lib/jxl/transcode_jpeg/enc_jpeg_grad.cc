@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -722,11 +723,9 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
 // Mirrors the hard formula in `EvaluatePassAwareModel` exactly once the
 // fractional value is floored.
 inline uint32_t PredictorBucketFromPredictedNZ(double predicted_nz) {
-  const int nz_int =
-      std::max(0, static_cast<int>(std::floor(predicted_nz)));
-  uint32_t pb = (nz_int < 8) ? static_cast<uint32_t>(nz_int)
-                             : (4u + static_cast<uint32_t>(nz_int) / 2u);
-  return std::min<uint32_t>(pb, kJPEGNonZeroBuckets - 1);
+  const double nz_int = std::floor(predicted_nz);
+  uint32_t pb = (nz_int < 8) ? nz_int : (4 + nz_int / 2);
+  return std::min(pb, kJPEGNonZeroBuckets - 1);
 }
 
 // Flat per-pass overhead constant; duplicated from `ComputePassOverhead` in
@@ -738,14 +737,6 @@ inline double FlatPassOverheadBits(const JPEGOptData& d) {
   const uint32_t groups = groups_x * groups_y;
   return static_cast<double>(groups * 64u + 64000u);
 }
-
-// Computes the AC-histogram signalling overhead for one actual soft context-map
-// histogram `(pass, h)`. The input is `ctx_h[p, token, h]`, i.e. after
-// `(cluster, zdc)` slots have been routed into the shared budget of `H`
-// histograms.
-//
-// Counts are rounded from soft `double` to integer via `std::llround`. The
-// overhead term is not differentiated; this integer projection is enough.
 }  // namespace
 
 // Forward + optional backward. Shared body for all public entry points.
@@ -825,8 +816,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
     }
   }
 
-  // Soft context-map sigma: softmax(ctx_logits[p,k,zdc,:], ctx_temperature).
-  // Flat layout: (p * K * kZDC + k * kZDC + zdc) * H + h.
+  // Soft context-map sigma: `softmax(ctx_logits[p,k,zdc,:], ctx_temperature)`.
+  // Flat layout: `(p * K * kZDC + k * kZDC + zdc) * H + h`.
   std::vector<double>& sigma = work.sigma;
   for (uint32_t p = 0; p < num_passes; ++p) {
     for (uint32_t k = 0; k < num_clusters; ++k) {
@@ -842,11 +833,12 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
   std::vector<double>& w1 = work.w1;
   std::vector<double>& w2 = work.w2;
   std::vector<double>& cell_weight = work.cell_weight;
-  // Per-block per-cluster aggregate weight, B[k] = sum_cell
-  // w_cell*rho[c,cell,k]. Reused by both AC and NZ forward and by the backward
-  // pass; sized to fit any cluster axis count, allocated once per call.
+  // Per-block per-cluster aggregate weight,
+  //  `B[k] = sum_cell w_cell*rho[c,cell,k]`.
+  // Reused by both AC and NZ forward and by the backward pass;
+  // sized to fit any cluster axis count, allocated once per call.
   std::vector<double>& B = work.B;
-  // w_vec[k*P+p] = B[k]*pi[p]; drives VecAddVec per AC event.
+  // `w_vec[k*P+p] = B[k]*pi[p]`; drives `VecAddVec` per AC event.
   std::vector<double>& w_vec = work.w_vec;
 
   // --- Forward pass ---------------------------------------------------------
@@ -885,10 +877,10 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
                         num_cells, num_clusters);
 
       // AC accumulation.
-      // Compute w_vec[k*P+p] = B[k]*pi[p] once, then per event add
-      // w_vec into the transposed accumulators with a single VecAddVec.
-      // This replaces K*P random scatter writes with one sequential SIMD
-      // add per event, and keeps ac_h footprint L2-resident.
+      // Compute `w_vec[k*P+p] = B[k]*pi[p]` once, then per event add
+      // `w_vec` into the transposed accumulators with a single `VecAddVec`.
+      // This replaces `K*P` random scatter writes with one sequential SIMD
+      // add per event, and keeps `ac_h` footprint L2-resident.
       for (uint32_t k = 0; k < num_clusters; ++k) {
         const double Bk = B[k];
         for (uint32_t p = 0; p < num_passes; ++p) {
@@ -902,8 +894,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         VecAddVec(&ac_N[evt.zdc * cp_count], w_vec.data(), cp_count);
       }
 
-      // NZ accumulation: pb depends only on (block, pass), so precompute it
-      // outside the cluster loop. Same B[k] aggregation collapses the cell
+      // NZ accumulation: `pb` depends only on `(block, pass)`, so precompute it
+      // outside the cluster loop. Same `B[k]` aggregation collapses the cell
       // axis here too.
       const uint32_t y = b / grid_w;
       const uint32_t x = b % grid_w;
@@ -949,9 +941,9 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
     }
   }
 
-  // Context histograms: ctx_h[p, token, h] and ctx_N[p, h].
-  // Layouts: ctx_h index = p * kACTokenCount * H + token * H + h,
-  //          ctx_N index = p * H + h.
+  // Context histograms: `ctx_h[p, token, h]` and `ctx_N[p, h]`.
+  // Layouts: `ctx_h index = p * kACTokenCount * H + token * H + h`,
+  //          `ctx_N index = p * H + h`.
   std::vector<double>& ctx_h = work.ctx_h;
   std::vector<double>& ctx_N = work.ctx_N;
   std::fill(ctx_h.begin(), ctx_h.end(), 0.0);
@@ -994,17 +986,17 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
   if (grad == nullptr) return result;
 
   // --- Backward pass --------------------------------------------------------
-  // Precompute upstream gradients wrt ac_h / ac_N accumulators.
+  // Precompute upstream gradients wrt `ac_h/ac_N` accumulators.
   std::vector<double>& dL_dN = work.dL_dN;
   std::vector<double>& dL_dh = work.dL_dh;
-  // Upstream from context histograms: dL/dctx_N = +ftab', dL/dctx_h = -ftab'.
+  // Upstream from context histograms: `dL/dctx_N = +ftab', dL/dctx_h = -ftab'`.
   std::vector<double>& dL_dctx_N = work.dL_dctx_N;
   std::vector<double>& dL_dctx_h = work.dL_dctx_h;
   SoftFTabPrimeVecFast(ctx_N.data(), dL_dctx_N.data(), num_passes * H);
   SoftFTabPrimeNegVecFast(ctx_h.data(), dL_dctx_h.data(),
                           num_passes * kACTokenCount * H);
 
-  // Propagate through sigma to get dL/dh, dL/dN, and dL/dsigma.
+  // Propagate through `sigma` to get `dL/dh`, `dL/dN`, and `dL/dsigma`.
   JXL_DASSERT(grad->ctx_logits.size() == state.ctx_logits.size());
   std::vector<double>& dL_dsigma = work.dL_dsigma;
   std::fill(dL_dsigma.begin(), dL_dsigma.end(), 0.0);
@@ -1015,8 +1007,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
                      kACTokenCount, H);
 
   // Transpose context-backward outputs to match the forward AC accumulator
-  // layout. Block backward replays events once and accumulates all (k,p) slots
-  // with one sequential SIMD add per event.
+  // layout. Block backward replays events once and accumulates all `(k,p)`
+  // slots with one sequential SIMD add per event.
   std::vector<double>& dL_dh_trans = work.dL_dh_trans;
   for (uint32_t di = 0; di < ac_alpha; ++di) {
     double* HWY_RESTRICT dst = &dL_dh_trans[di * cp_count];
@@ -1032,8 +1024,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
     }
   }
 
-  // dL/dsigma softmax Jacobian -> grad->ctx_logits.
-  // Softmax Jacobian per (p, k, zdc) row.
+  // `dL/dsigma` softmax Jacobian -> `grad->ctx_logits`.
+  // Softmax Jacobian per `(p, k, zdc)` row.
   SoftmaxJacobianRowsVec(sigma.data(), dL_dsigma.data(),
                          grad->ctx_logits.data(), inv_ctx_t,
                          num_passes * num_clusters * kZDC, H);
@@ -1108,9 +1100,9 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
 
       // AC contribution: per-(k, p) delta. Use transposed dL/dh and dL/dN so
       // each event adds a contiguous cp_count vector, mirroring forward.
-      //   dL/dpi[p]   = sum_k B[k] * delta_ac[k*P+p]
-      //   dL/dcell    = sum_k rho_cell[k] * D[k], D[k] = sum_p pi[p]*delta
-      //   dL/drho[c,cell,k] += w_cell * D[k]
+      //   `dL/dpi[p]   = sum_k B[k] * delta_ac[k*P+p]`
+      //   `dL/dcell    = sum_k rho_cell[k] * D[k], D[k] = sum_p pi[p]*delta`
+      //   `dL/drho[c,cell,k] += w_cell * D[k]`
       std::fill(delta_ac_kp.begin(), delta_ac_kp.end(), 0.0);
       for (uint32_t e = ev_start; e < ev_end; ++e) {
         const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
@@ -1119,10 +1111,10 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
                    &dL_dN_trans[evt.zdc * cp_count], cp_count);
       }
 
-      // NZ contribution: pb is per-(block, pass), so precompute outside the
+      // NZ contribution: `pb` is per-(block, pass), so precompute outside the
       // cluster loop. For each (k, p) we record:
-      //   nz_diff_h[cp] = h_real_g - h_zero_g  (drives dL/dpi)
-      //   nz_T_kp[cp]   = pi_p*h_real_g + (1-pi_p)*h_zero_g + N_g
+      //   `nz_diff_h[cp] = h_real_g - h_zero_g`  (drives dL/dpi)
+      //   `nz_T_kp[cp]   = pi_p*h_real_g + (1-pi_p)*h_zero_g + N_g`
       //                   (combines into D[k] for cell/rho gradients)
       const uint32_t y = b / grid_w;
       const uint32_t x = b % grid_w;
@@ -1174,7 +1166,7 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         }
       }
 
-      // Build D[k] = sum_p (pi[p] * delta_ac[cp] + nz_T_kp[cp]) and pi-axis
+      // Build `D[k] = sum_p (pi[p] * delta_ac[cp] + nz_T_kp[cp])` and `pi`-axis
       // gradient sums.
       std::vector<double>& D = block_D;
       for (uint32_t k = 0; k < num_clusters; ++k) {
@@ -1187,7 +1179,7 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         D[k] = dk;
       }
 
-      // dL/dpi[p] from AC and NZ contributions, factored via B[k].
+      // `dL/dpi[p]` from AC and NZ contributions, factored via `B[k]`.
       for (uint32_t k = 0; k < num_clusters; ++k) {
         const double Bk = B[k];
         if (Bk == 0.0) continue;
@@ -1198,14 +1190,15 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         }
       }
 
-      // dL/dcell[cell] = sum_k rho_cell[k] * D[k]; dL/drho[c,cell,k] +=
-      // w_cell * D[k]. Single per-cell pass over clusters covers both.
+      // `dL/dcell[cell] = sum_k rho_cell[k] * D[k]`;
+      // `dL/drho[c,cell,k] += w_cell * D[k]`.
+      // Single per-cell pass over clusters covers both.
       CellGradientVec(cell_weight.data(), rho_cache[c].data(), D.data(),
                       dL_dcell.data(), dL_drho[c].data(), num_cells,
                       num_clusters);
 
-      // Softmax Jacobian: dL/dlogit[q] = pi[q] * (dL/dpi[q] - s) / tau_pi,
-      // where s = sum_p pi[p] * dL/dpi[p].
+      // Softmax Jacobian: `dL/dlogit[q] = pi[q] * (dL/dpi[q] - s) / tau_pi`,
+      // where `s = sum_p pi[p] * dL/dpi[p]`.
       double s = 0.0;
       for (uint32_t p = 0; p < num_passes; ++p) s += pi[p] * dL_dpi[p];
       double* grad_logits = &grad->pass_logits[c][b * num_passes];
@@ -1213,8 +1206,9 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         grad_logits[q] += inv_pass_t * pi[q] * (dL_dpi[q] - s);
       }
 
-      // Decompose dL/dcell into dL/dw_axis. Axis 0's weight at k0 pairs with
-      // w1[k1]*w2[k2] in the product, so that's the factor we multiply by.
+      // Decompose `dL/dcell` into `dL/dw_axis`. Axis 0's weight at `k0` pairs
+      // with `w1[k1]*w2[k2]` in the product, so that's the factor we multiply
+      // by.
       for (auto& a : dL_dw_ax) {
         std::fill(a.begin(), a.end(), 0.0);
       }
@@ -1230,8 +1224,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         }
       }
 
-      // Threshold gradient per axis. Threshold T[a][j] affects buckets j and
-      // j+1 in opposite directions.
+      // Threshold gradient per axis. Threshold `T[a][j]` affects buckets `j`
+      // and `j+1` in opposite directions.
       for (uint32_t a = 0; a < kNumCh; ++a) {
         const size_t Tlen = state.thresholds[a].size();
         if (Tlen == 0) continue;
@@ -1245,10 +1239,10 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
     }
   }
 
-  // Softmax Jacobian for cluster logits: per (c, cell), convert
+  // Softmax Jacobian for cluster logits: per `(c, cell)`, convert
   // `dL/drho[c][cell*K + k]` into `dL/dcluster_logits[c][cell*K + k]` via
-  //   dL/dlogit[m] = rho[m] * (dL/drho[m] - sum_k rho[k] * dL/drho[k])
-  //                  / cluster_temperature.
+  //   `dL/dlogit[m] = rho[m] * (dL/drho[m] - sum_k rho[k] * dL/drho[k])`
+  //                  `/ cluster_temperature`.
   for (uint32_t c = 0; c < d.channels; ++c) {
     SoftmaxJacobianRowsVec(rho_cache[c].data(), dL_drho[c].data(),
                            grad->cluster_logits[c].data(), inv_cluster_t,
@@ -1357,6 +1351,32 @@ static double DCThresholdValueToIndex(const JPEGOptData& d, uint32_t axis,
   const auto it = std::lower_bound(vals.begin(), vals.end(), threshold);
   return static_cast<double>(it - vals.begin());
 }
+
+namespace {
+
+uint32_t CompactHardClusters(PassSearchResult* result) {
+  std::array<bool, 256> used{};
+  for (uint8_t id : result->ctx_map) {
+    JXL_DASSERT(id < result->num_clusters);
+    used[id] = true;
+  }
+
+  std::array<uint8_t, 256> remap{};
+  uint32_t next = 0;
+  for (uint32_t id = 0; id < used.size(); ++id) {
+    if (!used[id]) continue;
+    JXL_DASSERT(next <= std::numeric_limits<uint8_t>::max());
+    remap[id] = static_cast<uint8_t>(next++);
+  }
+
+  for (uint8_t& id : result->ctx_map) {
+    id = remap[id];
+  }
+  result->num_clusters = std::max<uint32_t>(next, 1);
+  return result->num_clusters;
+}
+
+}  // namespace
 
 OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
                                 const AdamConfig& adam_cfg,
@@ -1544,6 +1564,7 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
       r.pass_assignment[c][b] = static_cast<uint8_t>(best);
     }
   }
+  CompactHardClusters(&r);
   return r;
 }
 
@@ -1639,6 +1660,8 @@ std::pair<uint32_t, uint32_t> ResolvePassRange(
 Status RefreshHardCostWithBiclusterModel(const JPEGOptData& d,
                                          uint32_t proto_budget_per_pass,
                                          PassSearchResult* result) {
+  CompactHardClusters(result);
+
   // The gradient search used in production currently runs with kToken420. For
   // other AC models, keep the older pass-aware evaluator as a conservative
   // fallback instead of failing an otherwise valid search path.
@@ -1699,6 +1722,8 @@ StatusOr<uint32_t> ReduceClustersAgglomerative(const JPEGOptData& d,
   if (result->ctx_map.size() != d.channels * num_cells) {
     return JXL_FAILURE("ReduceClustersAgglomerative: ctx_map size mismatch");
   }
+  CompactHardClusters(result);
+  if (result->num_clusters <= 1) return uint32_t{0};
 
   // Build the pass-stream once. Pass assignment is fixed across merges, so
   // the stream stays valid for every cost evaluation we do below.
@@ -1896,6 +1921,7 @@ uint32_t PruneRedundantThresholds(const JPEGOptData& d,
     }
   }
 
+  CompactHardClusters(result);
   return pruned_total;
 }
 
@@ -2015,8 +2041,9 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
           // Prune thresholds whose adjacent buckets all share the same
           // cluster (post-merge, often most of them). This shrinks the
           // bitstream factorization metadata and ctx_map size without
-          // changing per-block cluster assignment, so EvaluatePassAwareModel
-          // cost is unchanged but the actual bitstream is smaller.
+          // changing per-block cluster assignment other than dense
+          // renumbering, so EvaluatePassAwareModel cost is unchanged but the
+          // actual bitstream is smaller.
           const uint32_t pruned =
               PruneRedundantThresholds(d, &slots[idx].result);
           if (pruned > 0) {

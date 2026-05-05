@@ -100,6 +100,17 @@ std::shared_ptr<JPEGOptData> BuildOptDataFromFixture(
   return opt_data;
 }
 
+void ExpectDenseClusters(const PassSearchResult& result) {
+  std::vector<bool> seen(result.num_clusters, false);
+  for (uint8_t cluster : result.ctx_map) {
+    ASSERT_LT(cluster, result.num_clusters);
+    seen[cluster] = true;
+  }
+  for (uint32_t cluster = 0; cluster < result.num_clusters; ++cluster) {
+    EXPECT_TRUE(seen[cluster]) << "cluster=" << cluster;
+  }
+}
+
 // Initializes `GradientState` from a hard `PassSearchResult` for tests.
 GradientState InitGradientStateFromHard(const JPEGOptData& d,
                                         const PassSearchResult& hard,
@@ -712,6 +723,35 @@ TEST(JpegGradTest, ClusterLogitsHardLimitAgreesWithPassAwareModel) {
   }
 }
 
+TEST(JpegGradTest, RoundToHardAssignmentCompactsClusterHoles) {
+  std::shared_ptr<JPEGOptData> opt_data =
+      BuildOptDataFromFixture(JPEGTranscodeACModel::kToken420);
+  ASSERT_NE(opt_data, nullptr);
+
+  GradientState state;
+  state.num_passes = 1;
+  state.num_clusters = 4;
+  state.num_cells = 2;
+  state.thresholds[0] = {1.0};
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    state.pass_logits[c].assign(opt_data->num_blocks[c], 0.0);
+    if (c >= opt_data->channels) continue;
+    state.cluster_logits[c].assign(state.num_cells * state.num_clusters, -10.0);
+    state.cluster_logits[c][0 * state.num_clusters + 0] = 10.0;
+    state.cluster_logits[c][1 * state.num_clusters + 3] = 10.0;
+  }
+
+  const PassSearchResult rounded = RoundToHardAssignment(*opt_data, state);
+  EXPECT_EQ(rounded.num_clusters, 2u);
+  ASSERT_EQ(rounded.ctx_map.size(),
+            static_cast<size_t>(opt_data->channels) * state.num_cells);
+  for (uint32_t c = 0; c < opt_data->channels; ++c) {
+    EXPECT_EQ(rounded.ctx_map[c * state.num_cells + 0], 0u);
+    EXPECT_EQ(rounded.ctx_map[c * state.num_cells + 1], 1u);
+  }
+  ExpectDenseClusters(rounded);
+}
+
 // Iteration 6: parallel sweep over MaximalFactorizations. The smoke test runs
 // the full orchestrator with a modest iteration budget on a small fixture.
 // This validates plumbing end-to-end. Deeper correctness is covered by the
@@ -763,9 +803,7 @@ TEST(JpegGradTest, SearchGradientContextModelSmoke) {
                            (result.thresholds.TCr().size() + 1);
   EXPECT_EQ(result.ctx_map.size(),
             static_cast<size_t>(opt_data->channels) * num_cells);
-  for (uint8_t cluster : result.ctx_map) {
-    EXPECT_LT(cluster, result.num_clusters);
-  }
+  ExpectDenseClusters(result);
   for (size_t c = 0; c < kNumCh; ++c) {
     EXPECT_EQ(result.pass_assignment[c].size(), opt_data->num_blocks[c]);
     for (uint8_t p : result.pass_assignment[c]) {

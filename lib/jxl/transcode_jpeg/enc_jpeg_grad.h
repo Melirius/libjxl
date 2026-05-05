@@ -291,7 +291,8 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d,
 //                      `d.channels * state.num_cells`.
 //   - Thresholds:      rounded in DC-index space, projected to strictly
 //                      increasing, then mapped to actual `int16_t` DC values.
-//   - `num_passes` and `num_clusters` are copied from `state`.
+//   - `num_passes` is copied from `state`; `num_clusters` is compacted to the
+//     number of actually used hard clusters, so `ctx_map` ids are dense.
 PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
                                        const GradientState& state);
 
@@ -311,9 +312,9 @@ GradientState InitGradientStateFromFactorization(
 // scans thresholds and drops the ones whose adjacent buckets map to the
 // same cluster across every (channel, perpendicular-cell) combination.
 // Updates `result.thresholds` and `result.ctx_map` in place; cluster
-// assignments per block are preserved exactly. Saves bitstream size by
-// shrinking the factorization metadata and ctx_map. Returns the total number
-// of thresholds removed across all axes.
+// assignments per block are preserved up to dense renumbering. Saves bitstream
+// size by shrinking the factorization metadata and ctx_map. Returns the total
+// number of thresholds removed across all axes.
 //
 // Typically run AFTER `ReduceClustersAgglomerative`: cluster merging makes
 // many thresholds redundant by collapsing distinct clusters into shared ids.
