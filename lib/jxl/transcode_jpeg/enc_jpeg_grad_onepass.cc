@@ -73,26 +73,11 @@ void ContextBackwardVec(const double* HWY_RESTRICT ac_h,
 
 namespace {
 
-void SoftmaxScalar(const double* logits, uint32_t P, double inv_t,
-                   double* out) {
-  double max_val = logits[0];
-  for (uint32_t p = 1; p < P; ++p) {
-    if (logits[p] > max_val) max_val = logits[p];
-  }
-  double sum = 0.0;
-  for (uint32_t p = 0; p < P; ++p) {
-    out[p] = std::exp((logits[p] - max_val) * inv_t);
-    sum += out[p];
-  }
-  const double inv_sum = 1.0 / sum;
-  for (uint32_t p = 0; p < P; ++p) out[p] *= inv_sum;
-}
-
 void Softmax(const double* HWY_RESTRICT logits, uint32_t P, double temperature,
              double* HWY_RESTRICT out) {
   const double inv_t = 1.0 / temperature;
   if (P < 16) {
-    SoftmaxScalar(logits, P, inv_t, out);
+    GradientSoftmaxScalar(logits, P, inv_t, out);
     return;
   }
 
@@ -110,45 +95,42 @@ void Softmax(const double* HWY_RESTRICT logits, uint32_t P, double temperature,
     if (logits[p] > max_val) max_val = logits[p];
   }
 
+  const bool use_unshifted =
+      std::abs(max_val * inv_t) < kSoftmaxUnshiftedMaxArg;
   const auto vmax_val = hn::Set(d, max_val);
   auto vsum = hn::Zero(d);
-  for (p = 0; p + N <= P; p += N) {
-    const auto prob = hn::Exp(
-        d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val), vinv_t));
-    hn::StoreU(prob, d, out + p);
-    vsum = hn::Add(vsum, prob);
-  }
-  double sum = hn::ReduceSum(d, vsum);
-  for (; p < P; ++p) {
-    out[p] = std::exp((logits[p] - max_val) * inv_t);
-    sum += out[p];
+  double sum;
+  if (use_unshifted) {
+    for (p = 0; p + N <= P; p += N) {
+      const auto prob = hn::Exp(d, hn::Mul(hn::LoadU(d, logits + p), vinv_t));
+      hn::StoreU(prob, d, out + p);
+      vsum = hn::Add(vsum, prob);
+    }
+    sum = hn::ReduceSum(d, vsum);
+    for (; p < P; ++p) {
+      out[p] = std::exp(logits[p] * inv_t);
+      sum += out[p];
+    }
+  } else {
+    for (p = 0; p + N <= P; p += N) {
+      const auto prob = hn::Exp(
+          d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val), vinv_t));
+      hn::StoreU(prob, d, out + p);
+      vsum = hn::Add(vsum, prob);
+    }
+    sum = hn::ReduceSum(d, vsum);
+    for (; p < P; ++p) {
+      out[p] = std::exp((logits[p] - max_val) * inv_t);
+      sum += out[p];
+    }
   }
 
-  const auto vinv_sum = hn::Set(d, 1.0 / sum);
+  const double inv_sum = 1.0 / sum;
+  const auto vinv_sum = hn::Set(d, inv_sum);
   for (p = 0; p + N <= P; p += N) {
     hn::StoreU(hn::Mul(hn::LoadU(d, out + p), vinv_sum), d, out + p);
   }
-  const double inv_sum = 1.0 / sum;
   for (; p < P; ++p) out[p] *= inv_sum;
-}
-
-void AxisBucketWeights(const std::vector<double>& thresholds, uint32_t dc_idx,
-                       double inv_temperature, double* out,
-                       double* sigma = nullptr) {
-  const size_t K = thresholds.size() + 1;
-  if (K == 1) {
-    out[0] = 1.0;
-    return;
-  }
-  double prev = 0.0;
-  for (size_t k = 0; k + 1 < K; ++k) {
-    const double cur =
-        SafeSigmoid((thresholds[k] - dc_idx - 0.5) * inv_temperature);
-    out[k] = cur - prev;
-    if (sigma != nullptr) sigma[k] = cur;
-    prev = cur;
-  }
-  out[K - 1] = 1.0 - prev;
 }
 
 inline double FlatPassOverheadBits(const JPEGOptData& d) {

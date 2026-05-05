@@ -56,9 +56,6 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// `log2(e)`, the constant offset in `d(n*log2(n))/dn = log2(n) + log2(e)`.
-constexpr double kLog2E = 1.4426950408889634;
-
 // Experimental double-lane analogue of `FastLog2f`: same exponent/mantissa
 // reduction and 2/2 approximation, but adapted to IEEE-754 double bits.
 // Undefined for negative / NaN inputs. For zero it returns a finite value, so
@@ -348,8 +345,7 @@ void SoftmaxJacobianRowsVec(const double* HWY_RESTRICT prob,
     for (; k < row_size; ++k) s += p_row[k] * dp_row[k];
 
     const auto vs = hn::Set(d, s);
-    k = 0;
-    for (; k + N <= row_size; k += N) {
+    for (k = 0; k + N <= row_size; k += N) {
       hn::StoreU(hn::MulAdd(hn::Mul(vscale, hn::LoadU(d, p_row + k)),
                             hn::Sub(hn::LoadU(d, dp_row + k), vs),
                             hn::LoadU(d, dst_row + k)),
@@ -579,47 +575,17 @@ void AdamApplyVec(const double* HWY_RESTRICT grad, double* HWY_RESTRICT param,
 
 namespace {
 
-// Continuous extension of `ftab(n) = n * log2(n)` to fractional `n >= 0`. At
-// `n = 0` the limit is 0; the natural extension is used to stay differentiable
-// and to match the precomputed integer `ftab` at integer arguments up to
-// fixed-point rounding.
-inline double SoftFTab(double n) {
-  if (n <= 0.0) return 0.0;
-  return n * std::log2(n);
-}
-
-// Derivative `d(n * log2(n))/dn = log2(n) + log2(e)`. At `n <= 0` returns 0:
-// the soft forward pass only produces zero `n` when all contributing soft
-// weights are zero, in which case the chain rule collapses to zero anyway.
-inline double SoftFTabPrime(double n) {
-  constexpr double kEps = 1e-18;
-  if (n <= kEps) return 0.0;
-  return std::log2(n) + kLog2E;
-}
-
-void SoftmaxScalar(const double* logits, uint32_t P, double inv_t,
-                   double* out) {
-  double max_val = logits[0];
-  for (uint32_t p = 1; p < P; ++p) {
-    if (logits[p] > max_val) max_val = logits[p];
-  }
-  double sum = 0.0;
-  for (uint32_t p = 0; p < P; ++p) {
-    out[p] = std::exp((logits[p] - max_val) * inv_t);
-    sum += out[p];
-  }
-  const double inv_sum = 1.0 / sum;
-  for (uint32_t p = 0; p < P; ++p) out[p] *= inv_sum;
-}
-
 // Computes softmax of `P` logits with the given temperature, writing `P`
 // probabilities into `out`.
 void Softmax(const double* HWY_RESTRICT logits, uint32_t P, double temperature,
              double* HWY_RESTRICT out) {
   const double inv_t = 1.0 / temperature;
+  // Use the cheaper unshifted exp only while the largest exponent argument is
+  // comfortably finite. Low annealed temperatures can otherwise overflow or
+  // underflow the whole row, so we fall back to the row-max shift.
   // Keep tiny rows on std::exp; the hot context-map rows have H=128.
   if (P < 16) {
-    SoftmaxScalar(logits, P, inv_t, out);
+    GradientSoftmaxScalar(logits, P, inv_t, out);
     return;
   }
 
@@ -637,25 +603,41 @@ void Softmax(const double* HWY_RESTRICT logits, uint32_t P, double temperature,
     if (logits[p] > max_val) max_val = logits[p];
   }
 
+  const bool use_unshifted =
+      std::abs(max_val * inv_t) < kSoftmaxUnshiftedMaxArg;
   const auto vmax_val = hn::Set(d, max_val);
   auto vsum = hn::Zero(d);
-  for (p = 0; p + N <= P; p += N) {
-    const auto prob = hn::Exp(
-        d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val), vinv_t));
-    hn::StoreU(prob, d, out + p);
-    vsum = hn::Add(vsum, prob);
-  }
-  double sum = hn::ReduceSum(d, vsum);
-  for (; p < P; ++p) {
-    out[p] = std::exp((logits[p] - max_val) * inv_t);
-    sum += out[p];
+  double sum;
+  if (use_unshifted) {
+    for (p = 0; p + N <= P; p += N) {
+      const auto prob = hn::Exp(d, hn::Mul(hn::LoadU(d, logits + p), vinv_t));
+      hn::StoreU(prob, d, out + p);
+      vsum = hn::Add(vsum, prob);
+    }
+    sum = hn::ReduceSum(d, vsum);
+    for (; p < P; ++p) {
+      out[p] = std::exp(logits[p] * inv_t);
+      sum += out[p];
+    }
+  } else {
+    for (p = 0; p + N <= P; p += N) {
+      const auto prob = hn::Exp(
+          d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val), vinv_t));
+      hn::StoreU(prob, d, out + p);
+      vsum = hn::Add(vsum, prob);
+    }
+    sum = hn::ReduceSum(d, vsum);
+    for (; p < P; ++p) {
+      out[p] = std::exp((logits[p] - max_val) * inv_t);
+      sum += out[p];
+    }
   }
 
-  const auto vinv_sum = hn::Set(d, 1.0 / sum);
+  const double inv_sum = 1.0 / sum;
+  const auto vinv_sum = hn::Set(d, inv_sum);
   for (p = 0; p + N <= P; p += N) {
     hn::StoreU(hn::Mul(hn::LoadU(d, out + p), vinv_sum), d, out + p);
   }
-  const double inv_sum = 1.0 / sum;
   for (; p < P; ++p) out[p] *= inv_sum;
 }
 
@@ -693,22 +675,34 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
   for (; b + N <= num_blocks; b += N) {
     const double* HWY_RESTRICT logits_base = logits + b * P;
     double* HWY_RESTRICT out_base = out + b * P;
-    auto vmax = hn::GatherIndex(d, logits_base, block_offsets);
+    const auto p0 = hn::GatherIndex(d, logits_base, block_offsets);
+    auto vmax = p0;
+    probs[0] = hn::Exp(d, hn::Mul(p0, vinv_t));
+    auto vsum = probs[0];
     for (uint32_t p = 1; p < P; ++p) {
       const auto pass_offsets =
           hn::Add(block_offsets, hn::Set(di, static_cast<int64_t>(p)));
-      vmax = hn::Max(vmax, hn::GatherIndex(d, logits_base, pass_offsets));
+      const auto logits_p = hn::GatherIndex(d, logits_base, pass_offsets);
+      vmax = hn::Max(vmax, logits_p);
+      probs[p] = hn::Exp(d, hn::Mul(logits_p, vinv_t));
+      vsum = hn::Add(vsum, probs[p]);
     }
 
-    auto vsum = hn::Zero(d);
-    for (uint32_t p = 0; p < P; ++p) {
-      const auto pass_offsets =
-          hn::Add(block_offsets, hn::Set(di, static_cast<int64_t>(p)));
-      probs[p] = hn::Exp(
-          d,
-          hn::Mul(hn::Sub(hn::GatherIndex(d, logits_base, pass_offsets), vmax),
-                  vinv_t));
-      vsum = hn::Add(vsum, probs[p]);
+    // Fast path keeps the unshifted probabilities already computed above.
+    // If any lane's largest exponent would be unsafe, overwrite them
+    // with the shifted form for the whole SIMD chunk.
+    const bool use_unshifted =
+        hn::AllTrue(d, hn::Lt(hn::Abs(hn::Mul(vmax, vinv_t)),
+                              hn::Set(d, kSoftmaxUnshiftedMaxArg)));
+    if (!use_unshifted) {
+      vsum = hn::Zero(d);
+      for (uint32_t p = 0; p < P; ++p) {
+        const auto pass_offsets =
+            hn::Add(block_offsets, hn::Set(di, static_cast<int64_t>(p)));
+        const auto logits_p = hn::GatherIndex(d, logits_base, pass_offsets);
+        probs[p] = hn::Exp(d, hn::Mul(hn::Sub(logits_p, vmax), vinv_t));
+        vsum = hn::Add(vsum, probs[p]);
+      }
     }
 
     const auto vinv_sum = hn::Div(vone, vsum);
@@ -720,35 +714,8 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
   }
 
   for (; b < num_blocks; ++b) {
-    SoftmaxScalar(&logits[b * P], P, inv_t, &out[b * P]);
+    GradientSoftmaxScalar(&logits[b * P], P, inv_t, &out[b * P]);
   }
-}
-
-// Computes per-bucket weights for one axis and optionally records the sigmoid
-// values needed for the backward pass.
-//
-// Uses a half-integer offset `(T_idx - DC_idx - 0.5)` inside the sigmoid. At
-// the hard temperature limit this matches the strict `T[j] > DC` convention of
-// `AxisMaps::Bkt`: a block whose DC equals a threshold lands in the bucket
-// *after* the threshold, since `(T_idx - T_idx - 0.5)/tau -> -inf` drives the
-// sigmoid to 0 rather than sitting at the ambiguous 0.5 midpoint.
-void AxisBucketWeights(const std::vector<double>& thresholds, uint32_t dc_idx,
-                       double inv_temperature, double* out,
-                       double* sigma = nullptr) {
-  const size_t K = thresholds.size() + 1;
-  if (K == 1) {
-    out[0] = 1.0;
-    return;
-  }
-  double prev = 0.0;
-  for (size_t k = 0; k + 1 < K; ++k) {
-    const double cur =
-        SafeSigmoid((thresholds[k] - dc_idx - 0.5) * inv_temperature);
-    out[k] = cur - prev;
-    if (sigma != nullptr) sigma[k] = cur;
-    prev = cur;
-  }
-  out[K - 1] = 1.0 - prev;
 }
 
 // Derives the integer predictor bucket `pb` from a fractional `predicted_nz`.

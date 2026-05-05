@@ -18,6 +18,33 @@
 
 namespace jxl {
 
+constexpr double kSoftmaxUnshiftedMaxArg = 700.0;
+
+inline void GradientSoftmaxScalar(const double* logits, uint32_t P,
+                                  double inv_t, double* out) {
+  double max_val = logits[0];
+  for (uint32_t p = 1; p < P; ++p) {
+    if (logits[p] > max_val) max_val = logits[p];
+  }
+  const bool use_unshifted =
+      std::abs(max_val * inv_t) < kSoftmaxUnshiftedMaxArg;
+
+  double sum = 0.0;
+  if (use_unshifted) {
+    for (uint32_t p = 0; p < P; ++p) {
+      out[p] = std::exp(logits[p] * inv_t);
+      sum += out[p];
+    }
+  } else {
+    for (uint32_t p = 0; p < P; ++p) {
+      out[p] = std::exp((logits[p] - max_val) * inv_t);
+      sum += out[p];
+    }
+  }
+  const double inv_sum = 1.0 / sum;
+  for (uint32_t p = 0; p < P; ++p) out[p] *= inv_sum;
+}
+
 struct GradientBlockAux {
   std::array<uint16_t, kNumCh> dc_idx;
   uint16_t onepass_nz_pb = 0;
@@ -197,11 +224,16 @@ struct GradientScratch {
   }
 };
 
-inline double ACSignallingOverheadBits(const double* ctx_h,
-                                                   size_t p, size_t h,
-                                                   size_t H,
-                                                   uint32_t* touched_slots,
-                                                   Histogram* hist) {
+inline float OverheadBits(Histogram* hist) {
+  if (hist->total_count == 0) return 0.0f;
+  auto ans_cost = hist->ANSPopulationCost();
+  if (!ans_cost.ok()) return 0.0f;
+  return std::move(ans_cost).value_() - hist->ShannonEntropy();
+}
+
+inline double ACSignallingOverheadBits(const double* ctx_h, size_t p, size_t h,
+                                       size_t H, uint32_t* touched_slots,
+                                       Histogram* hist) {
   std::fill(hist->counts.begin(), hist->counts.end(), ANSHistBin{0});
   hist->total_count = 0;
   size_t total = 0;
@@ -209,49 +241,35 @@ inline double ACSignallingOverheadBits(const double* ctx_h,
   for (uint32_t token = 0; token < kACTokenCount; ++token) {
     const double v = ctx_h[p_off + token * H + h];
     if (v <= 0.0) continue;
-    const uint32_t count = static_cast<uint32_t>(std::llround(v));
+    const ANSHistBin count = static_cast<ANSHistBin>(std::llround(v));
     if (count == 0) continue;
-    hist->counts[token] = static_cast<ANSHistBin>(count);
+    hist->counts[token] = count;
     total += count;
   }
   if (total == 0) return 0.0;
   ++*touched_slots;
   hist->total_count = total;
-  auto ans_or = hist->ANSPopulationCost();
-  if (!ans_or.ok()) return 0.0;
-  const float ans_cost = std::move(ans_or).value_();
-  const float shannon = hist->ShannonEntropy();
-  const float header_cost = ans_cost - shannon;
-  return header_cost > 0.0f ? static_cast<double>(header_cost) : 0.0;
+  return OverheadBits(hist);
 }
 
-inline double NZSignallingOverheadBits(const double* nz_h,
-                                              size_t slot_idx, size_t cp_count,
-                                              Histogram* hist) {
+inline double NZSignallingOverheadBits(const double* nz_h, size_t slot_idx,
+                                       size_t cp_count, Histogram* hist) {
   double overhead_bits = 0.0;
   for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
-    std::fill(hist->counts.begin(), hist->counts.end(),
-              static_cast<ANSHistBin>(0));
+    std::fill(hist->counts.begin(), hist->counts.end(), ANSHistBin{0});
     hist->total_count = 0;
     size_t total = 0;
     for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
-      const double v =
-          nz_h[static_cast<size_t>(NZHistogramIndex(pb, nz)) * cp_count +
-               slot_idx];
+      const double v = nz_h[NZHistogramIndex(pb, nz) * cp_count + slot_idx];
       if (v <= 0.0) continue;
-      const uint32_t count = static_cast<uint32_t>(std::llround(v));
+      const ANSHistBin count = static_cast<ANSHistBin>(std::llround(v));
       if (count == 0) continue;
-      hist->counts[nz] = static_cast<ANSHistBin>(count);
+      hist->counts[nz] = count;
       total += count;
     }
     if (total == 0) continue;
     hist->total_count = total;
-    auto ans_or = hist->ANSPopulationCost();
-    if (!ans_or.ok()) continue;
-    const float ans_cost = std::move(ans_or).value_();
-    const float shannon = hist->ShannonEntropy();
-    const float header_cost = ans_cost - shannon;
-    if (header_cost > 0.0f) overhead_bits += static_cast<double>(header_cost);
+    overhead_bits += OverheadBits(hist);
   }
   return overhead_bits;
 }
@@ -263,6 +281,33 @@ inline double SafeSigmoid(double x) {
   if (x > 500.0) return 1.0;
   if (x < -500.0) return 0.0;
   return 1.0 / (1.0 + std::exp(-x));
+}
+
+// Computes per-bucket weights for one axis and optionally records the sigmoid
+// values needed for the backward pass.
+//
+// Uses a half-integer offset `(T_idx - DC_idx - 0.5)` inside the sigmoid. At
+// the hard temperature limit this matches the strict `T[j] > DC` convention of
+// `AxisMaps::Bkt`: a block whose DC equals a threshold lands in the bucket
+// *after* the threshold, since `(T_idx - T_idx - 0.5)/tau -> -inf` drives the
+// sigmoid to 0 rather than sitting at the ambiguous 0.5 midpoint.
+inline void AxisBucketWeights(const std::vector<double>& thresholds,
+                              uint32_t dc_idx, double inv_temperature,
+                              double* out, double* sigma = nullptr) {
+  const size_t K = thresholds.size() + 1;
+  if (K == 1) {
+    out[0] = 1.0;
+    return;
+  }
+  double prev = 0.0;
+  for (size_t k = 0; k + 1 < K; ++k) {
+    const double cur =
+        SafeSigmoid((thresholds[k] - dc_idx - 0.5) * inv_temperature);
+    out[k] = cur - prev;
+    if (sigma != nullptr) sigma[k] = cur;
+    prev = cur;
+  }
+  out[K - 1] = 1.0 - prev;
 }
 
 SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,

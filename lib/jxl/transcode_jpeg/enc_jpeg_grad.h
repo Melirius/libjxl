@@ -253,7 +253,7 @@ void AdamStep(const GradientGrad& grad, const AdamConfig& cfg, AdamState* adam,
 // Projects thresholds to be strictly increasing. Required because gradient
 // updates can swap adjacent thresholds, which would produce negative bucket
 // weights in the forward pass. Uses `epsilon` as the minimum gap.
-void ProjectThresholdsMonotonic(GradientState* state, double epsilon = 1e-6);
+void ProjectThresholdsMonotonic(GradientState* state, double epsilon = 1e-2);
 
 struct OptimizeResult {
   // Cost (bits) at the very first forward pass, before any Adam step.
