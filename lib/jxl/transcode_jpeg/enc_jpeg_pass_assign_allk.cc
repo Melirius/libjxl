@@ -176,7 +176,7 @@ FixedPointCost ClusteredHistogramProxyCost(const PassAssignmentCtx& ctx) {
   params.clustering = HistogramParams::ClusteringType::kBest;
 
   std::vector<std::array<uint32_t, kACTokenCount>> token_counts(ctx.czdc_size);
-  const auto& dense_to_symbol = ctx.d.ACHistogram().dense_to_zdcvalue;
+  const CompactACHistogramData& ac_hist = ctx.d.ACHistogram();
 
   FixedPointCost unclustered_token_cost = 0;
   FixedPointCost clustered_token_cost = 0;
@@ -193,9 +193,9 @@ FixedPointCost ClusteredHistogramProxyCost(const PassAssignmentCtx& ctx) {
           ctx.hist_h[static_cast<size_t>(compact_id) * ctx.num_passes + pass];
       if (freq == 0) continue;
       const uint16_t czdc = ctx.active.compact_to_czdc[compact_id];
-      const SignallingHistSymbol sym = ctx.d.SignallingHistSymbolFromSymbol(
-          dense_to_symbol[ctx.active.active_bins[compact_id]]);
-      token_counts[czdc][sym.token] += freq;
+      const uint32_t token =
+          ac_hist.dense_to_token[ctx.active.active_bins[compact_id]];
+      token_counts[czdc][token] += freq;
     }
 
     for (uint32_t czdc = 0; czdc < ctx.czdc_size; ++czdc) {
@@ -872,12 +872,12 @@ class FixedRowsPassAssignmentCtx {
       ++scratch->ac_token_size;
     };
 
+    const auto& dense_to_token = d.ACHistogram().dense_to_token;
     ForEachBlockBin(d, ref.c, ref.b, [&](ACBin bin) {
       const CompactACEvent ac_event = d.FromBin(bin);
-      const SignallingHistSymbol sym = d.SignallingHistSymbolFromSymbol(
-          d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
-      add_slice(static_cast<uint16_t>(sym.zdc));
-      add_token(static_cast<uint16_t>(sym.zdc * kACTokenCount + sym.token));
+      const uint32_t token = dense_to_token[ac_event.hist_bin];
+      add_slice(static_cast<uint16_t>(ac_event.zdc));
+      add_token(static_cast<uint16_t>(ac_event.zdc * kACTokenCount + token));
     });
 
     FixedPointCost best_delta = 0;
@@ -1093,25 +1093,25 @@ class FixedRowsPassAssignmentCtx {
 
   void AddACBlockToPass(uint32_t c, uint32_t b, uint32_t pass) {
     const uint32_t row = fixed_rows[c][b];
+    const auto& dense_to_token = d.ACHistogram().dense_to_token;
     ForEachBlockBin(d, c, b, [&](ACBin bin) {
       const CompactACEvent ac_event = d.FromBin(bin);
-      const SignallingHistSymbol sym = d.SignallingHistSymbolFromSymbol(
-          d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
-      const size_t slice = ACSliceIndex(row, pass, sym.zdc);
+      const uint32_t token = dense_to_token[ac_event.hist_bin];
+      const size_t slice = ACSliceIndex(row, pass, ac_event.zdc);
       ++ac_total[slice];
-      ++ac_hist[slice * kACTokenCount + sym.token];
+      ++ac_hist[slice * kACTokenCount + token];
     });
   }
 
   void RemoveACBlockFromPass(uint32_t c, uint32_t b, uint32_t pass) {
     const uint32_t row = fixed_rows[c][b];
+    const auto& dense_to_token = d.ACHistogram().dense_to_token;
     ForEachBlockBin(d, c, b, [&](ACBin bin) {
       const CompactACEvent ac_event = d.FromBin(bin);
-      const SignallingHistSymbol sym = d.SignallingHistSymbolFromSymbol(
-          d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
-      const size_t slice = ACSliceIndex(row, pass, sym.zdc);
+      const uint32_t token = dense_to_token[ac_event.hist_bin];
+      const size_t slice = ACSliceIndex(row, pass, ac_event.zdc);
       --ac_total[slice];
-      --ac_hist[slice * kACTokenCount + sym.token];
+      --ac_hist[slice * kACTokenCount + token];
     });
   }
 

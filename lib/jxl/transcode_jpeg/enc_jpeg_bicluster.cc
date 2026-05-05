@@ -78,11 +78,11 @@ void MoveBlockRowContributions(const JPEGOptData& d,
                                RowSliceHistograms* rows) {
   if (old_row == new_row) return;
   const uint32_t pass = pass_assignment[c][b];
+  const auto& dense_to_token = d.ACHistogram().dense_to_token;
   for (uint32_t pi = d.block_offsets[c][b]; pi < d.block_offsets[c][b + 1];
        ++pi) {
     const CompactACEvent ac_event = d.FromBin(d.block_bins[c][pi]);
-    const SignallingHistSymbol hist_symbol = d.SignallingHistSymbolFromSymbol(
-        d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
+    const uint32_t token = dense_to_token[ac_event.hist_bin];
     const size_t old_idx =
         (static_cast<size_t>(old_row) * num_passes + pass) *
             kZeroDensityContextCount +
@@ -91,9 +91,9 @@ void MoveBlockRowContributions(const JPEGOptData& d,
         (static_cast<size_t>(new_row) * num_passes + pass) *
             kZeroDensityContextCount +
         ac_event.zdc;
-    rows->ac_hist[old_idx].Subtract(hist_symbol.token);
+    rows->ac_hist[old_idx].Subtract(token);
     --rows->ac_total[old_idx];
-    rows->ac_hist[new_idx].Add(hist_symbol.token);
+    rows->ac_hist[new_idx].Add(token);
     ++rows->ac_total[new_idx];
   }
 
@@ -151,6 +151,7 @@ StatusOr<RowSliceState> BuildRowSliceState(
   rows.nz_total.assign(static_cast<size_t>(total_rows) * num_passes *
                            kJPEGNonZeroBuckets,
                        0);
+  const auto& dense_to_token = d.ACHistogram().dense_to_token;
   for (uint32_t c = 0; c < d.channels; ++c) {
     state.block_rows[c].resize(d.num_blocks[c]);
   }
@@ -169,10 +170,7 @@ StatusOr<RowSliceState> BuildRowSliceState(
             (static_cast<size_t>(row) * num_passes + pass) *
                 kZeroDensityContextCount +
             ac_event.zdc;
-        const SignallingHistSymbol hist_symbol =
-            d.SignallingHistSymbolFromSymbol(
-                d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
-        rows.ac_hist[idx].Add(hist_symbol.token);
+        rows.ac_hist[idx].Add(dense_to_token[ac_event.hist_bin]);
         ++rows.ac_total[idx];
       }
     }
@@ -586,6 +584,7 @@ FixedPointCost EstimateBiclusterGroupOverhead(
     group_bits[slot] += bits;
     group_nonempty[slot] = 1;
   };
+  const auto& dense_to_token = d.ACHistogram().dense_to_token;
 
   for (uint32_t c = 0; c < d.channels; ++c) {
     for (uint32_t y = 0; y < d.block_grid_h[c]; ++y) {
@@ -604,16 +603,15 @@ FixedPointCost EstimateBiclusterGroupOverhead(
         for (uint32_t pi = d.block_offsets[c][b]; pi < d.block_offsets[c][b + 1];
              ++pi) {
           const CompactACEvent ac_event = d.FromBin(d.block_bins[c][pi]);
-          const SignallingHistSymbol hist_symbol = d.SignallingHistSymbolFromSymbol(
-              d.ACHistogram().dense_to_zdcvalue[ac_event.hist_bin]);
+          const uint32_t token = dense_to_token[ac_event.hist_bin];
           const int16_t proto = ac_model.ac_proto_by_slice
               [static_cast<size_t>(cluster) * kZeroDensityContextCount + ac_event.zdc];
           JXL_DASSERT(proto >= 0);
           JXL_DASSERT(static_cast<size_t>(proto) < ac_model.proto_symbol_cost.size());
-          JXL_DASSERT(static_cast<size_t>(hist_symbol.token) <
+          JXL_DASSERT(static_cast<size_t>(token) <
                       ac_model.proto_symbol_cost[proto].size());
           mark_symbol(pass, group,
-                      ac_model.proto_symbol_cost[proto][hist_symbol.token]);
+                      ac_model.proto_symbol_cost[proto][token]);
         }
 
         const uint32_t b_top = (y - 1) * d.block_grid_w[c] + x;

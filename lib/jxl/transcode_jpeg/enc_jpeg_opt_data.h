@@ -120,12 +120,19 @@ struct CompactACHistogramData {
   std::vector<uint32_t> compact_map_h;
   // Inverse map: dense histogram id -> original model symbol.
   std::vector<uint32_t> dense_to_zdcvalue;
+  // Decoded inverse maps: dense histogram id -> signalling zdc / token.
+  std::vector<uint16_t> dense_to_zdc;
+  std::vector<uint16_t> dense_to_token;
 
   // Inserts `symbol` on first use and keeps both maps in sync.
-  void AddUniqueSymbol(uint32_t symbol) {
+  void AddUniqueSymbol(uint32_t symbol, uint32_t zdc, uint32_t token) {
     if (compact_map_h[symbol] == kInvalidCompactH) {
+      JXL_DASSERT(zdc <= std::numeric_limits<uint16_t>::max());
+      JXL_DASSERT(token <= std::numeric_limits<uint16_t>::max());
       compact_map_h[symbol] = num_zdcvalue++;
       dense_to_zdcvalue.push_back(symbol);
+      dense_to_zdc.push_back(static_cast<uint16_t>(zdc));
+      dense_to_token.push_back(static_cast<uint16_t>(token));
     }
   }
 };

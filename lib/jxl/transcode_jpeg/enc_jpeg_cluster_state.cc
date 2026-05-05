@@ -41,15 +41,13 @@ void AppendTokenHistograms(const JPEGOptData& d, const CompactHistogram& cluster
                            std::vector<Histogram>* histograms) {
   if (cluster.empty()) return;
 
-  const auto& dense_to_zdcvalue = d.ACHistogram().dense_to_zdcvalue;
+  const CompactACHistogramData& ac_hist = d.ACHistogram();
   std::vector<std::array<uint32_t, kACTokenCount>> zdc_counts(
       kZeroDensityContextCount);
   cluster.ForEachNonZero([&](uint32_t id, uint32_t freq) {
-    const SignallingHistSymbol hist_symbol =
-        d.SignallingHistSymbolFromSymbol(dense_to_zdcvalue[id]);
-    JXL_DASSERT(hist_symbol.zdc < kZeroDensityContextCount);
-    JXL_DASSERT(hist_symbol.token < kACTokenCount);
-    zdc_counts[hist_symbol.zdc][hist_symbol.token] += freq;
+    JXL_DASSERT(ac_hist.dense_to_zdc[id] < kZeroDensityContextCount);
+    JXL_DASSERT(ac_hist.dense_to_token[id] < kACTokenCount);
+    zdc_counts[ac_hist.dense_to_zdc[id]][ac_hist.dense_to_token[id]] += freq;
   });
 
   for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
@@ -147,13 +145,11 @@ Clustering::SignallingTokenHist::ClusterSignallingOverhead(
     FixedPointCost cutoff) {
   FixedPointCost overhead = 0;
   hist = {};
-  const auto& dense_to_zdcvalue = d.ACHistogram().dense_to_zdcvalue;
+  const CompactACHistogramData& ac_hist = d.ACHistogram();
   cluster.ForEachNonZero([&](uint32_t id, uint32_t freq) {
-    const SignallingHistSymbol hist_symbol =
-        d.SignallingHistSymbolFromSymbol(dense_to_zdcvalue[id]);
-    JXL_DASSERT(hist_symbol.zdc < kZeroDensityContextCount);
-    JXL_DASSERT(hist_symbol.token < kACTokenCount);
-    hist[hist_symbol.zdc][hist_symbol.token] += freq;
+    JXL_DASSERT(ac_hist.dense_to_zdc[id] < kZeroDensityContextCount);
+    JXL_DASSERT(ac_hist.dense_to_token[id] < kACTokenCount);
+    hist[ac_hist.dense_to_zdc[id]][ac_hist.dense_to_token[id]] += freq;
   });
 
   for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {

@@ -228,9 +228,13 @@ ACStreamData EmitACStream(const ActiveBinLayout& layout,
           : kZeroDensityContextCount * kACTokenCount;
   hist.compact_map_h.assign(hist_symbol_count, kInvalidCompactH);
   hist.dense_to_zdcvalue.reserve(layout.active_bins.size());
+  hist.dense_to_zdc.reserve(layout.active_bins.size());
+  hist.dense_to_token.reserve(layout.active_bins.size());
 
   for (uint32_t bin : layout.active_bins) {
-    hist.AddUniqueSymbol(d.ACHistogramSymbol(bin));
+    const uint32_t symbol = d.ACHistogramSymbol(bin);
+    const SignallingHistSymbol sym = d.SignallingHistSymbolFromSymbol(symbol);
+    hist.AddUniqueSymbol(symbol, sym.zdc, sym.token);
   }
 
   std::vector<EmitBin> emit_bins = BuildEmitBins(layout, d);

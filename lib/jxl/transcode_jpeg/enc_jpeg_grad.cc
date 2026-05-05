@@ -14,9 +14,9 @@
 //     integer-rounded (no gradient through bucket selection) and the per-block
 //     h-contribution splits between bin_real = NZIndex(pb, nz_b) and
 //     bin_zero = NZIndex(pb, 0) with weights pi[p] and 1 - pi[p].
-//   - Signalling overhead = per-slot ANSPopulationCost - ShannonEntropy for
-//     AC and NZ histograms, plus a flat `ComputePassOverhead(d) * num_passes`.
-//     Treated as constant for gradient purposes.
+//   - Signalling overhead = ANSPopulationCost - ShannonEntropy for routed AC
+//     histograms and NZ slots, plus a flat `ComputePassOverhead(d) *
+//     num_passes`. Treated as constant for gradient purposes.
 
 #include "lib/jxl/transcode_jpeg/enc_jpeg_grad.h"
 
@@ -41,7 +41,6 @@
 
 #include "lib/jxl/ac_context.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/enc_ans_params.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_bicluster.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
@@ -367,8 +366,8 @@ void SoftmaxJacobianRowsVec(const double* HWY_RESTRICT prob,
 // (L1-resident).
 void ContextForwardVec(const double* HWY_RESTRICT ac_h,
                        const double* HWY_RESTRICT sigma,
-                       const uint32_t* HWY_RESTRICT dense_to_zdc,
-                       const uint32_t* HWY_RESTRICT dense_to_token,
+                       const uint16_t* HWY_RESTRICT dense_to_zdc,
+                       const uint16_t* HWY_RESTRICT dense_to_token,
                        double* HWY_RESTRICT ctx_h,
                        double* HWY_RESTRICT ctx_N, size_t num_clusters,
                        size_t num_passes, size_t ac_alpha, size_t zdc_count,
@@ -435,8 +434,8 @@ void ContextBackwardVec(const double* HWY_RESTRICT ac_h,
                         const double* HWY_RESTRICT sigma,
                         const double* HWY_RESTRICT dctx_h,
                         const double* HWY_RESTRICT dctx_N,
-                        const uint32_t* HWY_RESTRICT dense_to_zdc,
-                        const uint32_t* HWY_RESTRICT dense_to_token,
+                        const uint16_t* HWY_RESTRICT dense_to_zdc,
+                        const uint16_t* HWY_RESTRICT dense_to_token,
                         double* HWY_RESTRICT dL_dh,
                         double* HWY_RESTRICT dL_dN,
                         double* HWY_RESTRICT dL_dsigma, size_t num_clusters,
@@ -728,12 +727,12 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
 // Computes per-bucket weights for one axis and optionally records the sigmoid
 // values needed for the backward pass.
 //
-// Uses a half-integer offset `(T - DC - 0.5)` inside the sigmoid. At the hard
-// temperature limit this matches the strict `T[j] > DC` convention of
+// Uses a half-integer offset `(T_idx - DC_idx - 0.5)` inside the sigmoid. At
+// the hard temperature limit this matches the strict `T[j] > DC` convention of
 // `AxisMaps::Bkt`: a block whose DC equals a threshold lands in the bucket
-// *after* the threshold, since `(T - T - 0.5)/tau -> -inf` drives the sigmoid
-// to 0 rather than sitting at the ambiguous 0.5 midpoint.
-void AxisBucketWeights(const std::vector<double>& thresholds, int dc,
+// *after* the threshold, since `(T_idx - T_idx - 0.5)/tau -> -inf` drives the
+// sigmoid to 0 rather than sitting at the ambiguous 0.5 midpoint.
+void AxisBucketWeights(const std::vector<double>& thresholds, uint32_t dc_idx,
                        double inv_temperature, double* out,
                        double* sigma = nullptr) {
   const size_t K = thresholds.size() + 1;
@@ -744,7 +743,7 @@ void AxisBucketWeights(const std::vector<double>& thresholds, int dc,
   double prev = 0.0;
   for (size_t k = 0; k + 1 < K; ++k) {
     const double cur =
-        SafeSigmoid((thresholds[k] - dc - 0.5) * inv_temperature);
+        SafeSigmoid((thresholds[k] - dc_idx - 0.5) * inv_temperature);
     out[k] = cur - prev;
     if (sigma != nullptr) sigma[k] = cur;
     prev = cur;
@@ -773,101 +772,13 @@ inline double FlatPassOverheadBits(const JPEGOptData& d) {
   return static_cast<double>(groups * 64u + 64000u);
 }
 
-// Computes the AC-histogram signalling overhead for one (cluster, pass) slot.
-// Buckets symbols by zdc into sub-histograms over tokens, then returns
-// `ANSPopulationCost - ShannonEntropy` per sub-histogram.
+// Computes the AC-histogram signalling overhead for one actual soft context-map
+// histogram `(pass, h)`. The input is `ctx_h[p, token, h]`, i.e. after
+// `(cluster, zdc)` slots have been routed into the shared budget of `H`
+// histograms.
 //
 // Counts are rounded from soft `double` to integer via `std::llround`. The
 // overhead term is not differentiated; this integer projection is enough.
-double ACSignallingOverheadBitsForSlot(const JPEGOptData& d,
-                                       const double* ac_h_transposed, size_t cp,
-                                       size_t cp_count, size_t ac_h_size) {
-  std::array<std::array<uint32_t, kACTokenCount>, kZeroDensityContextCount>
-      signalling_hist = {};
-  const auto& dense_to_symbol = d.ACHistogram().dense_to_zdcvalue;
-  const size_t dense_size = dense_to_symbol.size();
-  double overhead_bits = 0.0;
-  for (size_t idx = 0; idx < ac_h_size && idx < dense_size; ++idx) {
-    const double v = ac_h_transposed[idx * cp_count + cp];
-    if (v <= 0.0) continue;
-    const uint32_t count =
-        static_cast<uint32_t>(std::llround(std::max<double>(v, 0.0)));
-    if (count == 0) continue;
-    const SignallingHistSymbol sym =
-        d.SignallingHistSymbolFromSymbol(dense_to_symbol[idx]);
-    signalling_hist[sym.zdc][sym.token] += count;
-  }
-  for (uint32_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
-    size_t total = 0;
-    uint32_t max_token = 0;
-    for (uint32_t token = 0; token < kACTokenCount; ++token) {
-      if (signalling_hist[zdc][token] == 0) continue;
-      total += signalling_hist[zdc][token];
-      max_token = token;
-    }
-    if (total == 0) continue;
-    Histogram h(max_token + 1);
-    for (uint32_t token = 0; token <= max_token; ++token) {
-      h.counts[token] = static_cast<ANSHistBin>(signalling_hist[zdc][token]);
-    }
-    h.total_count = total;
-    auto ans_or = h.ANSPopulationCost();
-    if (!ans_or.ok()) continue;
-    const float ans_cost = std::move(ans_or).value_();
-    const float shannon = h.ShannonEntropy();
-    const float header_cost = ans_cost - shannon;
-    if (header_cost > 0.0f) overhead_bits += header_cost;
-  }
-  return overhead_bits;
-}
-
-// Signalling overhead for one NZ-histogram slot in transposed `[bin][p][k]`
-// layout: per predictor bucket, build a sub-histogram over `nz_count` and
-// return `ANSPopulationCost - ShannonEntropy`.
-double NZSignallingOverheadBitsForTransposedSlot(const double* nz_h, size_t k,
-                                                 size_t p, size_t num_clusters,
-                                                 size_t num_passes) {
-  double overhead_bits = 0.0;
-  for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
-    uint32_t max_nz = 0;
-    size_t total = 0;
-    // First pass: find max symbol and total.
-    for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
-      const size_t off =
-          (static_cast<size_t>(NZHistogramIndex(pb, nz)) * num_passes + p) *
-              num_clusters +
-          k;
-      const double v = nz_h[off];
-      if (v <= 0.0) continue;
-      const uint32_t count =
-          static_cast<uint32_t>(std::llround(std::max<double>(v, 0.0)));
-      if (count == 0) continue;
-      max_nz = std::max(max_nz, nz);
-      total += count;
-    }
-    if (total == 0) continue;
-    Histogram h(max_nz + 1);
-    for (uint32_t nz = 0; nz <= max_nz; ++nz) {
-      const size_t off =
-          (static_cast<size_t>(NZHistogramIndex(pb, nz)) * num_passes + p) *
-              num_clusters +
-          k;
-      const double v = nz_h[off];
-      if (v <= 0.0) continue;
-      h.counts[nz] = static_cast<ANSHistBin>(
-          std::llround(std::max<double>(v, 0.0)));
-    }
-    h.total_count = total;
-    auto ans_or = h.ANSPopulationCost();
-    if (!ans_or.ok()) continue;
-    const float ans_cost = std::move(ans_or).value_();
-    const float shannon = h.ShannonEntropy();
-    const float header_cost = ans_cost - shannon;
-    if (header_cost > 0.0f) overhead_bits += static_cast<double>(header_cost);
-  }
-  return overhead_bits;
-}
-
 }  // namespace
 
 // Forward + optional backward. Shared body for all public entry points.
@@ -898,6 +809,7 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
   }
 
   const size_t cp_count = num_clusters * num_passes;
+  const CompactACHistogramData& ac_hist = d.ACHistogram();
   const uint32_t ac_alpha = d.ACHistogramSize();
   constexpr uint32_t kZDC = kZeroDensityContextCount;
   const double inv_pass_t = 1.0 / state.pass_temperature;
@@ -906,7 +818,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
   const double inv_ctx_t = 1.0 / state.ctx_temperature;
   const uint32_t H = state.num_hists;
   JXL_DASSERT(state.ctx_logits.size() == num_passes * num_clusters * kZDC * H);
-  JXL_DASSERT(ac_alpha == ac_alpha);
+  JXL_DASSERT(ac_hist.dense_to_zdc.size() == ac_alpha);
+  JXL_DASSERT(ac_hist.dense_to_token.size() == ac_alpha);
   for (uint32_t c = 0; c < d.channels; ++c) {
     JXL_DASSERT(aux.blocks[c].size() == d.num_blocks[c]);
   }
@@ -977,11 +890,11 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
       const double* pi = &pi_cache[c][b * num_passes];
       const auto& block_aux = aux.blocks[c][b];
 
-      AxisBucketWeights(state.thresholds[0], block_aux.dc[0], inv_thr_t,
+      AxisBucketWeights(state.thresholds[0], block_aux.dc_idx[0], inv_thr_t,
                         w0.data());
-      AxisBucketWeights(state.thresholds[1], block_aux.dc[1], inv_thr_t,
+      AxisBucketWeights(state.thresholds[1], block_aux.dc_idx[1], inv_thr_t,
                         w1.data());
-      AxisBucketWeights(state.thresholds[2], block_aux.dc[2], inv_thr_t,
+      AxisBucketWeights(state.thresholds[2], block_aux.dc_idx[2], inv_thr_t,
                         w2.data());
 
       for (uint32_t k1 = 0; k1 < n_axis[1]; ++k1) {
@@ -1076,34 +989,35 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
   std::vector<double>& ctx_N = work.ctx_N;
   std::fill(ctx_h.begin(), ctx_h.end(), 0.0);
   std::fill(ctx_N.begin(), ctx_N.end(), 0.0);
-  ContextForwardVec(ac_h.data(), sigma.data(), aux.dense_to_zdc_lut.data(),
-                    aux.dense_to_token_lut.data(), ctx_h.data(), ctx_N.data(),
+  ContextForwardVec(ac_h.data(), sigma.data(), ac_hist.dense_to_zdc.data(),
+                    ac_hist.dense_to_token.data(), ctx_h.data(), ctx_N.data(),
                     num_clusters, num_passes, ac_alpha, kZDC, kACTokenCount, H);
 
   // --- AC cost reduction ----------------------------------------------------
   double ac_cost = 0.0;
-  uint32_t touched_slots = 0;
   for (uint32_t p = 0; p < num_passes; ++p) {
     const double N_sum = SoftFTabReduceVecFast(&ctx_N[p * H], H);
     const double h_sum =
         SoftFTabReduceVecFast(&ctx_h[p * kACTokenCount * H], kACTokenCount * H);
     ac_cost += N_sum - h_sum;
-    if (N_sum != 0.0 || h_sum != 0.0) ++touched_slots;
   }
   result.ac_cost_bits = ac_cost;
-  result.num_cp_slots = touched_slots;
 
   // --- NZ cost + signalling overhead ---------------------------------------
   double nz_cost = SoftFTabReduceVecFast(nz_N.data(), nz_N.size()) -
                    SoftFTabReduceVecFast(nz_h.data(), nz_h.size());
   double overhead_bits = 0.0;
-  for (uint32_t cp = 0; cp < cp_count; ++cp) {
-    const size_t k = cp / num_passes;
-    const size_t p = cp % num_passes;
-    overhead_bits +=
-        ACSignallingOverheadBitsForSlot(d, ac_h.data(), cp, cp_count, ac_alpha);
-    overhead_bits += NZSignallingOverheadBitsForTransposedSlot(
-        nz_h.data(), k, p, num_clusters, num_passes);
+  uint32_t touched_slots = 0;
+  for (uint32_t p = 0; p < num_passes; ++p) {
+    for (uint32_t h = 0; h < H; ++h) {
+      overhead_bits += ACSignallingOverheadBits(
+          ctx_h.data(), p, h, H, &touched_slots, &work.overhead_hist);
+    }
+  }
+  result.num_cp_slots = touched_slots;
+  for (size_t slot = 0; slot < cp_count; ++slot) {
+    overhead_bits += NZSignallingOverheadBits(
+        nz_h.data(), slot, cp_count, &work.overhead_hist);
   }
   overhead_bits += FlatPassOverheadBits(d) * num_passes;
   result.nz_cost_bits = nz_cost;
@@ -1128,8 +1042,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
   std::vector<double>& dL_dsigma = work.dL_dsigma;
   std::fill(dL_dsigma.begin(), dL_dsigma.end(), 0.0);
   ContextBackwardVec(ac_h.data(), ac_N.data(), sigma.data(), dL_dctx_h.data(),
-                     dL_dctx_N.data(), aux.dense_to_zdc_lut.data(),
-                     aux.dense_to_token_lut.data(), dL_dh.data(), dL_dN.data(),
+                     dL_dctx_N.data(), ac_hist.dense_to_zdc.data(),
+                     ac_hist.dense_to_token.data(), dL_dh.data(), dL_dN.data(),
                      dL_dsigma.data(), num_clusters, num_passes, ac_alpha, kZDC,
                      kACTokenCount, H);
 
@@ -1194,11 +1108,11 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
       const double* pi = &pi_cache[c][b * num_passes];
       const auto& block_aux = aux.blocks[c][b];
 
-      AxisBucketWeights(state.thresholds[0], block_aux.dc[0], inv_thr_t,
+      AxisBucketWeights(state.thresholds[0], block_aux.dc_idx[0], inv_thr_t,
                         w0.data(), axis_sigma[0].data());
-      AxisBucketWeights(state.thresholds[1], block_aux.dc[1], inv_thr_t,
+      AxisBucketWeights(state.thresholds[1], block_aux.dc_idx[1], inv_thr_t,
                         w1.data(), axis_sigma[1].data());
-      AxisBucketWeights(state.thresholds[2], block_aux.dc[2], inv_thr_t,
+      AxisBucketWeights(state.thresholds[2], block_aux.dc_idx[2], inv_thr_t,
                         w2.data(), axis_sigma[2].data());
 
       for (uint32_t k1 = 0; k1 < n_axis[1]; ++k1) {
@@ -1470,6 +1384,13 @@ void ProjectThresholdsMonotonic(GradientState* state, double epsilon) {
   }
 }
 
+static double DCThresholdValueToIndex(const JPEGOptData& d, uint32_t axis,
+                                      int16_t threshold) {
+  const auto& vals = d.DC_vals[axis];
+  const auto it = std::lower_bound(vals.begin(), vals.end(), threshold);
+  return static_cast<double>(it - vals.begin());
+}
+
 OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
                                 const AdamConfig& adam_cfg,
                                 const AnnealSchedule& schedule,
@@ -1614,24 +1535,26 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
     }
   }
 
-  // Round thresholds to int16_t and enforce strict monotonicity.
-  constexpr int16_t kMinDC = -1024;
-  constexpr int16_t kMaxDC = 1023;
+  // Round thresholds from DC-index space back to actual DC values and enforce
+  // strict monotonicity in the compact index domain.
   for (uint32_t a = 0; a < kNumCh; ++a) {
     const auto& soft = state.thresholds[a];
+    const auto& vals = d.DC_vals[a];
     Thresholds& out = r.thresholds.T[a];
     out.clear();
     out.reserve(soft.size());
-    int16_t prev = kMinDC - 1;
-    for (double v : soft) {
-      const int64_t vi64 = std::llround(v);
-      const int16_t clamped = static_cast<int16_t>(
-          std::min<int64_t>(kMaxDC, std::max<int64_t>(kMinDC, vi64)));
-      int16_t val = std::min<int16_t>(
-          kMaxDC,
-          std::max<int16_t>(clamped, static_cast<int16_t>(prev + 1)));
-      out.push_back(val);
-      prev = val;
+    if (soft.empty() || vals.empty()) continue;
+    const int64_t max_idx = static_cast<int64_t>(vals.size() - 1);
+    int64_t prev = 0;
+    for (size_t j = 0; j < soft.size(); ++j) {
+      const int64_t remaining = static_cast<int64_t>(soft.size() - 1 - j);
+      const int64_t lower = (j == 0) ? 1 : prev + 1;
+      const int64_t upper = std::max<int64_t>(lower, max_idx - remaining);
+      const int64_t vi64 = std::llround(soft[j]);
+      const int64_t idx = std::min<int64_t>(
+          max_idx, std::max<int64_t>(lower, std::min<int64_t>(upper, vi64)));
+      out.push_back(vals[idx]);
+      prev = idx;
     }
   }
 
@@ -1671,10 +1594,14 @@ GradientState InitGradientStateFromFactorization(
   state.cluster_temperature = cluster_temperature;
 
   // Per-axis thresholds via `InitThresh` (same starting point as the hard
-  // search's factorization-to-candidate init).
+  // search's factorization-to-candidate init), converted to DC-index space for
+  // the soft optimizer.
   for (uint32_t axis = 0; axis < kNumCh; ++axis) {
     const Thresholds T = InitThresh(d, axis, f[axis]);
-    state.thresholds[axis].assign(T.begin(), T.end());
+    state.thresholds[axis].resize(T.size());
+    for (size_t i = 0; i < T.size(); ++i) {
+      state.thresholds[axis][i] = DCThresholdValueToIndex(d, axis, T[i]);
+    }
   }
   state.num_cells = static_cast<uint32_t>(
       (state.thresholds[0].size() + 1) * (state.thresholds[1].size() + 1) *

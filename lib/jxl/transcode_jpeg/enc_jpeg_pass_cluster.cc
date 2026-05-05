@@ -252,11 +252,10 @@ StatusOr<FixedPointCost> SignalOverheadFromHist(
     const std::unordered_map<uint32_t, uint32_t>& hist_h) {
   std::array<std::array<uint32_t, kACTokenCount>, kZeroDensityContextCount>
       signalling_hist = {};
-  const auto& dense_to_symbol = d.ACHistogram().dense_to_zdcvalue;
+  const CompactACHistogramData& ac_hist = d.ACHistogram();
   for (const auto& entry : hist_h) {
-    const SignallingHistSymbol sym =
-        d.SignallingHistSymbolFromSymbol(dense_to_symbol[entry.first]);
-    signalling_hist[sym.zdc][sym.token] += entry.second;
+    signalling_hist[ac_hist.dense_to_zdc[entry.first]]
+                   [ac_hist.dense_to_token[entry.first]] += entry.second;
   }
 
   FixedPointCost overhead = 0;

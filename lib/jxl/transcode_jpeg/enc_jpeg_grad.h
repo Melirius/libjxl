@@ -9,9 +9,9 @@
 //
 // `GradientState` holds three continuous-variable bundles that the
 // optimizer can move through gradient descent:
-//   - `thresholds`      — per-axis DC thresholds, real-valued (rounded back to
-//                         int16_t when collapsing to a hard
-//                         `PassSearchResult`).
+//   - `thresholds`      — per-axis DC thresholds in compact DC-index space,
+//                         real-valued (mapped back to int16_t DC values when
+//                         collapsing to a hard `PassSearchResult`).
 //   - `pass_logits`     — per-block pre-softmax pass weights.
 //   - `cluster_logits`  — per-(channel, cell) pre-softmax cluster weights.
 // Each bundle has its own sigmoid/softmax temperature; annealing all three
@@ -61,12 +61,13 @@ struct AnnealSchedule {
 
 // Continuous-variable state for the joint-relaxation optimizer.
 //
-// Threshold values live in the same integer DC domain as `ThresholdSet`. They
+// Threshold values live in compact DC-index space: index `i` means
+// `JPEGOptData::DC_vals[axis][i]`, the first DC value of the next bucket. They
 // are stored as `double` here so the sigmoid relaxation can place them
-// off-integer during optimization; rounding to `int16_t` happens when
-// collapsing back to a hard `PassSearchResult`.
+// off-integer during optimization; conversion to actual `int16_t` DC thresholds
+// happens when collapsing back to a hard `PassSearchResult`.
 struct GradientState {
-  // Per-axis DC thresholds (continuous). Length of each axis matches the
+  // Per-axis DC-index thresholds (continuous). Length of each axis matches the
   // factorization minus one (same convention as `ThresholdSet`).
   std::array<std::vector<double>, kNumCh> thresholds;
 
@@ -170,15 +171,16 @@ struct SoftCostResult {
   // NZ entropy cost (iteration 4).
   double nz_cost_bits = 0.0;
 
-  // Signalling overhead estimate: per-slot ANS-population-minus-Shannon plus a
-  // flat per-pass overhead. Treated as constant for gradient purposes.
+  // Signalling overhead estimate: ANS-population-minus-Shannon for the actual
+  // AC histograms selected from the `H` budget and for NZ slots, plus a flat
+  // per-pass overhead. Treated as constant for gradient purposes.
   double signalling_overhead_bits = 0.0;
 
   // Sum of the three components.
   double total_cost_bits = 0.0;
 
-  // Number of (cluster, pass) slots visited; zero-total slots are skipped in
-  // the cost sum to match `EvaluatePassAwareModel`.
+  // Number of non-empty actual AC histogram slots `(pass, h)` visited after
+  // context-map routing.
   uint32_t num_cp_slots = 0;
 };
 
@@ -287,8 +289,8 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d,
 //   - Pass assignment: argmax over pass logits per block.
 //   - `ctx_map`:       argmax over cluster logits per (channel, cell). Size is
 //                      `d.channels * state.num_cells`.
-//   - Thresholds:      rounded to `int16_t` and projected to strictly
-//                      increasing.
+//   - Thresholds:      rounded in DC-index space, projected to strictly
+//                      increasing, then mapped to actual `int16_t` DC values.
 //   - `num_passes` and `num_clusters` are copied from `state`.
 PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
                                        const GradientState& state);

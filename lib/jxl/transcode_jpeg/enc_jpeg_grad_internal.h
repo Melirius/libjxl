@@ -6,25 +6,26 @@
 #ifndef LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_INTERNAL_H_
 #define LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_INTERNAL_H_
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
+#include "lib/jxl/enc_ans_params.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_grad.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_histogram.h"
 
 namespace jxl {
 
 struct GradientBlockAux {
-  std::array<int16_t, kNumCh> dc;
+  std::array<uint16_t, kNumCh> dc_idx;
   uint16_t onepass_nz_pb = 0;
   uint16_t onepass_nz_bin_real = 0;
 };
 
 struct GradientAux {
   uint32_t ac_alpha = 0;
-  std::vector<uint32_t> dense_to_zdc_lut;
-  std::vector<uint32_t> dense_to_token_lut;
   std::array<std::vector<GradientBlockAux>, kNumCh> blocks;
 
   explicit GradientAux(const JPEGOptData& d) {
@@ -34,15 +35,6 @@ struct GradientAux {
                   "one-pass NZ histogram index must fit in uint16_t");
 
     ac_alpha = d.ACHistogramSize();
-    dense_to_zdc_lut.resize(ac_alpha);
-    dense_to_token_lut.resize(ac_alpha);
-    const CompactACHistogramData& hist = d.ACHistogram();
-    for (uint32_t di = 0; di < ac_alpha; ++di) {
-      const SignallingHistSymbol sym =
-          d.SignallingHistSymbolFromSymbol(hist.dense_to_zdcvalue[di]);
-      dense_to_zdc_lut[di] = sym.zdc;
-      dense_to_token_lut[di] = sym.token;
-    }
 
     for (uint32_t c = 0; c < d.channels; ++c) {
       const uint32_t nb = d.num_blocks[c];
@@ -51,7 +43,7 @@ struct GradientAux {
       uint32_t x = 0;
       for (uint32_t b = 0; b < nb; ++b) {
         GradientBlockAux& block = blocks[c][b];
-        block.dc = AuxBlockDCValues(d, c, b);
+        block.dc_idx = AuxBlockDCIndices(d, c, b);
 
         const bool has_top = b >= grid_w;
         const bool has_left = x != 0;
@@ -82,22 +74,24 @@ struct GradientAux {
     return std::min<uint32_t>(pb, kJPEGNonZeroBuckets - 1);
   }
 
-  static int16_t AuxDCValueForAxis(const JPEGOptData& d, uint32_t src_channel,
-                                   uint32_t y, uint32_t x,
-                                   uint32_t dst_channel) {
+  static uint16_t AuxDCIndexForAxis(const JPEGOptData& d, uint32_t src_channel,
+                                    uint32_t y, uint32_t x,
+                                    uint32_t dst_channel) {
     const uint32_t b = MapTopLeftBlockIndex(d, src_channel, y, x, dst_channel);
-    return d.DC_vals[dst_channel][d.block_DC_idx[dst_channel][b]];
+    return d.block_DC_idx[dst_channel][b];
   }
 
-  static std::array<int16_t, kNumCh> AuxBlockDCValues(const JPEGOptData& d,
-                                                      uint32_t c, uint32_t b) {
+  static std::array<uint16_t, kNumCh> AuxBlockDCIndices(const JPEGOptData& d,
+                                                       uint32_t c,
+                                                       uint32_t b) {
     if (d.channels == 1) {
-      return {d.DC_vals[0][d.block_DC_idx[0][b]], 0, 0};
+      return {d.block_DC_idx[0][b], 0, 0};
     }
     const uint32_t y = b / d.block_grid_w[c];
     const uint32_t x = b % d.block_grid_w[c];
-    return {AuxDCValueForAxis(d, c, y, x, 0), AuxDCValueForAxis(d, c, y, x, 1),
-            AuxDCValueForAxis(d, c, y, x, 2)};
+    return {AuxDCIndexForAxis(d, c, y, x, 0),
+            AuxDCIndexForAxis(d, c, y, x, 1),
+            AuxDCIndexForAxis(d, c, y, x, 2)};
   }
 };
 
@@ -139,6 +133,7 @@ struct GradientScratch {
   std::vector<double> nz_T_kp;
   std::vector<double> nz_diff_h_kp;
   std::vector<double> block_D;
+  Histogram overhead_hist;
 
   GradientScratch(const JPEGOptData& d, const GradientAux& aux,
                   const GradientState& state) {
@@ -159,7 +154,7 @@ struct GradientScratch {
 
     for (uint32_t c = 0; c < kNumCh; ++c) {
       const size_t nb = (c < d.channels) ? d.num_blocks[c] : 0;
-      pi_cache[c].resize(nb * num_passes);
+      pi_cache[c].resize(num_passes == 1 ? 0 : nb * num_passes);
       const size_t rho_size = (c < d.channels) ? num_cells * num_clusters : 0;
       rho_cache[c].resize(rho_size);
       dL_drho[c].resize(rho_size);
@@ -198,8 +193,68 @@ struct GradientScratch {
     nz_T_kp.resize(cp_count);
     nz_diff_h_kp.resize(cp_count);
     block_D.resize(num_clusters);
+    overhead_hist.EnsureCapacity(kJPEGNonZeroRange);
   }
 };
+
+inline double ACSignallingOverheadBits(const double* ctx_h,
+                                                   size_t p, size_t h,
+                                                   size_t H,
+                                                   uint32_t* touched_slots,
+                                                   Histogram* hist) {
+  std::fill(hist->counts.begin(), hist->counts.end(), ANSHistBin{0});
+  hist->total_count = 0;
+  size_t total = 0;
+  const size_t p_off = p * kACTokenCount * H;
+  for (uint32_t token = 0; token < kACTokenCount; ++token) {
+    const double v = ctx_h[p_off + token * H + h];
+    if (v <= 0.0) continue;
+    const uint32_t count = static_cast<uint32_t>(std::llround(v));
+    if (count == 0) continue;
+    hist->counts[token] = static_cast<ANSHistBin>(count);
+    total += count;
+  }
+  if (total == 0) return 0.0;
+  ++*touched_slots;
+  hist->total_count = total;
+  auto ans_or = hist->ANSPopulationCost();
+  if (!ans_or.ok()) return 0.0;
+  const float ans_cost = std::move(ans_or).value_();
+  const float shannon = hist->ShannonEntropy();
+  const float header_cost = ans_cost - shannon;
+  return header_cost > 0.0f ? static_cast<double>(header_cost) : 0.0;
+}
+
+inline double NZSignallingOverheadBits(const double* nz_h,
+                                              size_t slot_idx, size_t cp_count,
+                                              Histogram* hist) {
+  double overhead_bits = 0.0;
+  for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+    std::fill(hist->counts.begin(), hist->counts.end(),
+              static_cast<ANSHistBin>(0));
+    hist->total_count = 0;
+    size_t total = 0;
+    for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+      const double v =
+          nz_h[static_cast<size_t>(NZHistogramIndex(pb, nz)) * cp_count +
+               slot_idx];
+      if (v <= 0.0) continue;
+      const uint32_t count = static_cast<uint32_t>(std::llround(v));
+      if (count == 0) continue;
+      hist->counts[nz] = static_cast<ANSHistBin>(count);
+      total += count;
+    }
+    if (total == 0) continue;
+    hist->total_count = total;
+    auto ans_or = hist->ANSPopulationCost();
+    if (!ans_or.ok()) continue;
+    const float ans_cost = std::move(ans_or).value_();
+    const float shannon = hist->ShannonEntropy();
+    const float header_cost = ans_cost - shannon;
+    if (header_cost > 0.0f) overhead_bits += static_cast<double>(header_cost);
+  }
+  return overhead_bits;
+}
 
 // Sigmoid with numeric-stable evaluation and graceful behavior at extreme
 // inputs. Returns exactly 0 or 1 when saturated to avoid denormal arithmetic
