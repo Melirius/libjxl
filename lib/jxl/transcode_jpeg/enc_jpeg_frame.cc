@@ -559,12 +559,11 @@ Status PlanJPEGPassAwareRecompression(JxlMemoryManager* memory_manager,
             effort.grad_hot_iters, effort.grad_anneal_iters, effort.grad_lr);
     fflush(stderr);
     std::vector<GradientSearchCandidate> gradient_debug_candidates;
-    JXL_ASSIGN_OR_RETURN(result,
-                         SearchGradientJointContextModel(
-                             opt_data, effort, pool,
-                             debug_candidates != nullptr
-                                 ? &gradient_debug_candidates
-                                 : nullptr));
+    JXL_ASSIGN_OR_RETURN(
+        result, SearchGradientContextModel(opt_data, effort, pool,
+                                           debug_candidates != nullptr
+                                               ? &gradient_debug_candidates
+                                               : nullptr));
     if (debug_candidates != nullptr) {
       debug_candidates->clear();
       debug_candidates->reserve(gradient_debug_candidates.size());

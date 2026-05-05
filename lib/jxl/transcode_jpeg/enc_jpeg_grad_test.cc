@@ -11,9 +11,10 @@
 // 1. `HardLimitAgreesWithPassAwareModel`:
 //    Run the existing pass-aware search to obtain a hard
 //    (thresholds, pass_assignment, ctx_map, ac_cost) tuple on a small JPEG.
-//    Initialize a `GradientJointState` with those thresholds (copied verbatim),
+//    Initialize a `GradientState` with those thresholds (copied verbatim),
 //    pass logits saturated to hard one-hot, and tiny temperatures. Assert that
-//    `ComputeSoftTotalCost` returns the same AC cost (up to fixed-point rounding).
+//    `ComputeSoftTotalCost` returns the same AC cost (up to fixed-point
+//    rounding).
 //
 // 2. `UniformPassIsInvariantForSingleCluster`:
 //    Construct a single-cluster, single-cell setup from a hard search result
@@ -37,12 +38,28 @@
 #include "lib/jxl/test_memory_manager.h"
 #include "lib/jxl/test_utils.h"
 #include "lib/jxl/testing.h"
+#include "lib/jxl/transcode_jpeg/enc_jpeg_grad_internal.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_opt_data.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_passes.h"
 #include "lib/jxl/transcode_jpeg/enc_jpeg_search.h"
 
 namespace jxl {
 namespace {
+
+SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,
+                                    const GradientState& state) {
+  const GradientAux aux(d);
+  GradientScratch scratch(d, aux, state);
+  return ComputeSoftTotalCost(d, aux, state, &scratch);
+}
+
+SoftCostResult SoftForwardBackward(const JPEGOptData& d,
+                                   const GradientState& state,
+                                   GradientGrad* grad) {
+  const GradientAux aux(d);
+  GradientScratch scratch(d, aux, state);
+  return SoftForwardBackward(d, aux, state, grad, &scratch);
+}
 
 // Shared fixture loader: parses the tiny reconstruction test JPEG and builds
 // `JPEGOptData`. Returns nullptr on any failure; caller asserts.
@@ -73,12 +90,14 @@ std::shared_ptr<JPEGOptData> BuildOptDataFromFixture(
   return opt_data;
 }
 
-// Initializes `GradientJointState` from a hard `PassSearchResult` for tests.
-GradientJointState InitGradientJointStateFromHard(
-    const JPEGOptData& d, const PassSearchResult& hard, double hard_logit,
-    double threshold_temperature, double pass_temperature,
-    double cluster_temperature) {
-  GradientJointState state;
+// Initializes `GradientState` from a hard `PassSearchResult` for tests.
+GradientState InitGradientStateFromHard(const JPEGOptData& d,
+                                        const PassSearchResult& hard,
+                                        double hard_logit,
+                                        double threshold_temperature,
+                                        double pass_temperature,
+                                        double cluster_temperature) {
+  GradientState state;
   state.num_passes = hard.num_passes;
   state.num_clusters = hard.num_clusters;
   state.threshold_temperature = threshold_temperature;
@@ -89,9 +108,9 @@ GradientJointState InitGradientJointStateFromHard(
     const Thresholds& T = hard.thresholds.T[axis];
     state.thresholds[axis].assign(T.begin(), T.end());
   }
-  state.num_cells = static_cast<uint32_t>(
-      (state.thresholds[0].size() + 1) * (state.thresholds[1].size() + 1) *
-      (state.thresholds[2].size() + 1));
+  state.num_cells = static_cast<uint32_t>((state.thresholds[0].size() + 1) *
+                                          (state.thresholds[1].size() + 1) *
+                                          (state.thresholds[2].size() + 1));
 
   const size_t P = hard.num_passes;
   for (uint32_t c = 0; c < kNumCh; ++c) {
@@ -150,12 +169,13 @@ TEST(JpegGradTest, HardLimitAgreesWithPassAwareModel) {
   // Saturate softmax/sigmoid so soft state mimics hard assignment.
   constexpr double kHardLogit = 40.0;
   constexpr double kTinyTemp = 1e-6;
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, kHardLogit, kTinyTemp, kTinyTemp, kTinyTemp);
   ASSERT_EQ(state.num_passes, hard.num_passes);
   ASSERT_EQ(state.num_clusters, hard.num_clusters);
   // Enable ctx routing (H=4). Conditioning on zdc context can only reduce
-  // cost vs the no-ctx hard model, so soft.ac_cost_bits <= hard.ac_cost/kFScale.
+  // cost vs the no-ctx hard model, so soft.ac_cost_bits <=
+  // hard.ac_cost/kFScale.
   state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &state);
 
@@ -197,7 +217,7 @@ TEST(JpegGradTest, UniformPassIsInvariantForSingleCluster) {
   // test to match `EvaluatePassAwareModel`).
   constexpr double kHardLogit = 40.0;
   constexpr double kTinyTemp = 1e-6;
-  GradientJointState hard_state = InitGradientJointStateFromHard(
+  GradientState hard_state = InitGradientStateFromHard(
       *opt_data, hard, kHardLogit, kTinyTemp, kTinyTemp, kTinyTemp);
   hard_state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &hard_state);
@@ -206,7 +226,7 @@ TEST(JpegGradTest, UniformPassIsInvariantForSingleCluster) {
   // Now: two passes, single cluster, single cell. All blocks share uniform
   // pass logits (= 0 => softmax gives 1/P per pass).
   const uint32_t P = 2;
-  GradientJointState uniform_state;
+  GradientState uniform_state;
   uniform_state.thresholds[0].clear();
   uniform_state.thresholds[1].clear();
   uniform_state.thresholds[2].clear();
@@ -229,7 +249,8 @@ TEST(JpegGradTest, UniformPassIsInvariantForSingleCluster) {
   uniform_state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &uniform_state);
 
-  const SoftCostResult uniform_cost = ComputeSoftTotalCost(*opt_data, uniform_state);
+  const SoftCostResult uniform_cost =
+      ComputeSoftTotalCost(*opt_data, uniform_state);
 
   // Entropy of a histogram replicated P times with counts scaled by 1/P equals
   // the original entropy. Expect equality up to floating-point error.
@@ -271,15 +292,14 @@ TEST(JpegGradTest, AnalyticGradientMatchesFiniteDifference) {
   constexpr double kPassTemp = 1.0;
   constexpr double kThresholdTemp = 50.0;
   constexpr double kClusterTemp = 1.0;
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, kHardLogit, kThresholdTemp, kPassTemp, kClusterTemp);
   state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &state);
 
-  GradientJointGrad grad;
-  ResetGradientJointGrad(state, &grad);
-  const SoftCostResult base =
-      SoftForwardBackward(*opt_data, state, &grad);
+  GradientGrad grad;
+  grad.Reset(state);
+  const SoftCostResult base = SoftForwardBackward(*opt_data, state, &grad);
   ASSERT_GT(base.num_cp_slots, 0u);
 
   // Helper: central difference on a single parameter reference.
@@ -367,21 +387,19 @@ TEST(JpegGradTest, AdamSingleStepDecreasesCost) {
                                                      effort, nullptr));
 
   // Non-saturated state at moderate temperatures -> smooth, non-trivial grad.
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, /*hard_logit=*/0.5,
       /*threshold_temperature=*/50.0, /*pass_temperature=*/1.0,
       /*cluster_temperature=*/1.0);
   state.num_hists = 4;
   InitCtxLogitsRoundRobin(/*hard_logit=*/0.5, &state);
 
-  GradientJointGrad grad;
-  ResetGradientJointGrad(state, &grad);
-  const SoftCostResult before =
-      SoftForwardBackward(*opt_data, state, &grad);
+  GradientGrad grad;
+  grad.Reset(state);
+  const SoftCostResult before = SoftForwardBackward(*opt_data, state, &grad);
   ASSERT_GT(before.num_cp_slots, 0u);
 
-  AdamState adam;
-  InitAdamState(state, &adam);
+  AdamState adam(state);
   AdamConfig cfg;
   cfg.lr = 0.01;
   AdamStep(grad, cfg, &adam, &state);
@@ -418,7 +436,7 @@ TEST(JpegGradTest, FullAnnealingReducesCostAndRoundsSanely) {
                                                      effort, nullptr));
 
   // Initialize with non-optimal temperatures to leave room for improvement.
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, /*hard_logit=*/0.1,
       /*threshold_temperature=*/200.0, /*pass_temperature=*/2.0,
       /*cluster_temperature=*/2.0);
@@ -439,7 +457,7 @@ TEST(JpegGradTest, FullAnnealingReducesCostAndRoundsSanely) {
   sched.cluster_final = 0.1;
 
   const OptimizeResult opt =
-      RunGradientJointSolve(*opt_data, adam_cfg, sched, &state);
+      RunGradientSolve(*opt_data, adam_cfg, sched, &state);
   EXPECT_EQ(opt.iters_taken, sched.hot_iters + sched.anneal_iters);
   EXPECT_LT(opt.final_cost_bits, opt.init_cost_bits)
       << "init=" << opt.init_cost_bits << " final=" << opt.final_cost_bits;
@@ -499,7 +517,7 @@ TEST(JpegGradTest, TotalCostHardLimitAgreesWithPassAwareModel) {
 
   constexpr double kHardLogit = 40.0;
   constexpr double kTinyTemp = 1e-6;
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, kHardLogit, kTinyTemp, kTinyTemp, kTinyTemp);
   state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &state);
@@ -549,15 +567,14 @@ TEST(JpegGradTest, TotalCostAnalyticGradientMatchesFiniteDifference) {
   constexpr double kPassTemp = 1.0;
   constexpr double kThresholdTemp = 50.0;
   constexpr double kClusterTemp = 1.0;
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, kHardLogit, kThresholdTemp, kPassTemp, kClusterTemp);
   state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &state);
 
-  GradientJointGrad grad;
-  ResetGradientJointGrad(state, &grad);
-  const SoftCostResult base =
-      SoftForwardBackward(*opt_data, state, &grad);
+  GradientGrad grad;
+  grad.Reset(state);
+  const SoftCostResult base = SoftForwardBackward(*opt_data, state, &grad);
   ASSERT_GT(base.num_cp_slots, 0u);
 
   // FD uses the ENTROPY-only subset of total cost (AC + NZ), because
@@ -669,7 +686,7 @@ TEST(JpegGradTest, ClusterLogitsHardLimitAgreesWithPassAwareModel) {
 
   constexpr double kHardLogit = 40.0;
   constexpr double kTinyTemp = 1e-6;
-  GradientJointState state = InitGradientJointStateFromHard(
+  GradientState state = InitGradientStateFromHard(
       *opt_data, hard, kHardLogit, kTinyTemp, kTinyTemp, kTinyTemp);
   state.num_hists = 4;
   InitCtxLogitsRoundRobin(kHardLogit, &state);
@@ -690,7 +707,7 @@ TEST(JpegGradTest, ClusterLogitsHardLimitAgreesWithPassAwareModel) {
 // the full orchestrator with a modest iteration budget on a small fixture.
 // This validates plumbing end-to-end. Deeper correctness is covered by the
 // iterations-1-5 tests on the flower fixture.
-TEST(JpegGradTest, SearchGradientJointContextModelSmoke) {
+TEST(JpegGradTest, SearchGradientContextModelSmoke) {
   JPEGCtxEffortParams effort =
       JPEGCtxEffortParams::FromSpeedTier(SpeedTier::kKitten);
   effort.grad_hot_iters = 2;
@@ -725,9 +742,8 @@ TEST(JpegGradTest, SearchGradientJointContextModelSmoke) {
   ASSERT_TRUE(opt_data->BuildFromJPEG(*jpeg_data, effort.ac_hist_model,
                                        cfl_ctx, nullptr));
 
-  JXL_TEST_ASSIGN_OR_DIE(
-      PassSearchResult result,
-      SearchGradientJointContextModel(opt_data, effort, nullptr));
+  JXL_TEST_ASSIGN_OR_DIE(PassSearchResult result,
+                         SearchGradientContextModel(opt_data, effort, nullptr));
 
   // Basic shape invariants. ctx_map size matches active channels × num_cells.
   EXPECT_GE(result.num_passes, 1u);

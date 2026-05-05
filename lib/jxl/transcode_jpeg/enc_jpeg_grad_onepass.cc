@@ -3,8 +3,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "lib/jxl/transcode_jpeg/enc_jpeg_grad_internal.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,6 +10,8 @@
 #include <cstdint>
 #include <utility>
 #include <vector>
+
+#include "lib/jxl/transcode_jpeg/enc_jpeg_grad_internal.h"
 
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "lib/jxl/transcode_jpeg/enc_jpeg_grad_onepass.cc"
@@ -44,13 +44,11 @@ void VecAddVec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src,
 void VecAdd2Vec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT a,
                 const double* HWY_RESTRICT b, size_t n);
 void ClusterWeightsVec(const double* HWY_RESTRICT cell_weight,
-                       const double* HWY_RESTRICT rho,
-                       double* HWY_RESTRICT B, size_t num_cells,
-                       size_t num_clusters);
+                       const double* HWY_RESTRICT rho, double* HWY_RESTRICT B,
+                       size_t num_cells, size_t num_clusters);
 void CellGradientVec(const double* HWY_RESTRICT cell_weight,
                      const double* HWY_RESTRICT rho,
-                     const double* HWY_RESTRICT D,
-                     double* HWY_RESTRICT dcell,
+                     const double* HWY_RESTRICT D, double* HWY_RESTRICT dcell,
                      double* HWY_RESTRICT drho, size_t num_cells,
                      size_t num_clusters);
 void SoftmaxJacobianRowsVec(const double* HWY_RESTRICT prob,
@@ -61,10 +59,9 @@ void ContextForwardVec(const double* HWY_RESTRICT ac_h,
                        const double* HWY_RESTRICT sigma,
                        const uint32_t* HWY_RESTRICT dense_to_zdc,
                        const uint32_t* HWY_RESTRICT dense_to_token,
-                       double* HWY_RESTRICT ctx_h,
-                       double* HWY_RESTRICT ctx_N, size_t num_clusters,
-                       size_t num_passes, size_t ac_alpha, size_t zdc_count,
-                       size_t token_count, size_t num_hists);
+                       double* HWY_RESTRICT ctx_h, double* HWY_RESTRICT ctx_N,
+                       size_t num_clusters, size_t num_passes, size_t ac_alpha,
+                       size_t zdc_count, size_t token_count, size_t num_hists);
 void ContextBackwardVec(const double* HWY_RESTRICT ac_h,
                         const double* HWY_RESTRICT ac_N,
                         const double* HWY_RESTRICT sigma,
@@ -72,19 +69,12 @@ void ContextBackwardVec(const double* HWY_RESTRICT ac_h,
                         const double* HWY_RESTRICT dctx_N,
                         const uint32_t* HWY_RESTRICT dense_to_zdc,
                         const uint32_t* HWY_RESTRICT dense_to_token,
-                        double* HWY_RESTRICT dL_dh,
-                        double* HWY_RESTRICT dL_dN,
+                        double* HWY_RESTRICT dL_dh, double* HWY_RESTRICT dL_dN,
                         double* HWY_RESTRICT dL_dsigma, size_t num_clusters,
                         size_t num_passes, size_t ac_alpha, size_t zdc_count,
                         size_t token_count, size_t num_hists);
 
 namespace {
-
-inline double SafeSigmoid(double x) {
-  if (x > 500.0) return 1.0;
-  if (x < -500.0) return 0.0;
-  return 1.0 / (1.0 + std::exp(-x));
-}
 
 void SoftmaxScalar(const double* logits, uint32_t P, double inv_t,
                    double* out) {
@@ -126,9 +116,8 @@ void Softmax(const double* HWY_RESTRICT logits, uint32_t P, double temperature,
   const auto vmax_val = hn::Set(d, max_val);
   auto vsum = hn::Zero(d);
   for (p = 0; p + N <= P; p += N) {
-    const auto prob =
-        hn::Exp(d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val),
-                           vinv_t));
+    const auto prob = hn::Exp(
+        d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val), vinv_t));
     hn::StoreU(prob, d, out + p);
     vsum = hn::Add(vsum, prob);
   }
@@ -156,7 +145,8 @@ void AxisBucketWeights(const std::vector<double>& thresholds, int dc,
   }
   double prev = 0.0;
   for (size_t k = 0; k + 1 < K; ++k) {
-    const double cur = SafeSigmoid((thresholds[k] - dc - 0.5) * inv_temperature);
+    const double cur =
+        SafeSigmoid((thresholds[k] - dc - 0.5) * inv_temperature);
     out[k] = cur - prev;
     if (sigma != nullptr) sigma[k] = cur;
     prev = cur;
@@ -172,9 +162,8 @@ inline double FlatPassOverheadBits(const JPEGOptData& d) {
 }
 
 double ACSignallingOverheadBitsForSlot(const JPEGOptData& d,
-                                       const double* ac_h_transposed,
-                                       size_t cp, size_t cp_count,
-                                       size_t ac_h_size) {
+                                       const double* ac_h_transposed, size_t cp,
+                                       size_t cp_count, size_t ac_h_size) {
   std::array<std::array<uint32_t, kACTokenCount>, kZeroDensityContextCount>
       signalling_hist = {};
   const auto& dense_to_symbol = d.ACHistogram().dense_to_zdcvalue;
@@ -214,8 +203,8 @@ double ACSignallingOverheadBitsForSlot(const JPEGOptData& d,
   return overhead_bits;
 }
 
-double NZSignallingOverheadBitsForTransposedSlot(const double* nz_h,
-                                                 size_t k, size_t cp_count) {
+double NZSignallingOverheadBitsForTransposedSlot(const double* nz_h, size_t k,
+                                                 size_t cp_count) {
   double overhead_bits = 0.0;
   for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
     uint32_t max_nz = 0;
@@ -234,8 +223,8 @@ double NZSignallingOverheadBitsForTransposedSlot(const double* nz_h,
     for (uint32_t nz = 0; nz <= max_nz; ++nz) {
       const double v = nz_h[NZHistogramIndex(pb, nz) * cp_count + k];
       if (v <= 0.0) continue;
-      h.counts[nz] = static_cast<ANSHistBin>(
-          std::llround(std::max<double>(v, 0.0)));
+      h.counts[nz] =
+          static_cast<ANSHistBin>(std::llround(std::max<double>(v, 0.0)));
     }
     h.total_count = total;
     auto ans_or = h.ANSPopulationCost();
@@ -251,60 +240,61 @@ double NZSignallingOverheadBitsForTransposedSlot(const double* nz_h,
 }  // namespace
 
 SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
-                                              const GradientJointAux& aux,
-                                              const GradientJointState& state,
-                                              GradientJointGrad* grad) {
+                                              const GradientAux& aux,
+                                              const GradientState& state,
+                                              GradientGrad* grad,
+                                              GradientScratch* scratch) {
   SoftCostResult result;
+  JXL_DASSERT(scratch != nullptr);
+  GradientScratch& work = *scratch;
   const size_t num_clusters = state.num_clusters;
-  if (state.num_passes != 1 || num_clusters == 0) return result;
+  JXL_DASSERT(state.num_passes == 1);
+  JXL_DASSERT(num_clusters > 0);
 
   const std::array<uint32_t, kNumCh> n_axis = {
       static_cast<uint32_t>(state.thresholds[0].size()) + 1,
       static_cast<uint32_t>(state.thresholds[1].size()) + 1,
       static_cast<uint32_t>(state.thresholds[2].size()) + 1};
   const size_t num_cells = n_axis[0] * n_axis[1] * n_axis[2];
-  if (state.num_cells != num_cells) return result;
+  JXL_DASSERT(state.num_cells == num_cells);
   for (uint32_t c = 0; c < d.channels; ++c) {
-    if (state.cluster_logits[c].size() != num_cells * num_clusters) {
-      return result;
-    }
+    JXL_DASSERT(state.cluster_logits[c].size() == num_cells * num_clusters);
   }
 
   const size_t cp_count = num_clusters;
   const uint32_t ac_alpha = d.ACHistogramSize();
   constexpr uint32_t kZDC = kZeroDensityContextCount;
-  constexpr uint32_t kNZBins = kNZHistogramsSize;
-  constexpr uint32_t kNZBuckets = kJPEGNonZeroBuckets;
   const double inv_thr_t = 1.0 / state.threshold_temperature;
   const double inv_cluster_t = 1.0 / state.cluster_temperature;
   const double inv_ctx_t = 1.0 / state.ctx_temperature;
   const uint32_t H = state.num_hists;
-  if (state.ctx_logits.size() != num_clusters * kZDC * H) {
-    return result;
-  }
+  JXL_DASSERT(state.ctx_logits.size() == num_clusters * kZDC * H);
   JXL_DASSERT(aux.ac_alpha == ac_alpha);
   for (uint32_t c = 0; c < d.channels; ++c) {
     JXL_DASSERT(aux.blocks[c].size() == d.num_blocks[c]);
   }
 
-  std::vector<double> ac_h(ac_alpha * cp_count, 0.0);
-  std::vector<double> ac_N(kZDC * cp_count, 0.0);
-  // One-pass NZ histograms use transposed layout so per-block updates and
+  std::vector<double>& ac_h = work.ac_h;
+  std::vector<double>& ac_N = work.ac_N;
+  std::fill(ac_h.begin(), ac_h.end(), 0.0);
+  std::fill(ac_N.begin(), ac_N.end(), 0.0);
+  // One-pass NZ histograms use layout that allows per-block updates and
   // backward replay add the full cluster vector sequentially:
-  //   nz_h[bin * K + k], nz_N[pb * K + k].
-  std::vector<double> nz_h(kNZBins * cp_count, 0.0);
-  std::vector<double> nz_N(kNZBuckets * cp_count, 0.0);
+  //   `nz_h[bin * K + k], nz_N[pb * K + k]`.
+  std::vector<double>& nz_h = work.nz_h;
+  std::vector<double>& nz_N = work.nz_N;
+  std::fill(nz_h.begin(), nz_h.end(), 0.0);
+  std::fill(nz_N.begin(), nz_N.end(), 0.0);
 
-  std::array<std::vector<double>, kNumCh> rho_cache;
+  auto& rho_cache = work.rho_cache;
   for (uint32_t c = 0; c < d.channels; ++c) {
-    rho_cache[c].assign(num_cells * num_clusters, 0.0);
     for (size_t cell = 0; cell < num_cells; ++cell) {
       Softmax(&state.cluster_logits[c][cell * num_clusters], num_clusters,
               state.cluster_temperature, &rho_cache[c][cell * num_clusters]);
     }
   }
 
-  std::vector<double> sigma(num_clusters * kZDC * H);
+  std::vector<double>& sigma = work.sigma;
   for (uint32_t k = 0; k < num_clusters; ++k) {
     for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
       const size_t off = (k * kZDC + zdc) * H;
@@ -312,11 +302,11 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
     }
   }
 
-  std::vector<double> w0(n_axis[0]);
-  std::vector<double> w1(n_axis[1]);
-  std::vector<double> w2(n_axis[2]);
-  std::vector<double> cell_weight(num_cells, 0.0);
-  std::vector<double> B(num_clusters, 0.0);
+  std::vector<double>& w0 = work.w0;
+  std::vector<double>& w1 = work.w1;
+  std::vector<double>& w2 = work.w2;
+  std::vector<double>& cell_weight = work.cell_weight;
+  std::vector<double>& B = work.B;
 
   for (uint32_t c = 0; c < d.channels; ++c) {
     const uint32_t nb = d.num_blocks[c];
@@ -334,8 +324,7 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
         for (uint32_t k2 = 0; k2 < n_axis[2]; ++k2) {
           const double v12 = v1 * w2[k2];
           for (uint32_t k0 = 0; k0 < n_axis[0]; ++k0) {
-            cell_weight[(k1 * n_axis[2] + k2) * n_axis[0] + k0] =
-                v12 * w0[k0];
+            cell_weight[(k1 * n_axis[2] + k2) * n_axis[0] + k0] = v12 * w0[k0];
           }
         }
       }
@@ -359,15 +348,16 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
     }
   }
 
-  std::vector<double> ctx_h(kACTokenCount * H, 0.0);
-  std::vector<double> ctx_N(H, 0.0);
+  std::vector<double>& ctx_h = work.ctx_h;
+  std::vector<double>& ctx_N = work.ctx_N;
+  std::fill(ctx_h.begin(), ctx_h.end(), 0.0);
+  std::fill(ctx_N.begin(), ctx_N.end(), 0.0);
   ContextForwardVec(ac_h.data(), sigma.data(), aux.dense_to_zdc_lut.data(),
                     aux.dense_to_token_lut.data(), ctx_h.data(), ctx_N.data(),
                     num_clusters, 1, ac_alpha, kZDC, kACTokenCount, H);
 
   const double N_sum = SoftFTabReduceVecFast(ctx_N.data(), H);
-  const double h_sum =
-      SoftFTabReduceVecFast(ctx_h.data(), kACTokenCount * H);
+  const double h_sum = SoftFTabReduceVecFast(ctx_h.data(), kACTokenCount * H);
   result.ac_cost_bits = N_sum - h_sum;
   result.num_cp_slots = (N_sum != 0.0 || h_sum != 0.0) ? 1u : 0u;
 
@@ -387,29 +377,30 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
 
   if (grad == nullptr) return result;
 
-  std::vector<double> dL_dN(cp_count * kZDC, 0.0);
-  std::vector<double> dL_dh(cp_count * ac_alpha, 0.0);
-  std::vector<double> dL_dctx_N(H, 0.0);
-  std::vector<double> dL_dctx_h(kACTokenCount * H, 0.0);
+  std::vector<double>& dL_dN = work.dL_dN;
+  std::vector<double>& dL_dh = work.dL_dh;
+  std::vector<double>& dL_dctx_N = work.dL_dctx_N;
+  std::vector<double>& dL_dctx_h = work.dL_dctx_h;
   SoftFTabPrimeVecFast(ctx_N.data(), dL_dctx_N.data(), H);
   SoftFTabPrimeNegVecFast(ctx_h.data(), dL_dctx_h.data(), kACTokenCount * H);
 
   JXL_DASSERT(grad->ctx_logits.size() == state.ctx_logits.size());
-  std::vector<double> dL_dsigma(state.ctx_logits.size(), 0.0);
+  std::vector<double>& dL_dsigma = work.dL_dsigma;
+  std::fill(dL_dsigma.begin(), dL_dsigma.end(), 0.0);
   ContextBackwardVec(ac_h.data(), ac_N.data(), sigma.data(), dL_dctx_h.data(),
                      dL_dctx_N.data(), aux.dense_to_zdc_lut.data(),
                      aux.dense_to_token_lut.data(), dL_dh.data(), dL_dN.data(),
                      dL_dsigma.data(), num_clusters, 1, ac_alpha, kZDC,
                      kACTokenCount, H);
 
-  std::vector<double> dL_dh_trans(ac_alpha * cp_count);
+  std::vector<double>& dL_dh_trans = work.dL_dh_trans;
   for (uint32_t di = 0; di < ac_alpha; ++di) {
     double* HWY_RESTRICT dst = &dL_dh_trans[di * cp_count];
     for (uint32_t k = 0; k < cp_count; ++k) {
       dst[k] = dL_dh[k * ac_alpha + di];
     }
   }
-  std::vector<double> dL_dN_trans(kZDC * cp_count);
+  std::vector<double>& dL_dN_trans = work.dL_dN_trans;
   for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
     double* HWY_RESTRICT dst = &dL_dN_trans[zdc * cp_count];
     for (uint32_t k = 0; k < cp_count; ++k) {
@@ -421,27 +412,21 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
                          grad->ctx_logits.data(), inv_ctx_t,
                          num_clusters * kZDC, H);
 
-  std::array<std::vector<double>, kNumCh> axis_sigma;
-  for (uint32_t a = 0; a < kNumCh; ++a) {
-    axis_sigma[a].resize(state.thresholds[a].size());
-  }
-  std::vector<double> dL_dcell(num_cells, 0.0);
-  std::vector<double> dL_dw_ax[kNumCh];
-  for (uint32_t a = 0; a < kNumCh; ++a) {
-    dL_dw_ax[a].resize(n_axis[a]);
-  }
+  auto& axis_sigma = work.axis_sigma;
+  std::vector<double>& dL_dcell = work.dL_dcell;
+  auto& dL_dw_ax = work.dL_dw_ax;
 
-  std::array<std::vector<double>, kNumCh> dL_drho;
+  auto& dL_drho = work.dL_drho;
   for (uint32_t c = 0; c < d.channels; ++c) {
-    dL_drho[c].assign(num_cells * num_clusters, 0.0);
+    std::fill(dL_drho[c].begin(), dL_drho[c].end(), 0.0);
   }
 
-  std::vector<double> dL_dnz_N(cp_count * kNZBuckets, 0.0);
-  std::vector<double> dL_dnz_h(cp_count * kNZBins, 0.0);
+  std::vector<double>& dL_dnz_N = work.dL_dnz_N;
+  std::vector<double>& dL_dnz_h = work.dL_dnz_h;
   SoftFTabPrimeVecFast(nz_N.data(), dL_dnz_N.data(), nz_N.size());
   SoftFTabPrimeNegVecFast(nz_h.data(), dL_dnz_h.data(), nz_h.size());
 
-  std::vector<double> delta_ac_k(cp_count, 0.0);
+  std::vector<double>& delta_ac_k = work.delta_ac_k;
 
   for (uint32_t c = 0; c < d.channels; ++c) {
     const uint32_t nb = d.num_blocks[c];
@@ -459,8 +444,7 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
         for (uint32_t k2 = 0; k2 < n_axis[2]; ++k2) {
           const double v12 = v1 * w2[k2];
           for (uint32_t k0 = 0; k0 < n_axis[0]; ++k0) {
-            cell_weight[(k1 * n_axis[2] + k2) * n_axis[0] + k0] =
-                v12 * w0[k0];
+            cell_weight[(k1 * n_axis[2] + k2) * n_axis[0] + k0] = v12 * w0[k0];
           }
         }
       }
@@ -476,8 +460,7 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
       for (uint32_t e = ev_start; e < ev_end; ++e) {
         const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
         if (evt.hist_bin == kInvalidCompactH) continue;
-        VecAdd2Vec(delta_ac_k.data(),
-                   &dL_dh_trans[evt.hist_bin * cp_count],
+        VecAdd2Vec(delta_ac_k.data(), &dL_dh_trans[evt.hist_bin * cp_count],
                    &dL_dN_trans[evt.zdc * cp_count], cp_count);
       }
 
@@ -497,8 +480,7 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
       for (uint32_t k1 = 0; k1 < n_axis[1]; ++k1) {
         for (uint32_t k2 = 0; k2 < n_axis[2]; ++k2) {
           for (uint32_t k0 = 0; k0 < n_axis[0]; ++k0) {
-            const double g =
-                dL_dcell[(k1 * n_axis[2] + k2) * n_axis[0] + k0];
+            const double g = dL_dcell[(k1 * n_axis[2] + k2) * n_axis[0] + k0];
             dL_dw_ax[0][k0] += g * w1[k1] * w2[k2];
             dL_dw_ax[1][k1] += g * w0[k0] * w2[k2];
             dL_dw_ax[2][k2] += g * w0[k0] * w1[k1];
@@ -539,11 +521,12 @@ namespace jxl {
 HWY_EXPORT(SoftForwardBackwardOnePassImpl);
 
 SoftCostResult SoftForwardBackwardOnePass(const JPEGOptData& d,
-                                          const GradientJointAux& aux,
-                                          const GradientJointState& state,
-                                          GradientJointGrad* grad) {
+                                          const GradientAux& aux,
+                                          const GradientState& state,
+                                          GradientGrad* grad,
+                                          GradientScratch* scratch) {
   return HWY_DYNAMIC_DISPATCH(SoftForwardBackwardOnePassImpl)(d, aux, state,
-                                                             grad);
+                                                              grad, scratch);
 }
 
 }  // namespace jxl
