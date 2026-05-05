@@ -152,7 +152,7 @@ void ResetGradientJointGrad(const GradientJointState& state,
 // threshold-gradient formula uses the sigmoid's analytic derivative, the
 // pass-logit gradient uses the softmax Jacobian scaled by 1/tau_pi, and the
 // cluster-logit gradient uses the softmax Jacobian scaled by 1/tau_cluster.
-SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
+SoftCostResult SoftForwardBackward(const JPEGOptData& d,
                                             const GradientJointState& state,
                                             GradientJointGrad* grad);
 
@@ -189,7 +189,7 @@ SoftCostResult ComputeSoftTotalCost(const JPEGOptData& d,
 // bucket selection are treated as non-differentiable; likewise the signalling
 // overhead term. The optimizer still benefits from reducing AC + NZ cost;
 // signalling changes come along for the ride through rounding.
-SoftCostResult ComputeSoftTotalCostWithGrad(const JPEGOptData& d,
+SoftCostResult SoftForwardBackward(const JPEGOptData& d,
                                             const GradientJointState& state,
                                             GradientJointGrad* grad);
 

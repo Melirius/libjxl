@@ -414,6 +414,8 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/transcode_jpeg/enc_jpeg_frame.cc
   jxl/transcode_jpeg/enc_jpeg_grad.cc
   jxl/transcode_jpeg/enc_jpeg_grad.h
+  jxl/transcode_jpeg/enc_jpeg_grad_internal.h
+  jxl/transcode_jpeg/enc_jpeg_grad_onepass.cc
   jxl/transcode_jpeg/enc_jpeg_histogram.h
   jxl/transcode_jpeg/enc_jpeg_opt_data.cc
   jxl/transcode_jpeg/enc_jpeg_opt_data.h
