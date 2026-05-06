@@ -196,6 +196,13 @@ static double DCThresholdValueToIndex(const JPEGOptData& d, uint32_t axis,
 
 namespace {
 
+constexpr uint32_t kGradientRaceWarmupIters = 10;
+constexpr uint32_t kGradientRaceCheckPeriod = 5;
+constexpr uint32_t kGradientRaceConsecutiveChecks = 2;
+constexpr uint32_t kGradientRaceGlobalKeep = 4;
+constexpr uint32_t kGradientRacePerPassKeepDuringHot = 2;
+constexpr double kGradientRaceAbandonRatio = 1.01;
+
 uint32_t CompactHardClusters(PassSearchResult* result) {
   std::array<bool, 256> used{};
   for (uint8_t id : result->ctx_map) {
@@ -217,6 +224,104 @@ uint32_t CompactHardClusters(PassSearchResult* result) {
   result->num_clusters = std::max<uint32_t>(next, 1);
   return result->num_clusters;
 }
+
+struct GradientRaceDecision {
+  double best_cost_bits = std::numeric_limits<double>::infinity();
+  uint32_t global_rank = std::numeric_limits<uint32_t>::max();
+  uint32_t pass_rank = std::numeric_limits<uint32_t>::max();
+  bool protected_by_global_keep = false;
+  bool protected_by_pass_keep = false;
+};
+
+class GradientRaceState {
+ public:
+  explicit GradientRaceState(size_t num_candidates)
+      : candidates_(num_candidates) {}
+
+  GradientRaceDecision Update(uint32_t idx, uint32_t num_passes, uint32_t iter,
+                              double cost_bits, uint32_t hot_iters) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    JXL_DASSERT(idx < candidates_.size());
+    Candidate& c = candidates_[idx];
+    c.has_cost = true;
+    c.latest_cost_bits = cost_bits;
+    c.num_passes = num_passes;
+
+    if (!c.abandoned && (cost_bits < best_cost_bits_ ||
+                         (cost_bits == best_cost_bits_ && idx < best_idx_))) {
+      best_cost_bits_ = cost_bits;
+      best_idx_ = idx;
+    }
+    if (best_idx_ < candidates_.size() && candidates_[best_idx_].abandoned) {
+      RecomputeBestLocked();
+    }
+
+    GradientRaceDecision decision;
+    decision.best_cost_bits = best_cost_bits_;
+    decision.global_rank = 1;
+    decision.pass_rank = 1;
+    for (size_t i = 0; i < candidates_.size(); ++i) {
+      const Candidate& other = candidates_[i];
+      if (!other.has_cost || other.abandoned) continue;
+      const bool before = other.latest_cost_bits < cost_bits ||
+                          (other.latest_cost_bits == cost_bits && i < idx);
+      if (!before) continue;
+      ++decision.global_rank;
+      if (other.num_passes == num_passes) ++decision.pass_rank;
+    }
+    decision.protected_by_global_keep =
+        decision.global_rank <= kGradientRaceGlobalKeep;
+    decision.protected_by_pass_keep =
+        iter <= hot_iters &&
+        decision.pass_rank <= kGradientRacePerPassKeepDuringHot;
+    return decision;
+  }
+
+  void MarkAbandoned(uint32_t idx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    JXL_DASSERT(idx < candidates_.size());
+    Candidate& c = candidates_[idx];
+    if (!c.abandoned) {
+      c.abandoned = true;
+      ++abandoned_count_;
+    }
+    if (idx == best_idx_) RecomputeBestLocked();
+  }
+
+  uint32_t abandoned_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return abandoned_count_;
+  }
+
+ private:
+  struct Candidate {
+    double latest_cost_bits = std::numeric_limits<double>::infinity();
+    uint32_t num_passes = 0;
+    bool has_cost = false;
+    bool abandoned = false;
+  };
+
+  void RecomputeBestLocked() {
+    best_cost_bits_ = std::numeric_limits<double>::infinity();
+    best_idx_ = std::numeric_limits<uint32_t>::max();
+    for (size_t i = 0; i < candidates_.size(); ++i) {
+      const Candidate& c = candidates_[i];
+      if (!c.has_cost || c.abandoned) continue;
+      if (c.latest_cost_bits < best_cost_bits_ ||
+          (c.latest_cost_bits == best_cost_bits_ &&
+           static_cast<uint32_t>(i) < best_idx_)) {
+        best_cost_bits_ = c.latest_cost_bits;
+        best_idx_ = static_cast<uint32_t>(i);
+      }
+    }
+  }
+
+  mutable std::mutex mutex_;
+  std::vector<Candidate> candidates_;
+  double best_cost_bits_ = std::numeric_limits<double>::infinity();
+  uint32_t best_idx_ = std::numeric_limits<uint32_t>::max();
+  uint32_t abandoned_count_ = 0;
+};
 
 bool GradientDumpClusterLogitsEnabled() {
   static const bool enabled = [] {
@@ -281,8 +386,7 @@ void DumpFinalClusterLogits(const JPEGOptData& d, const GradientState& state,
       fprintf(stderr,
               "PLANNER: [gradient] [(%u,%u,%u) P=%u] cluster_logits "
               "c=%u cell=%u best=%u second=%u margin=%.9g logits=[",
-              fa, fb, fc, num_passes, c, cell, best, second,
-              best_v - second_v);
+              fa, fb, fc, num_passes, c, cell, best, second, best_v - second_v);
       for (uint32_t k = 0; k < K; ++k) {
         fprintf(stderr, "%s%.9g", k == 0 ? "" : ",", base[k]);
       }
@@ -307,7 +411,9 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
                                 const AdamConfig& adam_cfg,
                                 const AnnealSchedule& schedule,
                                 GradientState* state, uint32_t fa, uint32_t fb,
-                                uint32_t fc, uint32_t num_passes) {
+                                uint32_t fc, uint32_t num_passes,
+                                GradientRaceState* race = nullptr,
+                                uint32_t race_idx = 0) {
   auto start_solve = PlannerClock::now();
 
   OptimizeResult result;
@@ -318,6 +424,10 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
   SoftCostResult r = ComputeSoftTotalCost(d, aux, *state, &scratch);
   result.init_cost_bits = r.total_cost_bits;
   result.final_cost_bits = r.total_cost_bits;  // for `total_iters == 0` case
+  if (race != nullptr) {
+    race->Update(race_idx, state->num_passes, /*iter=*/0, r.total_cost_bits,
+                 schedule.hot_iters);
+  }
   fprintf(stderr,
           "PLANNER: [gradient] [(%u,%u,%u) P=%u] Initial cost: %.2f bits "
           "(took %.2f ms)\n",
@@ -338,6 +448,7 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
   if (total_iters > 0) {
     AdamState adam(*state);
     GradientGrad grad;
+    uint32_t race_bad_checkpoints = 0;
 
     state->ApplyAnnealing(schedule, 0);
     grad.Reset(*state);
@@ -385,6 +496,40 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
               NanosToMs(ElapsedNanos(start_iter, end_adam)),
               NanosToMs(ElapsedNanos(start_iter, end_iter)));
       fflush(stderr);
+
+      if (race != nullptr) {
+        const uint32_t iter = t + 1;
+        const GradientRaceDecision decision =
+            race->Update(race_idx, state->num_passes, iter, r.total_cost_bits,
+                         schedule.hot_iters);
+        const bool is_checkpoint = iter >= kGradientRaceWarmupIters &&
+                                   (iter % kGradientRaceCheckPeriod) == 0;
+        const bool protected_candidate = decision.protected_by_global_keep ||
+                                         decision.protected_by_pass_keep;
+        const bool outside_margin =
+            std::isfinite(decision.best_cost_bits) &&
+            r.total_cost_bits >
+                decision.best_cost_bits * kGradientRaceAbandonRatio;
+        if (is_checkpoint && !protected_candidate && outside_margin) {
+          ++race_bad_checkpoints;
+        } else if (is_checkpoint) {
+          race_bad_checkpoints = 0;
+        }
+        if (race_bad_checkpoints >= kGradientRaceConsecutiveChecks) {
+          result.abandoned = true;
+          race->MarkAbandoned(race_idx);
+          fprintf(stderr,
+                  "PLANNER: [gradient] [(%u,%u,%u) P=%u] Early abandon at "
+                  "iter %u/%u: cost=%.2f bits, best_live=%.2f bits "
+                  "(%.3f%% over), rank=%u pass_rank=%u\n",
+                  fa, fb, fc, num_passes, iter, total_iters, r.total_cost_bits,
+                  decision.best_cost_bits,
+                  100.0 * (r.total_cost_bits / decision.best_cost_bits - 1.0),
+                  decision.global_rank, decision.pass_rank);
+          fflush(stderr);
+          break;
+        }
+      }
       prev_cost = r.total_cost_bits;
     }
   }
@@ -395,15 +540,18 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
                                ? (total_delta / result.init_cost_bits) * 100.0
                                : 0.0;
   fprintf(stderr,
-          "PLANNER: [gradient] [(%u,%u,%u) P=%u] Solve done: %u iters, "
+          "PLANNER: [gradient] [(%u,%u,%u) P=%u] Solve %s: %u/%u iters, "
           "init=%.2f -> final=%.2f bits delta=%+.2f (%+.3f%%), "
           "fwd_total=%.2f ms adam_total=%.2f ms wall=%.2f ms\n",
-          fa, fb, fc, num_passes, total_iters, result.init_cost_bits,
+          fa, fb, fc, num_passes, result.abandoned ? "abandoned" : "done",
+          result.iters_taken, total_iters, result.init_cost_bits,
           result.final_cost_bits, total_delta, total_pct,
           NanosToMs(total_fwd_ns), NanosToMs(total_adam_ns),
           NanosToMs(ElapsedNanos(start_solve, end_solve)));
   fflush(stderr);
-  DumpFinalClusterLogits(d, *state, fa, fb, fc, num_passes);
+  if (!result.abandoned) {
+    DumpFinalClusterLogits(d, *state, fa, fb, fc, num_passes);
+  }
   return result;
 }
 
@@ -917,10 +1065,12 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
     double final_cost_bits = std::numeric_limits<double>::max();
     uint32_t factorization_idx = 0;
     uint32_t num_passes = 0;
+    bool abandoned = false;
     bool valid = false;
   };
   const uint32_t total_workers = num_factorizations * pass_count_steps;
   std::vector<Slot> slots(total_workers);
+  GradientRaceState race(total_workers);
 
   auto start_sweep = PlannerClock::now();
   JXL_RETURN_IF_ERROR(RunOnPool(
@@ -932,11 +1082,16 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
         GradientState state = InitGradientStateFromFactorization(
             d, f, num_passes, num_clusters, sched.threshold_init,
             sched.pass_init, sched.cluster_init, num_hists);
-        RunGradientSolve(d, aux, adam_cfg, sched, &state, f[0], f[1], f[2],
-                         num_passes);
-        slots[idx].result = RoundToHardAssignment(d, state);
+        const OptimizeResult opt =
+            RunGradientSolve(d, aux, adam_cfg, sched, &state, f[0], f[1], f[2],
+                             num_passes, &race, idx);
         slots[idx].factorization_idx = factorization_idx;
         slots[idx].num_passes = num_passes;
+        if (opt.abandoned) {
+          slots[idx].abandoned = true;
+          return true;
+        }
+        slots[idx].result = RoundToHardAssignment(d, state);
         slots[idx].valid = true;
 
         // Post-hoc agglomerative cluster reduction (Option C). Adam's
@@ -992,13 +1147,14 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
       },
       "JpegCtxGradSweep"));
   auto end_sweep = PlannerClock::now();
+  const uint32_t abandoned_count = race.abandoned_count();
 
   // Pick the best. Deterministic tie-break: smaller flat index wins (which
   // corresponds to smaller num_passes first, then smaller factorization_idx).
   size_t best_idx = total_workers;
   double best_cost = std::numeric_limits<double>::max();
   for (size_t i = 0; i < slots.size(); ++i) {
-    if (!slots[i].valid) continue;
+    if (!slots[i].valid || slots[i].abandoned) continue;
     if (slots[i].final_cost_bits < best_cost) {
       best_cost = slots[i].final_cost_bits;
       best_idx = i;
@@ -1012,7 +1168,7 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
     debug_candidates->clear();
     debug_candidates->reserve(slots.size());
     for (size_t i = 0; i < slots.size(); ++i) {
-      if (!slots[i].valid) continue;
+      if (!slots[i].valid || slots[i].abandoned) continue;
       const Factorization& sf = factorizations[slots[i].factorization_idx];
       GradientSearchCandidate candidate;
       candidate.result = slots[i].result;
@@ -1028,8 +1184,14 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
 
   // Report per-slot results.
   for (size_t i = 0; i < slots.size(); ++i) {
-    if (!slots[i].valid) continue;
     const Factorization& sf = factorizations[slots[i].factorization_idx];
+    if (slots[i].abandoned) {
+      fprintf(stderr,
+              "PLANNER: [gradient] [(%u,%u,%u) P=%u] abandoned by race\n",
+              sf[0], sf[1], sf[2], slots[i].num_passes);
+      continue;
+    }
+    if (!slots[i].valid) continue;
     fprintf(stderr, "PLANNER: [gradient] [(%u,%u,%u) P=%u] cost=%.4f bits%s\n",
             sf[0], sf[1], sf[2], slots[i].num_passes, slots[i].final_cost_bits,
             i == best_idx ? " ** BEST **" : "");
@@ -1039,12 +1201,14 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
   const Slot& best = slots[best_idx];
   const Factorization& bf = factorizations[best.factorization_idx];
   fprintf(stderr,
-          "PLANNER: [gradient] Sweep done: %u workers in %.2f ms, "
+          "PLANNER: [gradient] Sweep done: %u workers (%u abandoned) in "
+          "%.2f ms, "
           "best=[(%u,%u,%u) P=%u] cost=%.4f bits "
           "(ac=%.2f nz=%.2f overhead=%.2f)\n",
-          total_workers, NanosToMs(ElapsedNanos(start_sweep, end_sweep)), bf[0],
-          bf[1], bf[2], best.num_passes, best.final_cost_bits,
-          bit_cost(best.result.ac_cost), bit_cost(best.result.nz_cost),
+          total_workers, abandoned_count,
+          NanosToMs(ElapsedNanos(start_sweep, end_sweep)), bf[0], bf[1], bf[2],
+          best.num_passes, best.final_cost_bits, bit_cost(best.result.ac_cost),
+          bit_cost(best.result.nz_cost),
           bit_cost(best.result.signalling_overhead));
   auto end_total = PlannerClock::now();
   fprintf(stderr, "PLANNER: [gradient] Total search took %.2f ms\n",

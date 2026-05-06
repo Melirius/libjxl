@@ -260,6 +260,9 @@ struct OptimizeResult {
   double final_cost_bits = 0.0;
   // Total number of forward+backward iterations executed.
   uint32_t iters_taken = 0;
+  // True if the candidate was stopped by the gradient race before completing
+  // the full Adam schedule.
+  bool abandoned = false;
 };
 
 struct GradientSearchCandidate {
