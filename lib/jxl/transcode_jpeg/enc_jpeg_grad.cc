@@ -26,7 +26,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -216,6 +218,89 @@ uint32_t CompactHardClusters(PassSearchResult* result) {
   return result->num_clusters;
 }
 
+bool GradientDumpClusterLogitsEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("JXL_DEBUG_GRADIENT_CLUSTER_LOGITS");
+    return env != nullptr && env[0] != '\0' &&
+           !(env[0] == '0' && env[1] == '\0');
+  }();
+  return enabled;
+}
+
+std::mutex& GradientDumpClusterLogitsMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+void DumpFinalClusterLogits(const JPEGOptData& d, const GradientState& state,
+                            uint32_t fa, uint32_t fb, uint32_t fc,
+                            uint32_t num_passes) {
+  if (!GradientDumpClusterLogitsEnabled()) return;
+  const uint32_t K = state.num_clusters;
+  const uint32_t num_cells = state.num_cells;
+  if (K == 0 || num_cells == 0) return;
+
+  std::array<bool, 256> hard_used{};
+  std::lock_guard<std::mutex> lock(GradientDumpClusterLogitsMutex());
+  fprintf(stderr,
+          "PLANNER: [gradient] [(%u,%u,%u) P=%u] Final cluster logits: "
+          "channels=%u cells=%u clusters=%u T_cluster=%.6f\n",
+          fa, fb, fc, num_passes, d.channels, num_cells, K,
+          state.cluster_temperature);
+
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    const std::vector<double>& logits = state.cluster_logits[c];
+    if (logits.size() != static_cast<size_t>(num_cells) * K) {
+      fprintf(stderr,
+              "PLANNER: [gradient] [(%u,%u,%u) P=%u] cluster_logits c=%u "
+              "size_mismatch size=%zu expected=%zu\n",
+              fa, fb, fc, num_passes, c, logits.size(),
+              static_cast<size_t>(num_cells) * K);
+      continue;
+    }
+    for (uint32_t cell = 0; cell < num_cells; ++cell) {
+      const double* base = &logits[static_cast<size_t>(cell) * K];
+      uint32_t best = 0;
+      uint32_t second = 0;
+      double best_v = base[0];
+      double second_v = -std::numeric_limits<double>::infinity();
+      for (uint32_t k = 1; k < K; ++k) {
+        const double v = base[k];
+        if (v > best_v) {
+          second = best;
+          second_v = best_v;
+          best = k;
+          best_v = v;
+        } else if (v > second_v) {
+          second = k;
+          second_v = v;
+        }
+      }
+      if (K == 1) second_v = best_v;
+      if (best < hard_used.size()) hard_used[best] = true;
+      fprintf(stderr,
+              "PLANNER: [gradient] [(%u,%u,%u) P=%u] cluster_logits "
+              "c=%u cell=%u best=%u second=%u margin=%.9g logits=[",
+              fa, fb, fc, num_passes, c, cell, best, second,
+              best_v - second_v);
+      for (uint32_t k = 0; k < K; ++k) {
+        fprintf(stderr, "%s%.9g", k == 0 ? "" : ",", base[k]);
+      }
+      fprintf(stderr, "]\n");
+    }
+  }
+
+  uint32_t used_count = 0;
+  for (uint32_t k = 0; k < K && k < hard_used.size(); ++k) {
+    if (hard_used[k]) ++used_count;
+  }
+  fprintf(stderr,
+          "PLANNER: [gradient] [(%u,%u,%u) P=%u] Final cluster logits "
+          "hard-argmax-used=%u/%u\n",
+          fa, fb, fc, num_passes, used_count, K);
+  fflush(stderr);
+}
+
 }  // namespace
 
 OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
@@ -318,6 +403,7 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
           NanosToMs(total_fwd_ns), NanosToMs(total_adam_ns),
           NanosToMs(ElapsedNanos(start_solve, end_solve)));
   fflush(stderr);
+  DumpFinalClusterLogits(d, *state, fa, fb, fc, num_passes);
   return result;
 }
 
@@ -821,8 +907,11 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
           sched.ctx_final, num_hists);
   fflush(stderr);
 
-  // Flat work list of `(factorization_idx, num_passes)` tuples. Each worker
-  // writes its own slot; no shared mutation across threads.
+  // Flat work list of `(num_passes, factorization_idx)` tuples. Scheduling
+  // pass-major gives the search good low-P incumbents before costlier
+  // high-pass candidates start, which makes later racing/early-abandoning
+  // useful. Each worker writes its own slot; no shared mutation across
+  // threads.
   struct Slot {
     PassSearchResult result;
     double final_cost_bits = std::numeric_limits<double>::max();
@@ -837,8 +926,8 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
   JXL_RETURN_IF_ERROR(RunOnPool(
       pool, 0, total_workers, ThreadPool::NoInit,
       [&](uint32_t idx, size_t /*thread_id*/) -> Status {
-        const uint32_t factorization_idx = idx / pass_count_steps;
-        const uint32_t num_passes = min_passes + (idx % pass_count_steps);
+        const uint32_t num_passes = min_passes + idx / num_factorizations;
+        const uint32_t factorization_idx = idx % num_factorizations;
         const Factorization& f = factorizations[factorization_idx];
         GradientState state = InitGradientStateFromFactorization(
             d, f, num_passes, num_clusters, sched.threshold_init,
@@ -905,7 +994,7 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
   auto end_sweep = PlannerClock::now();
 
   // Pick the best. Deterministic tie-break: smaller flat index wins (which
-  // corresponds to smaller factorization_idx first, then smaller num_passes).
+  // corresponds to smaller num_passes first, then smaller factorization_idx).
   size_t best_idx = total_workers;
   double best_cost = std::numeric_limits<double>::max();
   for (size_t i = 0; i < slots.size(); ++i) {
