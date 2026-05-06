@@ -109,15 +109,14 @@ struct GradientAux {
   }
 
   static std::array<uint16_t, kNumCh> AuxBlockDCIndices(const JPEGOptData& d,
-                                                       uint32_t c,
-                                                       uint32_t b) {
+                                                        uint32_t c,
+                                                        uint32_t b) {
     if (d.channels == 1) {
       return {d.block_DC_idx[0][b], 0, 0};
     }
     const uint32_t y = b / d.block_grid_w[c];
     const uint32_t x = b % d.block_grid_w[c];
-    return {AuxDCIndexForAxis(d, c, y, x, 0),
-            AuxDCIndexForAxis(d, c, y, x, 1),
+    return {AuxDCIndexForAxis(d, c, y, x, 0), AuxDCIndexForAxis(d, c, y, x, 1),
             AuxDCIndexForAxis(d, c, y, x, 2)};
   }
 };
@@ -330,6 +329,12 @@ SoftCostResult SoftForwardBackwardOnePass(const JPEGOptData& d,
                                           const GradientState& state,
                                           GradientGrad* grad,
                                           GradientScratch* scratch);
+
+SoftCostResult SoftForwardBackwardManyPass(const JPEGOptData& d,
+                                           const GradientAux& aux,
+                                           const GradientState& state,
+                                           GradientGrad* grad,
+                                           GradientScratch* scratch);
 
 }  // namespace jxl
 

@@ -30,106 +30,9 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// Target-specific helpers defined in `enc_jpeg_grad.cc`.
-double SoftFTabReduceVecFast(const double* HWY_RESTRICT data, size_t n);
-void SoftFTabPrimeVecFast(const double* HWY_RESTRICT src,
-                          double* HWY_RESTRICT dst, size_t n);
-void SoftFTabPrimeNegVecFast(const double* HWY_RESTRICT src,
-                             double* HWY_RESTRICT dst, size_t n);
-void VecAddVec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src,
-               size_t n);
-void ClusterWeightsVec(const double* HWY_RESTRICT cell_weight,
-                       const double* HWY_RESTRICT rho, double* HWY_RESTRICT B,
-                       size_t num_cells, size_t num_clusters);
-void CellGradientVec(const double* HWY_RESTRICT cell_weight,
-                     const double* HWY_RESTRICT rho,
-                     const double* HWY_RESTRICT D, double* HWY_RESTRICT dcell,
-                     double* HWY_RESTRICT drho, size_t num_cells,
-                     size_t num_clusters);
-void SoftmaxJacobianRowsVec(const double* HWY_RESTRICT prob,
-                            const double* HWY_RESTRICT dprob,
-                            double* HWY_RESTRICT dst, double scale,
-                            size_t num_rows, size_t row_size);
-void ContextForwardVec(const double* HWY_RESTRICT ac_h,
-                       const double* HWY_RESTRICT sigma,
-                       const uint16_t* HWY_RESTRICT dense_to_zdc,
-                       const uint16_t* HWY_RESTRICT dense_to_token,
-                       double* HWY_RESTRICT ctx_h, double* HWY_RESTRICT ctx_N,
-                       size_t num_clusters, size_t num_passes, size_t ac_alpha,
-                       size_t zdc_count, size_t token_count, size_t num_hists);
-void ContextBackwardVec(const double* HWY_RESTRICT ac_h,
-                        const double* HWY_RESTRICT ac_N,
-                        const double* HWY_RESTRICT sigma,
-                        const double* HWY_RESTRICT dctx_h,
-                        const double* HWY_RESTRICT dctx_N,
-                        const uint16_t* HWY_RESTRICT dense_to_zdc,
-                        const uint16_t* HWY_RESTRICT dense_to_token,
-                        double* HWY_RESTRICT dL_dh, double* HWY_RESTRICT dL_dN,
-                        double* HWY_RESTRICT dL_dsigma, size_t num_clusters,
-                        size_t num_passes, size_t ac_alpha, size_t zdc_count,
-                        size_t token_count, size_t num_hists);
+#include "lib/jxl/transcode_jpeg/enc_jpeg_grad_simd-inl.h"
 
 namespace {
-
-void Softmax(const double* HWY_RESTRICT logits, uint32_t P, double temperature,
-             double* HWY_RESTRICT out) {
-  const double inv_t = 1.0 / temperature;
-  if (P < 16) {
-    GradientSoftmaxScalar(logits, P, inv_t, out);
-    return;
-  }
-
-  const hn::ScalableTag<double> d;
-  const size_t N = hn::Lanes(d);
-  const auto vinv_t = hn::Set(d, inv_t);
-  auto vmax = hn::Set(d, logits[0]);
-
-  uint32_t p = 0;
-  for (; p + N <= P; p += N) {
-    vmax = hn::Max(vmax, hn::LoadU(d, logits + p));
-  }
-  double max_val = hn::ReduceMax(d, vmax);
-  for (; p < P; ++p) {
-    if (logits[p] > max_val) max_val = logits[p];
-  }
-
-  const bool use_unshifted =
-      std::abs(max_val * inv_t) < kSoftmaxUnshiftedMaxArg;
-  const auto vmax_val = hn::Set(d, max_val);
-  auto vsum = hn::Zero(d);
-  double sum;
-  if (use_unshifted) {
-    for (p = 0; p + N <= P; p += N) {
-      const auto prob = hn::Exp(d, hn::Mul(hn::LoadU(d, logits + p), vinv_t));
-      hn::StoreU(prob, d, out + p);
-      vsum = hn::Add(vsum, prob);
-    }
-    sum = hn::ReduceSum(d, vsum);
-    for (; p < P; ++p) {
-      out[p] = std::exp(logits[p] * inv_t);
-      sum += out[p];
-    }
-  } else {
-    for (p = 0; p + N <= P; p += N) {
-      const auto prob = hn::Exp(
-          d, hn::Mul(hn::Sub(hn::LoadU(d, logits + p), vmax_val), vinv_t));
-      hn::StoreU(prob, d, out + p);
-      vsum = hn::Add(vsum, prob);
-    }
-    sum = hn::ReduceSum(d, vsum);
-    for (; p < P; ++p) {
-      out[p] = std::exp((logits[p] - max_val) * inv_t);
-      sum += out[p];
-    }
-  }
-
-  const double inv_sum = 1.0 / sum;
-  const auto vinv_sum = hn::Set(d, inv_sum);
-  for (p = 0; p + N <= P; p += N) {
-    hn::StoreU(hn::Mul(hn::LoadU(d, out + p), vinv_sum), d, out + p);
-  }
-  for (; p < P; ++p) out[p] *= inv_sum;
-}
 
 inline double FlatPassOverheadBits(const JPEGOptData& d) {
   const uint32_t groups_x = (d.w_max + 31) / 32;
@@ -274,8 +177,8 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
   }
   result.num_cp_slots = touched_slots;
   for (size_t slot = 0; slot < cp_count; ++slot) {
-    overhead_bits += NZSignallingOverheadBits(
-        nz_h.data(), slot, cp_count, &work.overhead_hist);
+    overhead_bits += NZSignallingOverheadBits(nz_h.data(), slot, cp_count,
+                                              &work.overhead_hist);
   }
   overhead_bits += FlatPassOverheadBits(d);
   result.nz_cost_bits = nz_cost;

@@ -2177,15 +2177,23 @@ Status MaybeDumpGradientCandidateFiles(
   JXL_RETURN_IF_ERROR(RunOnPool(
       nullptr, 0, n, ThreadPool::NoInit,
       [&](uint32_t i, size_t /*thread_id*/) -> Status {
+        const JPEGPassEncodingDebugCandidate& candidate = candidates[i];
+        const std::string path = GradientCandidatePath(prefix, i, candidate);
         PaddedBytes frame_bytes{memory_manager};
         JXL_RETURN_IF_ERROR(EncodeJPEGPassPlanFrameBytes(
             memory_manager, cparams, frame_info, metadata, frame_data,
-            jpeg_data, cms, /*pool=*/nullptr, frame_header, candidates[i].plan,
+            jpeg_data, cms, /*pool=*/nullptr, frame_header, candidate.plan,
             &frame_bytes));
         JXL_RETURN_IF_ERROR(BuildDebugCodestream(memory_manager, metadata,
                                                  frame_bytes, &codestreams[i]));
-        JXL_RETURN_IF_ERROR(WriteBytesToFile(
-            GradientCandidatePath(prefix, i, candidates[i]), codestreams[i]));
+        JXL_RETURN_IF_ERROR(WriteBytesToFile(path, codestreams[i]));
+        std::fprintf(stderr,
+                     "PLANNER: [gradient] wrote candidate %u"
+                     " to %s (%" PRIuS " bytes, target=%.2f bits)%s\n",
+                     i, path.c_str(), codestreams[i].size(),
+                     candidate.target_cost_bits,
+                     candidate.is_best ? " ** BEST **" : "");
+        std::fflush(stderr);
         return true;
       },
       "GradientCandidateEncode"));
@@ -2212,13 +2220,6 @@ Status MaybeDumpGradientCandidateFiles(
         candidate.num_clusters, candidate.factorization[0],
         candidate.factorization[1], candidate.factorization[2],
         static_cast<uint32_t>(candidate.is_best));
-    std::fprintf(stderr,
-                 "PLANNER: [gradient] wrote candidate %u"
-                 " to %s (%" PRIuS " bytes, target=%.2f bits)%s\n",
-                 i, path.c_str(), codestreams[i].size(),
-                 candidate.target_cost_bits,
-                 candidate.is_best ? " ** BEST **" : "");
-    std::fflush(stderr);
   }
   const int close_result = std::fclose(manifest);
   if (close_result != 0) {
