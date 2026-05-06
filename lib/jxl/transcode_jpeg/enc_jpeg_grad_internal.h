@@ -139,13 +139,12 @@ struct GradientScratch {
 
   std::vector<double> dL_dh;
   std::vector<double> dL_dN;
-  std::vector<double> dL_dh_trans;
-  std::vector<double> dL_dN_trans;
+  std::vector<double> dL_dac_event;
   std::vector<double> dL_dctx_h;
   std::vector<double> dL_dctx_N;
   std::vector<double> dL_dsigma;
-  std::vector<double> dL_dnz_h;
   std::vector<double> dL_dnz_N;
+  std::vector<double> dL_dnz_event;
 
   std::vector<double> w0;
   std::vector<double> w1;
@@ -158,7 +157,7 @@ struct GradientScratch {
   std::vector<double> delta_ac_kp;
   std::vector<double> delta_ac_k;
   std::vector<double> nz_T_kp;
-  std::vector<double> nz_diff_h_kp;
+  std::vector<double> nz_diff_event_kp;
   std::vector<double> block_D;
   Histogram overhead_hist;
 
@@ -199,13 +198,12 @@ struct GradientScratch {
 
     dL_dh.resize(cp_count * ac_alpha);
     dL_dN.resize(cp_count * kZDC);
-    dL_dh_trans.resize(ac_alpha * cp_count);
-    dL_dN_trans.resize(kZDC * cp_count);
+    dL_dac_event.resize(ac_alpha * cp_count);
     dL_dctx_h.resize(num_passes * kACTokenCount * H);
     dL_dctx_N.resize(num_passes * H);
     dL_dsigma.resize(state.ctx_logits.size());
-    dL_dnz_h.resize(kNZBins * cp_count);
     dL_dnz_N.resize(kNZBuckets * cp_count);
+    dL_dnz_event.resize(kNZBins * cp_count);
 
     w0.resize(n_axis[0]);
     w1.resize(n_axis[1]);
@@ -218,7 +216,7 @@ struct GradientScratch {
     delta_ac_kp.resize(cp_count);
     delta_ac_k.resize(cp_count);
     nz_T_kp.resize(cp_count);
-    nz_diff_h_kp.resize(cp_count);
+    nz_diff_event_kp.resize(cp_count);
     block_D.resize(num_clusters);
     overhead_hist.EnsureCapacity(kJPEGNonZeroRange);
   }

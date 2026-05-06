@@ -221,20 +221,6 @@ void VecAddVec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src,
   for (; k < n; ++k) dst[k] += src[k];
 }
 
-// `dst[k] += a[k] + b[k]` for `k` in `[0, n)`.
-void VecAdd2Vec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT a,
-                const double* HWY_RESTRICT b, size_t n) {
-  const hn::ScalableTag<double> d;
-  const size_t N = hn::Lanes(d);
-  size_t k = 0;
-  for (; k + N <= n; k += N) {
-    hn::StoreU(hn::Add(hn::LoadU(d, dst + k),
-                       hn::Add(hn::LoadU(d, a + k), hn::LoadU(d, b + k))),
-               d, dst + k);
-  }
-  for (; k < n; ++k) dst[k] += a[k] + b[k];
-}
-
 // `dst[k] += w * src[k]` for `k` in `[0, n)`.
 void AccumScaledVec(double* HWY_RESTRICT dst, double w,
                     const double* HWY_RESTRICT src, size_t n) {
@@ -1006,21 +992,15 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
                      dL_dsigma.data(), num_clusters, num_passes, ac_alpha, kZDC,
                      kACTokenCount, H);
 
-  // Transpose context-backward outputs to match the forward AC accumulator
-  // layout. Block backward replays events once and accumulates all `(k,p)`
-  // slots with one sequential SIMD add per event.
-  std::vector<double>& dL_dh_trans = work.dL_dh_trans;
+  // Fold the split entropy derivatives into the per-event derivative that the
+  // block replay actually consumes:
+  //   event(di, cp) = dL/dh(di, cp) + dL/dN(zdc(di), cp).
+  std::vector<double>& dL_dac_event = work.dL_dac_event;
   for (uint32_t di = 0; di < ac_alpha; ++di) {
-    double* HWY_RESTRICT dst = &dL_dh_trans[di * cp_count];
+    double* HWY_RESTRICT dst = &dL_dac_event[di * cp_count];
+    const uint32_t zdc = ac_hist.dense_to_zdc[di];
     for (uint32_t cp = 0; cp < cp_count; ++cp) {
-      dst[cp] = dL_dh[cp * ac_alpha + di];
-    }
-  }
-  std::vector<double>& dL_dN_trans = work.dL_dN_trans;
-  for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
-    double* HWY_RESTRICT dst = &dL_dN_trans[zdc * cp_count];
-    for (uint32_t cp = 0; cp < cp_count; ++cp) {
-      dst[cp] = dL_dN[cp * kZDC + zdc];
+      dst[cp] = dL_dh[cp * ac_alpha + di] + dL_dN[cp * kZDC + zdc];
     }
   }
 
@@ -1047,17 +1027,27 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
 
   // NZ upstream gradients.
   std::vector<double>& dL_dnz_N = work.dL_dnz_N;
-  std::vector<double>& dL_dnz_h = work.dL_dnz_h;
+  std::vector<double>& dL_dnz_event = work.dL_dnz_event;
   SoftFTabPrimeVecFast(nz_N.data(), dL_dnz_N.data(), nz_N.size());
-  SoftFTabPrimeNegVecFast(nz_h.data(), dL_dnz_h.data(), nz_h.size());
+  SoftFTabPrimeNegVecFast(nz_h.data(), dL_dnz_event.data(), nz_h.size());
+  for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+    for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+      const uint32_t bin = NZHistogramIndex(pb, nz);
+      for (uint32_t p = 0; p < num_passes; ++p) {
+        VecAddVec(&dL_dnz_event[(bin * num_passes + p) * num_clusters],
+                  &dL_dnz_N[(pb * num_passes + p) * num_clusters],
+                  num_clusters);
+      }
+    }
+  }
 
   // Per-block-per-(cluster, pass) scratch tables for the factored backward.
   // `delta_ac_kp[cp]` is the events-aggregated AC gradient at slot cp;
-  // `nz_T_kp[cp]` and `nz_diff_h_kp[cp]` carry the NZ-derived per-(k,p)
+  // `nz_T_kp[cp]` and `nz_diff_event_kp[cp]` carry the NZ-derived per-(k,p)
   // factors. `block_D[k]` is the per-block per-cluster reduction over passes.
   std::vector<double>& delta_ac_kp = work.delta_ac_kp;
   std::vector<double>& nz_T_kp = work.nz_T_kp;
-  std::vector<double>& nz_diff_h_kp = work.nz_diff_h_kp;
+  std::vector<double>& nz_diff_event_kp = work.nz_diff_event_kp;
   std::vector<double>& block_D = work.block_D;
 
   for (uint32_t c = 0; c < d.channels; ++c) {
@@ -1098,8 +1088,8 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
       ClusterWeightsVec(cell_weight.data(), rho_cache[c].data(), B.data(),
                         num_cells, num_clusters);
 
-      // AC contribution: per-(k, p) delta. Use transposed dL/dh and dL/dN so
-      // each event adds a contiguous cp_count vector, mirroring forward.
+      // AC contribution: per-(k, p) delta. Each event adds its combined
+      // entropy derivative as a contiguous cp_count vector, mirroring forward.
       //   `dL/dpi[p]   = sum_k B[k] * delta_ac[k*P+p]`
       //   `dL/dcell    = sum_k rho_cell[k] * D[k], D[k] = sum_p pi[p]*delta`
       //   `dL/drho[c,cell,k] += w_cell * D[k]`
@@ -1107,14 +1097,15 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
       for (uint32_t e = ev_start; e < ev_end; ++e) {
         const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
         if (evt.hist_bin == kInvalidCompactH) continue;
-        VecAdd2Vec(delta_ac_kp.data(), &dL_dh_trans[evt.hist_bin * cp_count],
-                   &dL_dN_trans[evt.zdc * cp_count], cp_count);
+        VecAddVec(delta_ac_kp.data(), &dL_dac_event[evt.hist_bin * cp_count],
+                  cp_count);
       }
 
       // NZ contribution: `pb` is per-(block, pass), so precompute outside the
       // cluster loop. For each (k, p) we record:
-      //   `nz_diff_h[cp] = h_real_g - h_zero_g`  (drives dL/dpi)
-      //   `nz_T_kp[cp]   = pi_p*h_real_g + (1-pi_p)*h_zero_g + N_g`
+      //   `nz_diff_h[cp] = event_real - event_zero`  (drives dL/dpi; the
+      //                    shared N term cancels)
+      //   `nz_T_kp[cp]   = pi_p*event_real + (1-pi_p)*event_zero`
       //                   (combines into D[k] for cell/rho gradients)
       const uint32_t y = b / grid_w;
       const uint32_t x = b % grid_w;
@@ -1151,18 +1142,16 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         const uint32_t bin_zero = NZHistogramIndex(pb, 0);
         const double pi_p = pi[p];
         const double one_minus_pi_p = 1.0 - pi_p;
-        const double* HWY_RESTRICT h_real_row =
-            &dL_dnz_h[bin_real * num_passes + p];
-        const double* HWY_RESTRICT h_zero_row =
-            &dL_dnz_h[bin_zero * num_passes + p];
-        const double* HWY_RESTRICT N_row = &dL_dnz_N[pb * num_passes + p];
+        const double* HWY_RESTRICT event_real_row =
+            &dL_dnz_event[(bin_real * num_passes + p) * num_clusters];
+        const double* HWY_RESTRICT event_zero_row =
+            &dL_dnz_event[(bin_zero * num_passes + p) * num_clusters];
         for (uint32_t k = 0; k < num_clusters; ++k) {
           const uint32_t cp = k * num_passes + p;
-          const double h_real_g = h_real_row[k];
-          const double h_zero_g = h_zero_row[k];
-          const double N_g = N_row[k];
-          nz_diff_h_kp[cp] = h_real_g - h_zero_g;
-          nz_T_kp[cp] = pi_p * h_real_g + one_minus_pi_p * h_zero_g + N_g;
+          const double event_real = event_real_row[k];
+          const double event_zero = event_zero_row[k];
+          nz_diff_event_kp[cp] = event_real - event_zero;
+          nz_T_kp[cp] = pi_p * event_real + one_minus_pi_p * event_zero;
         }
       }
 
@@ -1186,7 +1175,7 @@ SoftCostResult SoftForwardBackwardImpl(const JPEGOptData& d,
         for (uint32_t p = 0; p < num_passes; ++p) {
           const uint32_t cp = k * num_passes + p;
           dL_dpi[p] += Bk * delta_ac_kp[cp];
-          dL_dpi[p] += Bk * nz_diff_h_kp[cp];
+          dL_dpi[p] += Bk * nz_diff_event_kp[cp];
         }
       }
 

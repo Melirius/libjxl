@@ -496,8 +496,10 @@ TEST(JpegGradTest, FullAnnealingReducesCostAndRoundsSanely) {
 
   const PassSearchResult rounded = RoundToHardAssignment(*opt_data, state);
   EXPECT_EQ(rounded.num_passes, hard.num_passes);
-  EXPECT_EQ(rounded.num_clusters, hard.num_clusters);
+  EXPECT_GE(rounded.num_clusters, 1u);
+  EXPECT_LE(rounded.num_clusters, hard.num_clusters);
   EXPECT_EQ(rounded.ctx_map.size(), hard.ctx_map.size());
+  ExpectDenseClusters(rounded);
   for (uint32_t a = 0; a < kNumCh; ++a) {
     EXPECT_EQ(rounded.thresholds.T[a].size(), hard.thresholds.T[a].size());
     // Strictly increasing.

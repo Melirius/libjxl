@@ -38,8 +38,6 @@ void SoftFTabPrimeNegVecFast(const double* HWY_RESTRICT src,
                              double* HWY_RESTRICT dst, size_t n);
 void VecAddVec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src,
                size_t n);
-void VecAdd2Vec(double* HWY_RESTRICT dst, const double* HWY_RESTRICT a,
-                const double* HWY_RESTRICT b, size_t n);
 void ClusterWeightsVec(const double* HWY_RESTRICT cell_weight,
                        const double* HWY_RESTRICT rho, double* HWY_RESTRICT B,
                        size_t num_cells, size_t num_clusters);
@@ -302,18 +300,12 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
                      dL_dsigma.data(), num_clusters, 1, ac_alpha, kZDC,
                      kACTokenCount, H);
 
-  std::vector<double>& dL_dh_trans = work.dL_dh_trans;
+  std::vector<double>& dL_dac_event = work.dL_dac_event;
   for (uint32_t di = 0; di < ac_alpha; ++di) {
-    double* HWY_RESTRICT dst = &dL_dh_trans[di * cp_count];
+    double* HWY_RESTRICT dst = &dL_dac_event[di * cp_count];
+    const uint32_t zdc = ac_hist.dense_to_zdc[di];
     for (uint32_t k = 0; k < cp_count; ++k) {
-      dst[k] = dL_dh[k * ac_alpha + di];
-    }
-  }
-  std::vector<double>& dL_dN_trans = work.dL_dN_trans;
-  for (uint32_t zdc = 0; zdc < kZDC; ++zdc) {
-    double* HWY_RESTRICT dst = &dL_dN_trans[zdc * cp_count];
-    for (uint32_t k = 0; k < cp_count; ++k) {
-      dst[k] = dL_dN[k * kZDC + zdc];
+      dst[k] = dL_dh[k * ac_alpha + di] + dL_dN[k * kZDC + zdc];
     }
   }
 
@@ -331,9 +323,16 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
   }
 
   std::vector<double>& dL_dnz_N = work.dL_dnz_N;
-  std::vector<double>& dL_dnz_h = work.dL_dnz_h;
+  std::vector<double>& dL_dnz_event = work.dL_dnz_event;
   SoftFTabPrimeVecFast(nz_N.data(), dL_dnz_N.data(), nz_N.size());
-  SoftFTabPrimeNegVecFast(nz_h.data(), dL_dnz_h.data(), nz_h.size());
+  SoftFTabPrimeNegVecFast(nz_h.data(), dL_dnz_event.data(), nz_h.size());
+  for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+    const double* HWY_RESTRICT N_row = &dL_dnz_N[pb * cp_count];
+    for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+      VecAddVec(&dL_dnz_event[NZHistogramIndex(pb, nz) * cp_count], N_row,
+                cp_count);
+    }
+  }
 
   std::vector<double>& delta_ac_k = work.delta_ac_k;
 
@@ -369,15 +368,14 @@ SoftCostResult SoftForwardBackwardOnePassImpl(const JPEGOptData& d,
       for (uint32_t e = ev_start; e < ev_end; ++e) {
         const CompactACEvent evt = d.FromBin(d.block_bins[c][e]);
         if (evt.hist_bin == kInvalidCompactH) continue;
-        VecAdd2Vec(delta_ac_k.data(), &dL_dh_trans[evt.hist_bin * cp_count],
-                   &dL_dN_trans[evt.zdc * cp_count], cp_count);
+        VecAddVec(delta_ac_k.data(), &dL_dac_event[evt.hist_bin * cp_count],
+                  cp_count);
       }
 
-      const uint32_t pb = block_aux.onepass_nz_pb;
       const uint32_t bin_real = block_aux.onepass_nz_bin_real;
 
-      VecAdd2Vec(delta_ac_k.data(), &dL_dnz_h[bin_real * cp_count],
-                 &dL_dnz_N[pb * cp_count], cp_count);
+      VecAddVec(delta_ac_k.data(), &dL_dnz_event[bin_real * cp_count],
+                cp_count);
 
       CellGradientVec(cell_weight.data(), rho_cache[c].data(),
                       delta_ac_k.data(), dL_dcell.data(), dL_drho[c].data(),

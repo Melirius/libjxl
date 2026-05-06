@@ -4,8 +4,6 @@
 // license that can be found in the LICENSE file.
 
 // Gradient-based joint-relaxation optimizer for JPEG lossless recompression
-// (Lane B from plans/in-the-pass-aware-scheme-keen-barto.md). See
-// plans/lane_b_progress.md for the iteration-by-iteration history.
 //
 // `GradientState` holds three continuous-variable bundles that the
 // optimizer can move through gradient descent:
@@ -20,7 +18,7 @@
 // `ComputeSoftTotalCost` is the load-bearing forward pass: it walks every
 // block of `JPEGOptData`, applies the three soft membership weights, and
 // reduces to AC entropy + NZ entropy + signalling overhead. Counts match the
-// existing `EvaluatePassAwareModel` at temperatures → 0; gradient flows
+// existing `EvaluatePassAwareModel` at temperatures -> 0; gradient flows
 // analytically through entropy terms, signalling overhead is held constant.
 //
 // `RunGradientSolve` is the inner Adam + annealing loop for a single
