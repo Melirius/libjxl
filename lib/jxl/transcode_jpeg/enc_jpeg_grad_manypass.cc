@@ -35,7 +35,8 @@ namespace {
 
 // Computes block-major pass softmax rows `[b * P + p]`. Pass counts are small,
 // so vectorize across blocks: each SIMD lane owns one block.
-void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
+void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits,
+                         const double* HWY_RESTRICT gates, size_t num_blocks,
                          uint32_t P, double temperature,
                          double* HWY_RESTRICT out) {
   constexpr size_t kMaxPasses = 16;
@@ -47,8 +48,15 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
     return;
   }
   if (P > kMaxPasses) {
+    std::vector<double> row(P);
     for (size_t b = 0; b < num_blocks; ++b) {
-      Softmax(&logits[b * P], P, temperature, &out[b * P]);
+      const double* base = &logits[b * P];
+      if (gates == nullptr) {
+        Softmax(base, P, temperature, &out[b * P]);
+      } else {
+        for (uint32_t p = 0; p < P; ++p) row[p] = base[p] + gates[p];
+        GradientSoftmaxScalar(row.data(), P, inv_t, &out[b * P]);
+      }
     }
     return;
   }
@@ -67,14 +75,17 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
   for (; b + N <= num_blocks; b += N) {
     const double* HWY_RESTRICT logits_base = logits + b * P;
     double* HWY_RESTRICT out_base = out + b * P;
-    const auto p0 = hn::GatherIndex(d, logits_base, block_offsets);
+    const auto p0 = hn::Add(hn::GatherIndex(d, logits_base, block_offsets),
+                            hn::Set(d, gates == nullptr ? 0.0 : gates[0]));
     auto vmax = p0;
     probs[0] = hn::Exp(d, hn::Mul(p0, vinv_t));
     auto vsum = probs[0];
     for (uint32_t p = 1; p < P; ++p) {
       const auto pass_offsets =
           hn::Add(block_offsets, hn::Set(di, static_cast<int64_t>(p)));
-      const auto logits_p = hn::GatherIndex(d, logits_base, pass_offsets);
+      const auto logits_p =
+          hn::Add(hn::GatherIndex(d, logits_base, pass_offsets),
+                  hn::Set(d, gates == nullptr ? 0.0 : gates[p]));
       vmax = hn::Max(vmax, logits_p);
       probs[p] = hn::Exp(d, hn::Mul(logits_p, vinv_t));
       vsum = hn::Add(vsum, probs[p]);
@@ -91,7 +102,9 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
       for (uint32_t p = 0; p < P; ++p) {
         const auto pass_offsets =
             hn::Add(block_offsets, hn::Set(di, static_cast<int64_t>(p)));
-        const auto logits_p = hn::GatherIndex(d, logits_base, pass_offsets);
+        const auto logits_p =
+            hn::Add(hn::GatherIndex(d, logits_base, pass_offsets),
+                    hn::Set(d, gates == nullptr ? 0.0 : gates[p]));
         probs[p] = hn::Exp(d, hn::Mul(hn::Sub(logits_p, vmax), vinv_t));
         vsum = hn::Add(vsum, probs[p]);
       }
@@ -106,7 +119,14 @@ void PassSoftmaxCacheVec(const double* HWY_RESTRICT logits, size_t num_blocks,
   }
 
   for (; b < num_blocks; ++b) {
-    GradientSoftmaxScalar(&logits[b * P], P, inv_t, &out[b * P]);
+    const double* base = &logits[b * P];
+    if (gates == nullptr) {
+      GradientSoftmaxScalar(base, P, inv_t, &out[b * P]);
+    } else {
+      std::array<double, kMaxPasses> row;
+      for (uint32_t p = 0; p < P; ++p) row[p] = base[p] + gates[p];
+      GradientSoftmaxScalar(row.data(), P, inv_t, &out[b * P]);
+    }
   }
 }
 
@@ -127,6 +147,54 @@ inline double FlatPassOverheadBits(const JPEGOptData& d) {
   const uint32_t groups_y = (d.h_max + 31) / 32;
   const uint32_t groups = groups_x * groups_y;
   return static_cast<double>(groups * 64u + 64000u);
+}
+
+inline double SmoothAlive(double mass, double tau) {
+  if (mass <= 0.0) return 0.0;
+  return -std::expm1(-mass / tau);
+}
+
+inline double SmoothAlivePrime(double mass, double tau) {
+  if (mass <= 0.0) return 1.0 / tau;
+  return std::exp(-mass / tau) / tau;
+}
+
+inline size_t TotalChannelBlocks(const JPEGOptData& d) {
+  size_t total = 0;
+  for (uint32_t c = 0; c < d.channels; ++c) total += d.num_blocks[c];
+  return total;
+}
+
+inline double SmoothPassOccupancyOverheadBits(
+    const std::vector<double>& pass_mass,
+    const std::vector<double>& pass_group_mass, uint32_t num_passes,
+    uint32_t pass_group_count, double tau_pass, double tau_group,
+    std::vector<double>* pass_mass_grad,
+    std::vector<double>* pass_group_mass_grad) {
+  constexpr double kPassHeaderBits = 64000.0;
+  constexpr double kPassGroupBits = 64.0;
+  double bits = 0.0;
+  if (pass_mass_grad != nullptr) {
+    pass_mass_grad->resize(num_passes);
+    pass_group_mass_grad->resize(num_passes * pass_group_count);
+  }
+  for (uint32_t p = 0; p < num_passes; ++p) {
+    const double mass = pass_mass[p];
+    bits += kPassHeaderBits * SmoothAlive(mass, tau_pass);
+    if (pass_mass_grad != nullptr) {
+      (*pass_mass_grad)[p] = kPassHeaderBits * SmoothAlivePrime(mass, tau_pass);
+    }
+    for (uint32_t g = 0; g < pass_group_count; ++g) {
+      const size_t idx = p * pass_group_count + g;
+      const double group_mass = pass_group_mass[idx];
+      bits += kPassGroupBits * SmoothAlive(group_mass, tau_group);
+      if (pass_group_mass_grad != nullptr) {
+        (*pass_group_mass_grad)[idx] =
+            kPassGroupBits * SmoothAlivePrime(group_mass, tau_group);
+      }
+    }
+  }
+  return bits;
 }
 }  // namespace
 
@@ -167,6 +235,15 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
   const double inv_ctx_t = 1.0 / state.ctx_temperature;
   const uint32_t H = state.num_hists;
   JXL_DASSERT(state.ctx_logits.size() == num_passes * num_clusters * kZDC * H);
+  const bool optimize_pass_count = state.pass_gates.size() == num_passes;
+  const double* HWY_RESTRICT pass_gates =
+      optimize_pass_count ? state.pass_gates.data() : nullptr;
+  const uint32_t pass_group_count = GradientPassGroupCount(d);
+  const double total_blocks = static_cast<double>(TotalChannelBlocks(d));
+  const double tau_pass =
+      std::max(1.0, total_blocks / static_cast<double>(num_passes));
+  const double tau_group = std::max(
+      1.0, total_blocks / static_cast<double>(pass_group_count * num_passes));
   JXL_DASSERT(ac_hist.dense_to_zdc.size() == ac_alpha);
   JXL_DASSERT(ac_hist.dense_to_token.size() == ac_alpha);
   for (uint32_t c = 0; c < d.channels; ++c) {
@@ -189,10 +266,27 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
   // Precompute block-pi vectors for pass weights and NZ neighbor lookups.
   // Flat: `pi_cache[c][b * num_passes + p]`.
   auto& pi_cache = work.pi_cache;
+  std::vector<double>& pass_mass = work.pass_mass;
+  std::vector<double>& pass_group_mass = work.pass_group_mass;
+  if (optimize_pass_count) {
+    std::fill(pass_mass.begin(), pass_mass.end(), 0.0);
+    std::fill(pass_group_mass.begin(), pass_group_mass.end(), 0.0);
+  }
   for (uint32_t c = 0; c < d.channels; ++c) {
     const size_t nb = d.num_blocks[c];
-    PassSoftmaxCacheVec(state.pass_logits[c].data(), nb, num_passes,
+    PassSoftmaxCacheVec(state.pass_logits[c].data(), pass_gates, nb, num_passes,
                         state.pass_temperature, pi_cache[c].data());
+    if (optimize_pass_count) {
+      for (size_t b = 0; b < nb; ++b) {
+        const uint32_t group =
+            GradientPassGroupIndex(d, c, static_cast<uint32_t>(b));
+        const double* pi = &pi_cache[c][b * num_passes];
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          pass_mass[p] += pi[p];
+          pass_group_mass[p * pass_group_count + group] += pi[p];
+        }
+      }
+    }
   }
 
   // Precompute per-(channel, cell) cluster-softmax `rho`. Iteration 5 softens
@@ -368,7 +462,14 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
     overhead_bits += NZSignallingOverheadBits(nz_h.data(), slot, cp_count,
                                               &work.overhead_hist);
   }
-  overhead_bits += FlatPassOverheadBits(d) * num_passes;
+  if (optimize_pass_count) {
+    overhead_bits += SmoothPassOccupancyOverheadBits(
+        pass_mass, pass_group_mass, num_passes, pass_group_count, tau_pass,
+        tau_group, grad == nullptr ? nullptr : &work.pass_mass_grad,
+        grad == nullptr ? nullptr : &work.pass_group_mass_grad);
+  } else {
+    overhead_bits += FlatPassOverheadBits(d) * num_passes;
+  }
   result.nz_cost_bits = nz_cost;
   result.signalling_overhead_bits = overhead_bits;
   result.total_cost_bits = ac_cost + nz_cost + overhead_bits;
@@ -581,6 +682,16 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
           dL_dpi[p] += Bk * nz_diff_event_kp[cp];
         }
       }
+      if (optimize_pass_count) {
+        const uint32_t group = GradientPassGroupIndex(d, c, b);
+        const std::vector<double>& pass_mass_grad = work.pass_mass_grad;
+        const std::vector<double>& pass_group_mass_grad =
+            work.pass_group_mass_grad;
+        for (uint32_t p = 0; p < num_passes; ++p) {
+          dL_dpi[p] += pass_mass_grad[p];
+          dL_dpi[p] += pass_group_mass_grad[p * pass_group_count + group];
+        }
+      }
 
       // `dL/dcell[cell] = sum_k rho_cell[k] * D[k]`;
       // `dL/drho[c,cell,k] += w_cell * D[k]`.
@@ -595,7 +706,9 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
       for (uint32_t p = 0; p < num_passes; ++p) s += pi[p] * dL_dpi[p];
       double* grad_logits = &grad->pass_logits[c][b * num_passes];
       for (uint32_t q = 0; q < num_passes; ++q) {
-        grad_logits[q] += inv_pass_t * pi[q] * (dL_dpi[q] - s);
+        const double g = inv_pass_t * pi[q] * (dL_dpi[q] - s);
+        grad_logits[q] += g;
+        if (optimize_pass_count) grad->pass_gates[q] += g;
       }
 
       // Decompose `dL/dcell` into `dL/dw_axis`. Axis 0's weight at `k0` pairs

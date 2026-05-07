@@ -15,8 +15,9 @@
 //     h-contribution splits between bin_real = NZIndex(pb, nz_b) and
 //     bin_zero = NZIndex(pb, 0) with weights pi[p] and 1 - pi[p].
 //   - Signalling overhead = ANSPopulationCost - ShannonEntropy for routed AC
-//     histograms and NZ slots, plus a flat `ComputePassOverhead(d) *
-//     num_passes`. Treated as constant for gradient purposes.
+//     histograms and NZ slots. Fixed-P mode adds the flat pass overhead as a
+//     constant; auto-P mode uses a smooth pass occupancy surrogate so gradients
+//     can retire unused passes.
 
 #include "lib/jxl/transcode_jpeg/enc_jpeg_grad.h"
 
@@ -120,6 +121,8 @@ void AdamStepImpl(const GradientGrad& grad, const AdamConfig& cfg,
     apply(grad.cluster_logits[a], &state->cluster_logits[a],
           &adam->m_cluster_logits[a], &adam->v_cluster_logits[a]);
   }
+  apply(grad.pass_gates, &state->pass_gates, &adam->m_pass_gates,
+        &adam->v_pass_gates);
   apply(grad.ctx_logits, &state->ctx_logits, &adam->m_ctx_logits,
         &adam->v_ctx_logits);
 }
@@ -571,6 +574,7 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
   const uint32_t num_passes = state.num_passes;
   const uint32_t num_clusters = state.num_clusters;
   const uint32_t num_cells = state.num_cells;
+  const bool compact_passes = state.pass_gates.size() == num_passes;
   r.num_passes = num_passes;
   r.num_clusters = num_clusters;
 
@@ -618,7 +622,10 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
     }
   }
 
-  // Argmax pass assignment per block.
+  // Argmax pass assignment per block. When auto-pass-count gates are present,
+  // they participate in hardening and unused pass ids are compacted away after
+  // all blocks have been assigned.
+  std::vector<uint8_t> pass_seen(num_passes, 0);
   for (uint32_t c = 0; c < kNumCh; ++c) {
     const uint32_t nb = (c < d.channels) ? d.num_blocks[c] : 0u;
     r.pass_assignment[c].assign(nb, 0);
@@ -627,15 +634,35 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
     for (uint32_t b = 0; b < nb; ++b) {
       const double* base = &logits[b * num_passes];
       uint32_t best = 0;
-      double best_v = base[0];
+      double best_v = base[0] + (compact_passes ? state.pass_gates[0] : 0.0);
       for (uint32_t p = 1; p < num_passes; ++p) {
-        if (base[p] > best_v) {
-          best_v = base[p];
+        const double v = base[p] + (compact_passes ? state.pass_gates[p] : 0.0);
+        if (v > best_v) {
+          best_v = v;
           best = p;
         }
       }
       r.pass_assignment[c][b] = static_cast<uint8_t>(best);
+      pass_seen[best] = 1;
     }
+  }
+  if (compact_passes && num_passes > 1) {
+    std::vector<uint8_t> pass_remap(num_passes, 0);
+    uint32_t used_passes = 0;
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      if (!pass_seen[p]) continue;
+      pass_remap[p] = static_cast<uint8_t>(used_passes++);
+    }
+    if (used_passes == 0) {
+      pass_remap[0] = 0;
+      used_passes = 1;
+    }
+    for (uint32_t c = 0; c < kNumCh; ++c) {
+      for (uint8_t& p : r.pass_assignment[c]) {
+        p = pass_remap[p];
+      }
+    }
+    r.num_passes = used_passes;
   }
   CompactHardClusters(&r);
   return r;
@@ -646,7 +673,8 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
 GradientState InitGradientStateFromFactorization(
     const JPEGOptData& d, const Factorization& f, uint32_t num_passes,
     uint32_t num_clusters, double threshold_temperature,
-    double pass_temperature, double cluster_temperature, uint32_t num_hists) {
+    double pass_temperature, double cluster_temperature, uint32_t num_hists,
+    bool optimize_pass_count) {
   GradientState state;
   state.num_passes = num_passes;
   state.num_clusters = num_clusters;
@@ -698,6 +726,17 @@ GradientState InitGradientStateFromFactorization(
       }
     } else {
       state.cluster_logits[c].clear();
+    }
+  }
+  if (optimize_pass_count && num_passes > 1) {
+    // Global gates give the optimizer a low-dimensional way to retire a pass
+    // for every block at once. The tiny descending bias breaks exact symmetry;
+    // the per-block logits above still provide spatial variety when extra
+    // passes pay for themselves.
+    constexpr double kPassGateSymmetryBreak = 0.05;
+    state.pass_gates.resize(num_passes);
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      state.pass_gates[p] = -kPassGateSymmetryBreak * p;
     }
   }
   state.num_hists = num_hists;
@@ -1018,12 +1057,18 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
   const uint32_t pass_count_steps = max_passes - min_passes + 1;
   const uint32_t num_factorizations =
       static_cast<uint32_t>(factorizations.size());
+  const bool optimize_pass_count =
+      effort.optimize_passes_num == 0 && max_passes > 1;
+  const uint32_t total_workers = optimize_pass_count
+                                     ? num_factorizations
+                                     : num_factorizations * pass_count_steps;
 
   fprintf(stderr,
           "PLANNER: [gradient] %u factorizations, pass range [%u, %u] "
-          "(%u workers), %u clusters\n",
-          num_factorizations, min_passes, max_passes,
-          num_factorizations * pass_count_steps, num_clusters);
+          "(%u workers%s), %u clusters\n",
+          num_factorizations, min_passes, max_passes, total_workers,
+          optimize_pass_count ? ", auto-P via one Pmax solve" : "",
+          num_clusters);
   fflush(stderr);
 
   AdamConfig adam_cfg;
@@ -1055,11 +1100,10 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
           sched.ctx_final, num_hists);
   fflush(stderr);
 
-  // Flat work list of `(num_passes, factorization_idx)` tuples. Scheduling
-  // pass-major gives the search good low-P incumbents before costlier
-  // high-pass candidates start, which makes later racing/early-abandoning
-  // useful. Each worker writes its own slot; no shared mutation across
-  // threads.
+  // Flat work list. In fixed-P mode it still enumerates `(num_passes,
+  // factorization_idx)` tuples. In auto-P mode each factorization runs once at
+  // Pmax with global pass gates and smooth occupancy overhead; hard rounding
+  // compacts unused pass ids away.
   struct Slot {
     PassSearchResult result;
     double final_cost_bits = std::numeric_limits<double>::max();
@@ -1068,7 +1112,6 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
     bool abandoned = false;
     bool valid = false;
   };
-  const uint32_t total_workers = num_factorizations * pass_count_steps;
   std::vector<Slot> slots(total_workers);
   GradientRaceState race(total_workers);
 
@@ -1076,12 +1119,16 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
   JXL_RETURN_IF_ERROR(RunOnPool(
       pool, 0, total_workers, ThreadPool::NoInit,
       [&](uint32_t idx, size_t /*thread_id*/) -> Status {
-        const uint32_t num_passes = min_passes + idx / num_factorizations;
-        const uint32_t factorization_idx = idx % num_factorizations;
+        const uint32_t num_passes = optimize_pass_count
+                                        ? max_passes
+                                        : min_passes + idx / num_factorizations;
+        const uint32_t factorization_idx =
+            optimize_pass_count ? idx : idx % num_factorizations;
         const Factorization& f = factorizations[factorization_idx];
         GradientState state = InitGradientStateFromFactorization(
             d, f, num_passes, num_clusters, sched.threshold_init,
-            sched.pass_init, sched.cluster_init, num_hists);
+            sched.pass_init, sched.cluster_init, num_hists,
+            optimize_pass_count);
         const OptimizeResult opt =
             RunGradientSolve(d, aux, adam_cfg, sched, &state, f[0], f[1], f[2],
                              num_passes, &race, idx);
@@ -1092,14 +1139,21 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
           return true;
         }
         slots[idx].result = RoundToHardAssignment(d, state);
+        slots[idx].num_passes = slots[idx].result.num_passes;
         slots[idx].valid = true;
+        if (optimize_pass_count) {
+          fprintf(stderr,
+                  "PLANNER: [gradient] [(%u,%u,%u) Pmax=%u] Final pass "
+                  "count: %u\n",
+                  f[0], f[1], f[2], num_passes, slots[idx].num_passes);
+          fflush(stderr);
+        }
 
-        // Post-hoc agglomerative cluster reduction (Option C). Adam's
-        // gradient ignores signalling overhead, so it tends to keep all 16
-        // clusters even when overhead would be saved by merging. This pass
-        // greedily merges cluster pairs whose merge reduces the encoder's
-        // actual cost (entropy + overhead) and updates the slot's cost
-        // fields and tie-break key.
+        // Post-hoc agglomerative cluster reduction (Option C). The smooth
+        // auto-P term only helps with pass occupancy; cluster signalling is
+        // still piecewise enough that the soft optimizer can over-allocate
+        // clusters. This pass greedily merges cluster pairs whose merge reduces
+        // the encoder's actual cost and updates the slot's cost fields.
         if (effort.grad_overhead_aware_reduce) {
           auto merges_or = ReduceClustersAgglomerative(d, &slots[idx].result,
                                                        /*pool=*/nullptr);
@@ -1115,7 +1169,7 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
                       "PLANNER: [gradient] [(%u,%u,%u) P=%u] "
                       "Agglomerative merge: %u clusters dropped, "
                       "final_cost=%.2f bits\n",
-                      f[0], f[1], f[2], num_passes, merges,
+                      f[0], f[1], f[2], slots[idx].result.num_passes, merges,
                       slots[idx].final_cost_bits);
               fflush(stderr);
             }
@@ -1136,8 +1190,8 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
                   "PLANNER: [gradient] [(%u,%u,%u) P=%u] "
                   "Threshold pruning: %u redundant thresholds dropped, "
                   "factorization now (%zu,%zu,%zu)\n",
-                  f[0], f[1], f[2], num_passes, pruned, T0.size() + 1,
-                  T1.size() + 1, T2.size() + 1);
+                  f[0], f[1], f[2], slots[idx].result.num_passes, pruned,
+                  T0.size() + 1, T1.size() + 1, T2.size() + 1);
           fflush(stderr);
         }
         JXL_RETURN_IF_ERROR(RefreshHardCostWithBiclusterModel(

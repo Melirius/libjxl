@@ -121,6 +121,37 @@ struct GradientAux {
   }
 };
 
+constexpr uint32_t kGradientPassGroupDimInBlocks = 32;
+
+inline uint32_t GradientPassGroupsX(const JPEGOptData& d) {
+  return (d.w_max + kGradientPassGroupDimInBlocks - 1) /
+         kGradientPassGroupDimInBlocks;
+}
+
+inline uint32_t GradientPassGroupsY(const JPEGOptData& d) {
+  return (d.h_max + kGradientPassGroupDimInBlocks - 1) /
+         kGradientPassGroupDimInBlocks;
+}
+
+inline uint32_t GradientPassGroupCount(const JPEGOptData& d) {
+  return GradientPassGroupsX(d) * GradientPassGroupsY(d);
+}
+
+inline uint32_t GradientPassGroupIndex(const JPEGOptData& d, uint32_t c,
+                                       uint32_t b) {
+  const uint32_t groups_x = GradientPassGroupsX(d);
+  const uint32_t groups_y = GradientPassGroupsY(d);
+  const uint32_t x = b % d.block_grid_w[c];
+  const uint32_t y = b / d.block_grid_w[c];
+  const uint32_t group_x =
+      std::min<uint32_t>((x << d.hshift[c]) / kGradientPassGroupDimInBlocks,
+                         groups_x - 1);
+  const uint32_t group_y =
+      std::min<uint32_t>((y << d.vshift[c]) / kGradientPassGroupDimInBlocks,
+                         groups_y - 1);
+  return group_y * groups_x + group_x;
+}
+
 struct GradientScratch {
   std::array<std::vector<double>, kNumCh> pi_cache;
   std::array<std::vector<double>, kNumCh> rho_cache;
@@ -158,6 +189,10 @@ struct GradientScratch {
   std::vector<double> nz_T_kp;
   std::vector<double> nz_diff_event_kp;
   std::vector<double> block_D;
+  std::vector<double> pass_mass;
+  std::vector<double> pass_mass_grad;
+  std::vector<double> pass_group_mass;
+  std::vector<double> pass_group_mass_grad;
   Histogram overhead_hist;
 
   GradientScratch(const JPEGOptData& d, const GradientAux& aux,
@@ -176,6 +211,7 @@ struct GradientScratch {
     const size_t num_cells = n_axis[0] * n_axis[1] * n_axis[2];
     const size_t cp_count = num_clusters * num_passes;
     const size_t ac_alpha = d.ACHistogramSize();
+    const size_t pass_group_count = GradientPassGroupCount(d);
 
     for (uint32_t c = 0; c < kNumCh; ++c) {
       const size_t nb = (c < d.channels) ? d.num_blocks[c] : 0;
@@ -217,6 +253,10 @@ struct GradientScratch {
     nz_T_kp.resize(cp_count);
     nz_diff_event_kp.resize(cp_count);
     block_D.resize(num_clusters);
+    pass_mass.resize(num_passes);
+    pass_mass_grad.resize(num_passes);
+    pass_group_mass.resize(num_passes * pass_group_count);
+    pass_group_mass_grad.resize(num_passes * pass_group_count);
     overhead_hist.EnsureCapacity(kJPEGNonZeroRange);
   }
 };

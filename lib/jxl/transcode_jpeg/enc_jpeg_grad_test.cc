@@ -754,6 +754,39 @@ TEST(JpegGradTest, RoundToHardAssignmentCompactsClusterHoles) {
   ExpectDenseClusters(rounded);
 }
 
+TEST(JpegGradTest, RoundToHardAssignmentCompactsPassHolesWithGates) {
+  std::shared_ptr<JPEGOptData> opt_data =
+      BuildOptDataFromFixture(JPEGTranscodeACModel::kToken420);
+  ASSERT_NE(opt_data, nullptr);
+
+  GradientState state;
+  state.num_passes = 4;
+  state.pass_gates = {2.0, -2.0, 1.0, -3.0};
+  state.num_clusters = 1;
+  state.num_cells = 1;
+  for (uint32_t c = 0; c < kNumCh; ++c) {
+    const uint32_t nb = opt_data->num_blocks[c];
+    state.pass_logits[c].assign(nb * state.num_passes, -1.0);
+    for (uint32_t b = 0; b < nb; ++b) {
+      const uint32_t p = (b & 1) == 0 ? 0 : 2;
+      state.pass_logits[c][b * state.num_passes + p] = 5.0;
+    }
+    if (c < opt_data->channels) {
+      state.cluster_logits[c].assign(state.num_cells * state.num_clusters, 0.0);
+    }
+  }
+
+  const PassSearchResult rounded = RoundToHardAssignment(*opt_data, state);
+  EXPECT_EQ(rounded.num_passes, 2u);
+  for (uint32_t c = 0; c < opt_data->channels; ++c) {
+    const uint32_t nb = opt_data->num_blocks[c];
+    ASSERT_EQ(rounded.pass_assignment[c].size(), nb);
+    for (uint32_t b = 0; b < nb; ++b) {
+      EXPECT_EQ(rounded.pass_assignment[c][b], (b & 1) == 0 ? 0u : 1u);
+    }
+  }
+}
+
 // Iteration 6: parallel sweep over MaximalFactorizations. The smoke test runs
 // the full orchestrator with a modest iteration budget on a small fixture.
 // This validates plumbing end-to-end. Deeper correctness is covered by the

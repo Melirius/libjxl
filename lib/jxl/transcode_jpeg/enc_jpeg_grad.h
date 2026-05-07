@@ -11,6 +11,8 @@
 //                         real-valued (mapped back to int16_t DC values when
 //                         collapsing to a hard `PassSearchResult`).
 //   - `pass_logits`     — per-block pre-softmax pass weights.
+//   - `pass_gates`      — optional global pass logits, used by auto-pass-count
+//                         optimization to make empty passes disappear smoothly.
 //   - `cluster_logits`  — per-(channel, cell) pre-softmax cluster weights.
 // Each bundle has its own sigmoid/softmax temperature; annealing all three
 // to ~0 collapses the soft state back to a hard one-hot assignment.
@@ -19,15 +21,16 @@
 // block of `JPEGOptData`, applies the three soft membership weights, and
 // reduces to AC entropy + NZ entropy + signalling overhead. Counts match the
 // existing `EvaluatePassAwareModel` at temperatures -> 0; gradient flows
-// analytically through entropy terms, signalling overhead is held constant.
+// analytically through entropy and the smooth auto-P occupancy overhead.
 //
 // `RunGradientSolve` is the inner Adam + annealing loop for a single
-// `(factorization, num_passes)` configuration.
+// factorization configuration.
 // `SearchGradientContextModel` is the public entry point used by
 // `enc_jpeg_frame.cc` when `effort.use_gradient_joint_search` is set: it
-// sweeps `(factorization, num_passes)` tuples in parallel, rounds each state to
-// a hard `PassSearchResult`, rescores it with the biclustering hard evaluator,
-// and returns the result with the lowest final hard cost.
+// sweeps fixed-P `(factorization, num_passes)` tuples or, in auto-P mode, runs
+// one Pmax solve per factorization, rounds each state to a hard
+// `PassSearchResult`, rescores it with the biclustering hard evaluator, and
+// returns the result with the lowest final hard cost.
 
 #ifndef LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_
 #define LIB_JXL_TRANSCODE_JPEG_ENC_JPEG_GRAD_H_
@@ -78,6 +81,11 @@ struct GradientState {
   // soft pass-assignment weight `pi_{b,p}`. Sizes: `pass_logits[c]` has length
   // `num_blocks[c] * num_passes` in row-major (block-major) order.
   std::array<std::vector<double>, kNumCh> pass_logits;
+
+  // Optional global pass logits added to every block's pass logits before the
+  // softmax. Empty means fixed-P legacy behavior. Size is `num_passes` when
+  // auto-pass-count optimization is enabled.
+  std::vector<double> pass_gates;
 
   // Softmax temperature for pass assignment. As `pass_temperature -> 0+`,
   // softmax collapses to one-hot argmax.
@@ -170,8 +178,9 @@ struct SoftCostResult {
   double nz_cost_bits = 0.0;
 
   // Signalling overhead estimate: ANS-population-minus-Shannon for the actual
-  // AC histograms selected from the `H` budget and for NZ slots, plus a flat
-  // per-pass overhead. Treated as constant for gradient purposes.
+  // AC histograms selected from the `H` budget and for NZ slots, plus pass
+  // overhead. Histogram signalling is held constant for gradient purposes; the
+  // optional auto-pass-count overhead is smooth and differentiated.
   double signalling_overhead_bits = 0.0;
 
   // Sum of the three components.
@@ -187,6 +196,7 @@ struct SoftCostResult {
 struct GradientGrad {
   std::array<std::vector<double>, kNumCh> thresholds;
   std::array<std::vector<double>, kNumCh> pass_logits;
+  std::vector<double> pass_gates;
   std::array<std::vector<double>, kNumCh> cluster_logits;
   std::vector<double> ctx_logits;  // flat, same layout as GradientState
 
@@ -198,6 +208,7 @@ struct GradientGrad {
       pass_logits[a].assign(state.pass_logits[a].size(), 0.0);
       cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
     }
+    pass_gates.assign(state.pass_gates.size(), 0.0);
     ctx_logits.assign(state.ctx_logits.size(), 0.0);
   }
 };
@@ -210,6 +221,8 @@ struct AdamState {
   std::array<std::vector<double>, kNumCh> v_thresholds;
   std::array<std::vector<double>, kNumCh> m_logits;
   std::array<std::vector<double>, kNumCh> v_logits;
+  std::vector<double> m_pass_gates;
+  std::vector<double> v_pass_gates;
   std::array<std::vector<double>, kNumCh> m_cluster_logits;
   std::array<std::vector<double>, kNumCh> v_cluster_logits;
   std::vector<double> m_ctx_logits;  // flat, same layout as GradientState
@@ -226,6 +239,8 @@ struct AdamState {
       m_cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
       v_cluster_logits[a].assign(state.cluster_logits[a].size(), 0.0);
     }
+    m_pass_gates.assign(state.pass_gates.size(), 0.0);
+    v_pass_gates.assign(state.pass_gates.size(), 0.0);
     m_ctx_logits.assign(state.ctx_logits.size(), 0.0);
     v_ctx_logits.assign(state.ctx_logits.size(), 0.0);
   };
@@ -292,8 +307,10 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d,
 //                      `d.channels * state.num_cells`.
 //   - Thresholds:      rounded in DC-index space, projected to strictly
 //                      increasing, then mapped to actual `int16_t` DC values.
-//   - `num_passes` is copied from `state`; `num_clusters` is compacted to the
-//     number of actually used hard clusters, so `ctx_map` ids are dense.
+//   - `num_passes` is copied from `state`, unless auto-pass-count gates are
+//     enabled; in that case unused hard pass ids are compacted away.
+//   - `num_clusters` is compacted to the number of actually used hard clusters,
+//     so `ctx_map` ids are dense.
 PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
                                        const GradientState& state);
 
@@ -306,8 +323,8 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
 GradientState InitGradientStateFromFactorization(
     const JPEGOptData& d, const Factorization& f, uint32_t num_passes,
     uint32_t num_clusters, double threshold_temperature,
-    double pass_temperature, double cluster_temperature,
-    uint32_t num_hists = 1);
+    double pass_temperature, double cluster_temperature, uint32_t num_hists = 1,
+    bool optimize_pass_count = false);
 
 // Removes thresholds that don't actually separate clusters: for each axis,
 // scans thresholds and drops the ones whose adjacent buckets map to the
