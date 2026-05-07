@@ -196,6 +196,125 @@ inline double SmoothPassOccupancyOverheadBits(
   }
   return bits;
 }
+
+// Smooth surrogate for ANS histogram signalling. The hard cost is a discrete
+// function of rounded counts, so it gives Adam no signal for pass pruning. This
+// prices two continuous events instead: making a histogram non-empty and making
+// each symbol present in that histogram. The final candidate selection still
+// uses the real rounded hard cost.
+constexpr double kSmoothHistMassTau = 1.0;
+constexpr double kSmoothHistSymbolTau = 1.0;
+constexpr double kSmoothHistBaseBits = 6.0;
+constexpr double kSmoothHistSymbolBits = 1.0;
+constexpr double kSmoothHistTouchedEps = 1e-9;
+
+template <typename ValueAt>
+double SmoothHistogramOverheadBits(uint32_t num_symbols, ValueAt value_at,
+                                   bool* touched) {
+  double mass = 0.0;
+  for (uint32_t i = 0; i < num_symbols; ++i) {
+    mass += std::max(0.0, value_at(i));
+  }
+  if (touched != nullptr && mass > kSmoothHistTouchedEps) *touched = true;
+
+  double bits = kSmoothHistBaseBits * SmoothAlive(mass, kSmoothHistMassTau);
+  for (uint32_t i = 0; i < num_symbols; ++i) {
+    bits += kSmoothHistSymbolBits *
+            SmoothAlive(std::max(0.0, value_at(i)), kSmoothHistSymbolTau);
+  }
+  return bits;
+}
+
+template <typename ValueAt, typename AddGrad>
+void AddSmoothHistogramOverheadGradient(uint32_t num_symbols, ValueAt value_at,
+                                        AddGrad add_grad) {
+  double mass = 0.0;
+  for (uint32_t i = 0; i < num_symbols; ++i) {
+    mass += std::max(0.0, value_at(i));
+  }
+  const double mass_grad =
+      kSmoothHistBaseBits * SmoothAlivePrime(mass, kSmoothHistMassTau);
+  for (uint32_t i = 0; i < num_symbols; ++i) {
+    const double v = std::max(0.0, value_at(i));
+    const double symbol_grad =
+        kSmoothHistSymbolBits * SmoothAlivePrime(v, kSmoothHistSymbolTau);
+    add_grad(i, mass_grad + symbol_grad);
+  }
+}
+
+double SmoothACSignallingOverheadBits(const double* ctx_h, uint32_t num_passes,
+                                      uint32_t H, uint32_t* touched_slots) {
+  double bits = 0.0;
+  for (uint32_t p = 0; p < num_passes; ++p) {
+    for (uint32_t h = 0; h < H; ++h) {
+      bool touched = false;
+      const size_t p_off = p * kACTokenCount * H;
+      bits += SmoothHistogramOverheadBits(
+          kACTokenCount, [&](uint32_t token) {
+            return ctx_h[p_off + token * H + h];
+          },
+          &touched);
+      if (touched) ++*touched_slots;
+    }
+  }
+  return bits;
+}
+
+void AddSmoothACSignallingOverheadGradient(const double* ctx_h,
+                                           uint32_t num_passes, uint32_t H,
+                                           double* dL_dctx_h) {
+  for (uint32_t p = 0; p < num_passes; ++p) {
+    for (uint32_t h = 0; h < H; ++h) {
+      const size_t p_off = p * kACTokenCount * H;
+      AddSmoothHistogramOverheadGradient(
+          kACTokenCount,
+          [&](uint32_t token) { return ctx_h[p_off + token * H + h]; },
+          [&](uint32_t token, double g) {
+            dL_dctx_h[p_off + token * H + h] += g;
+          });
+    }
+  }
+}
+
+double SmoothNZSignallingOverheadBits(const double* nz_h, uint32_t num_passes,
+                                      uint32_t num_clusters) {
+  double bits = 0.0;
+  for (uint32_t p = 0; p < num_passes; ++p) {
+    for (uint32_t k = 0; k < num_clusters; ++k) {
+      for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+        bits += SmoothHistogramOverheadBits(
+            kJPEGNonZeroRange, [&](uint32_t nz) {
+              const uint32_t bin = NZHistogramIndex(pb, nz);
+              return nz_h[(bin * num_passes + p) * num_clusters + k];
+            },
+            nullptr);
+      }
+    }
+  }
+  return bits;
+}
+
+void AddSmoothNZSignallingOverheadGradient(const double* nz_h,
+                                           uint32_t num_passes,
+                                           uint32_t num_clusters,
+                                           double* dL_dnz_event) {
+  for (uint32_t p = 0; p < num_passes; ++p) {
+    for (uint32_t k = 0; k < num_clusters; ++k) {
+      for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+        AddSmoothHistogramOverheadGradient(
+            kJPEGNonZeroRange,
+            [&](uint32_t nz) {
+              const uint32_t bin = NZHistogramIndex(pb, nz);
+              return nz_h[(bin * num_passes + p) * num_clusters + k];
+            },
+            [&](uint32_t nz, double g) {
+              const uint32_t bin = NZHistogramIndex(pb, nz);
+              dL_dnz_event[(bin * num_passes + p) * num_clusters + k] += g;
+            });
+      }
+    }
+  }
+}
 }  // namespace
 
 // Forward + optional backward. Shared body for all public entry points.
@@ -451,17 +570,24 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
                    SoftFTabReduceVecFast(nz_h.data(), nz_h.size());
   double overhead_bits = 0.0;
   uint32_t touched_slots = 0;
-  for (uint32_t p = 0; p < num_passes; ++p) {
-    for (uint32_t h = 0; h < H; ++h) {
-      overhead_bits += ACSignallingOverheadBits(
-          ctx_h.data(), p, h, H, &touched_slots, &work.overhead_hist);
+  if (optimize_pass_count) {
+    overhead_bits += SmoothACSignallingOverheadBits(ctx_h.data(), num_passes,
+                                                    H, &touched_slots);
+    overhead_bits += SmoothNZSignallingOverheadBits(nz_h.data(), num_passes,
+                                                    num_clusters);
+  } else {
+    for (uint32_t p = 0; p < num_passes; ++p) {
+      for (uint32_t h = 0; h < H; ++h) {
+        overhead_bits += ACSignallingOverheadBits(
+            ctx_h.data(), p, h, H, &touched_slots, &work.overhead_hist);
+      }
+    }
+    for (size_t slot = 0; slot < cp_count; ++slot) {
+      overhead_bits += NZSignallingOverheadBits(nz_h.data(), slot, cp_count,
+                                                &work.overhead_hist);
     }
   }
   result.num_cp_slots = touched_slots;
-  for (size_t slot = 0; slot < cp_count; ++slot) {
-    overhead_bits += NZSignallingOverheadBits(nz_h.data(), slot, cp_count,
-                                              &work.overhead_hist);
-  }
   if (optimize_pass_count) {
     overhead_bits += SmoothPassOccupancyOverheadBits(
         pass_mass, pass_group_mass, num_passes, pass_group_count, tau_pass,
@@ -486,6 +612,10 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
   SoftFTabPrimeVecFast(ctx_N.data(), dL_dctx_N.data(), num_passes * H);
   SoftFTabPrimeNegVecFast(ctx_h.data(), dL_dctx_h.data(),
                           num_passes * kACTokenCount * H);
+  if (optimize_pass_count) {
+    AddSmoothACSignallingOverheadGradient(ctx_h.data(), num_passes, H,
+                                          dL_dctx_h.data());
+  }
 
   // Propagate through `sigma` to get `dL/dh`, `dL/dN`, and `dL/dsigma`.
   JXL_DASSERT(grad->ctx_logits.size() == state.ctx_logits.size());
@@ -535,6 +665,10 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
   std::vector<double>& dL_dnz_event = work.dL_dnz_event;
   SoftFTabPrimeVecFast(nz_N.data(), dL_dnz_N.data(), nz_N.size());
   SoftFTabPrimeNegVecFast(nz_h.data(), dL_dnz_event.data(), nz_h.size());
+  if (optimize_pass_count) {
+    AddSmoothNZSignallingOverheadGradient(nz_h.data(), num_passes,
+                                          num_clusters, dL_dnz_event.data());
+  }
   for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
     for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
       const uint32_t bin = NZHistogramIndex(pb, nz);

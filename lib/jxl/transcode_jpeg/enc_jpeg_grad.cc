@@ -228,6 +228,36 @@ uint32_t CompactHardClusters(PassSearchResult* result) {
   return result->num_clusters;
 }
 
+uint32_t CompactHardPasses(PassSearchResult* result) {
+  std::array<bool, 256> used{};
+  for (const auto& pass_assignment : result->pass_assignment) {
+    for (uint8_t pass : pass_assignment) {
+      JXL_DASSERT(pass < result->num_passes);
+      used[pass] = true;
+    }
+  }
+
+  std::array<uint8_t, 256> remap{};
+  uint32_t next = 0;
+  for (uint32_t pass = 0; pass < result->num_passes; ++pass) {
+    if (!used[pass]) continue;
+    JXL_DASSERT(next <= std::numeric_limits<uint8_t>::max());
+    remap[pass] = static_cast<uint8_t>(next++);
+  }
+  if (next == 0) {
+    result->num_passes = 1;
+    return result->num_passes;
+  }
+
+  for (auto& pass_assignment : result->pass_assignment) {
+    for (uint8_t& pass : pass_assignment) {
+      pass = remap[pass];
+    }
+  }
+  result->num_passes = next;
+  return result->num_passes;
+}
+
 struct GradientRaceDecision {
   double best_cost_bits = std::numeric_limits<double>::infinity();
   uint32_t global_rank = std::numeric_limits<uint32_t>::max();
@@ -625,7 +655,6 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
   // Argmax pass assignment per block. When auto-pass-count gates are present,
   // they participate in hardening and unused pass ids are compacted away after
   // all blocks have been assigned.
-  std::vector<uint8_t> pass_seen(num_passes, 0);
   for (uint32_t c = 0; c < kNumCh; ++c) {
     const uint32_t nb = (c < d.channels) ? d.num_blocks[c] : 0u;
     r.pass_assignment[c].assign(nb, 0);
@@ -643,26 +672,10 @@ PassSearchResult RoundToHardAssignment(const JPEGOptData& d,
         }
       }
       r.pass_assignment[c][b] = static_cast<uint8_t>(best);
-      pass_seen[best] = 1;
     }
   }
   if (compact_passes && num_passes > 1) {
-    std::vector<uint8_t> pass_remap(num_passes, 0);
-    uint32_t used_passes = 0;
-    for (uint32_t p = 0; p < num_passes; ++p) {
-      if (!pass_seen[p]) continue;
-      pass_remap[p] = static_cast<uint8_t>(used_passes++);
-    }
-    if (used_passes == 0) {
-      pass_remap[0] = 0;
-      used_passes = 1;
-    }
-    for (uint32_t c = 0; c < kNumCh; ++c) {
-      for (uint8_t& p : r.pass_assignment[c]) {
-        p = pass_remap[p];
-      }
-    }
-    r.num_passes = used_passes;
+    CompactHardPasses(&r);
   }
   CompactHardClusters(&r);
   return r;
@@ -819,6 +832,107 @@ Status RefreshHardCostWithBiclusterModel(const JPEGOptData& d,
   result->signalling_overhead = eval.signalling_overhead;
   result->total_cost = eval.total_cost();
   return true;
+}
+
+StatusOr<ModelEvaluation> EvaluateHardPassResult(const JPEGOptData& d,
+                                                 const ActiveRawBins& active,
+                                                 PassSearchResult* result) {
+  CompactHardPasses(result);
+  std::vector<uint32_t> pass_offsets;
+  JXL_ASSIGN_OR_RETURN(
+      std::vector<ACEntry> pass_stream,
+      BuildPassStream(d, active, result->pass_assignment, result->num_passes,
+                      &pass_offsets, /*pool=*/nullptr));
+  return EvaluatePassAwareModel(d, result->thresholds, result->ctx_map,
+                                result->num_clusters, result->pass_assignment,
+                                result->num_passes, pass_stream, pass_offsets);
+}
+
+StatusOr<uint32_t> ReducePassesAgglomerative(const JPEGOptData& d,
+                                             PassSearchResult* result) {
+  constexpr uint32_t kSourcePassCandidates = 3;
+  CompactHardPasses(result);
+  if (result->num_passes <= 1) return uint32_t{0};
+
+  const ActiveRawBins active = BuildActiveRawBins(d);
+  JXL_ASSIGN_OR_RETURN(ModelEvaluation current_eval,
+                       EvaluateHardPassResult(d, active, result));
+  FixedPointCost current_cost = current_eval.total_cost();
+  uint32_t current_P = result->num_passes;
+  PassAssignment working_assignment = result->pass_assignment;
+  uint32_t merges = 0;
+
+  while (current_P > 1) {
+    std::vector<uint32_t> pass_blocks(current_P, 0);
+    for (const auto& pass_assignment : working_assignment) {
+      for (uint8_t pass : pass_assignment) ++pass_blocks[pass];
+    }
+    std::vector<uint32_t> source_order(current_P);
+    for (uint32_t p = 0; p < current_P; ++p) source_order[p] = p;
+    std::sort(source_order.begin(), source_order.end(),
+              [&](uint32_t a, uint32_t b) {
+                if (pass_blocks[a] != pass_blocks[b]) {
+                  return pass_blocks[a] < pass_blocks[b];
+                }
+                return a > b;
+              });
+
+    bool found_merge = false;
+    FixedPointCost best_cost = current_cost;
+    ModelEvaluation best_eval = current_eval;
+    PassAssignment best_assignment = working_assignment;
+    uint32_t best_P = current_P;
+
+    const uint32_t sources_to_try =
+        std::min<uint32_t>(kSourcePassCandidates, current_P);
+    for (uint32_t rank = 0; rank < sources_to_try; ++rank) {
+      const uint32_t src = source_order[rank];
+      for (uint32_t dst = 0; dst < current_P; ++dst) {
+        if (src == dst) continue;
+
+        PassSearchResult trial = *result;
+        trial.pass_assignment = working_assignment;
+        trial.num_passes = current_P;
+        for (auto& pass_assignment : trial.pass_assignment) {
+          for (uint8_t& pass : pass_assignment) {
+            if (pass == src) pass = static_cast<uint8_t>(dst);
+          }
+        }
+        CompactHardPasses(&trial);
+        if (trial.num_passes >= current_P) continue;
+
+        JXL_ASSIGN_OR_RETURN(ModelEvaluation eval,
+                             EvaluateHardPassResult(d, active, &trial));
+        const FixedPointCost trial_cost = eval.total_cost();
+        if (trial_cost < best_cost) {
+          found_merge = true;
+          best_cost = trial_cost;
+          best_eval = eval;
+          best_assignment = std::move(trial.pass_assignment);
+          best_P = trial.num_passes;
+        }
+      }
+    }
+
+    if (!found_merge) break;
+    working_assignment = std::move(best_assignment);
+    current_eval = best_eval;
+    current_cost = best_cost;
+    current_P = best_P;
+    result->pass_assignment = working_assignment;
+    result->num_passes = current_P;
+    ++merges;
+  }
+
+  if (merges > 0) {
+    result->pass_assignment = std::move(working_assignment);
+    result->num_passes = current_P;
+    result->ac_cost = current_eval.ac_cost;
+    result->nz_cost = current_eval.nz_cost;
+    result->signalling_overhead = current_eval.signalling_overhead;
+    result->total_cost = current_eval.total_cost();
+  }
+  return merges;
 }
 
 }  // namespace
@@ -1143,7 +1257,7 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
         slots[idx].valid = true;
         if (optimize_pass_count) {
           fprintf(stderr,
-                  "PLANNER: [gradient] [(%u,%u,%u) Pmax=%u] Final pass "
+                  "PLANNER: [gradient] [(%u,%u,%u) Pmax=%u] Rounded pass "
                   "count: %u\n",
                   f[0], f[1], f[2], num_passes, slots[idx].num_passes);
           fflush(stderr);
@@ -1194,9 +1308,36 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
                   T0.size() + 1, T1.size() + 1, T2.size() + 1);
           fflush(stderr);
         }
+        if (optimize_pass_count) {
+          auto pass_merges_or = ReducePassesAgglomerative(d, &slots[idx].result);
+          if (pass_merges_or.ok()) {
+            const uint32_t pass_merges = std::move(pass_merges_or).value_();
+            if (pass_merges > 0) {
+              slots[idx].num_passes = slots[idx].result.num_passes;
+              slots[idx].final_cost_bits =
+                  static_cast<double>(slots[idx].result.total_cost) /
+                  static_cast<double>(kFScale);
+              fprintf(stderr,
+                      "PLANNER: [gradient] [(%u,%u,%u) P=%u] "
+                      "Agglomerative pass reduction: %u passes dropped, "
+                      "final_cost=%.2f bits\n",
+                      f[0], f[1], f[2], slots[idx].result.num_passes,
+                      pass_merges, slots[idx].final_cost_bits);
+              fflush(stderr);
+            }
+          }
+        }
         JXL_RETURN_IF_ERROR(RefreshHardCostWithBiclusterModel(
             d, effort.bicluster_proto_budget_per_pass, &slots[idx].result));
         slots[idx].final_cost_bits = bit_cost(slots[idx].result.total_cost);
+        slots[idx].num_passes = slots[idx].result.num_passes;
+        if (optimize_pass_count) {
+          fprintf(stderr,
+                  "PLANNER: [gradient] [(%u,%u,%u) Pmax=%u] Final pass "
+                  "count: %u\n",
+                  f[0], f[1], f[2], num_passes, slots[idx].num_passes);
+          fflush(stderr);
+        }
         return true;
       },
       "JpegCtxGradSweep"));
