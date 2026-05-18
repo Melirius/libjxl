@@ -159,38 +159,63 @@ inline double SmoothAlivePrime(double mass, double tau) {
   return std::exp(-mass / tau) / tau;
 }
 
+constexpr double kSmoothPassHeaderBits = 64000.0;
+constexpr double kSmoothPassGroupBits = 64.0;
+constexpr double kSmoothPassMassTau = 0.10;
+constexpr double kSmoothPassOrderBias = 0.75;
+
 inline size_t TotalChannelBlocks(const JPEGOptData& d) {
   size_t total = 0;
   for (uint32_t c = 0; c < d.channels; ++c) total += d.num_blocks[c];
   return total;
 }
 
+inline double SmoothLogAlive(double mass, double full_mass) {
+  if (mass <= 0.0) return 0.0;
+  const double denom =
+      std::log1p(std::max(1.0, full_mass) / kSmoothPassMassTau);
+  return std::log1p(mass / kSmoothPassMassTau) / denom;
+}
+
+inline double SmoothLogAlivePrime(double mass, double full_mass) {
+  const double denom =
+      std::log1p(std::max(1.0, full_mass) / kSmoothPassMassTau);
+  return 1.0 / ((mass + kSmoothPassMassTau) * denom);
+}
+
+inline double SmoothPassOrderWeight(uint32_t pass) {
+  return 1.0 + kSmoothPassOrderBias * static_cast<double>(pass);
+}
+
 inline double SmoothPassOccupancyOverheadBits(
     const std::vector<double>& pass_mass,
     const std::vector<double>& pass_group_mass, uint32_t num_passes,
-    uint32_t pass_group_count, double tau_pass, double tau_group,
+    uint32_t pass_group_count, double total_blocks, double group_blocks,
     std::vector<double>* pass_mass_grad,
     std::vector<double>* pass_group_mass_grad) {
-  constexpr double kPassHeaderBits = 64000.0;
-  constexpr double kPassGroupBits = 64.0;
   double bits = 0.0;
   if (pass_mass_grad != nullptr) {
     pass_mass_grad->resize(num_passes);
     pass_group_mass_grad->resize(num_passes * pass_group_count);
   }
   for (uint32_t p = 0; p < num_passes; ++p) {
+    const double pass_weight = SmoothPassOrderWeight(p);
     const double mass = pass_mass[p];
-    bits += kPassHeaderBits * SmoothAlive(mass, tau_pass);
+    bits += pass_weight * kSmoothPassHeaderBits *
+            SmoothLogAlive(mass, total_blocks);
     if (pass_mass_grad != nullptr) {
-      (*pass_mass_grad)[p] = kPassHeaderBits * SmoothAlivePrime(mass, tau_pass);
+      (*pass_mass_grad)[p] = pass_weight * kSmoothPassHeaderBits *
+                             SmoothLogAlivePrime(mass, total_blocks);
     }
     for (uint32_t g = 0; g < pass_group_count; ++g) {
       const size_t idx = p * pass_group_count + g;
       const double group_mass = pass_group_mass[idx];
-      bits += kPassGroupBits * SmoothAlive(group_mass, tau_group);
+      bits += pass_weight * kSmoothPassGroupBits *
+              SmoothLogAlive(group_mass, group_blocks);
       if (pass_group_mass_grad != nullptr) {
-        (*pass_group_mass_grad)[idx] =
-            kPassGroupBits * SmoothAlivePrime(group_mass, tau_group);
+        (*pass_group_mass_grad)[idx] = pass_weight * kSmoothPassGroupBits *
+                                       SmoothLogAlivePrime(group_mass,
+                                                           group_blocks);
       }
     }
   }
@@ -359,10 +384,8 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
       optimize_pass_count ? state.pass_gates.data() : nullptr;
   const uint32_t pass_group_count = GradientPassGroupCount(d);
   const double total_blocks = static_cast<double>(TotalChannelBlocks(d));
-  const double tau_pass =
-      std::max(1.0, total_blocks / static_cast<double>(num_passes));
-  const double tau_group = std::max(
-      1.0, total_blocks / static_cast<double>(pass_group_count * num_passes));
+  const double group_blocks =
+      std::max(1.0, total_blocks / static_cast<double>(pass_group_count));
   JXL_DASSERT(ac_hist.dense_to_zdc.size() == ac_alpha);
   JXL_DASSERT(ac_hist.dense_to_token.size() == ac_alpha);
   for (uint32_t c = 0; c < d.channels; ++c) {
@@ -401,8 +424,9 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
             GradientPassGroupIndex(d, c, static_cast<uint32_t>(b));
         const double* pi = &pi_cache[c][b * num_passes];
         for (uint32_t p = 0; p < num_passes; ++p) {
-          pass_mass[p] += pi[p];
-          pass_group_mass[p * pass_group_count + group] += pi[p];
+          const double pi_p = pi[p];
+          pass_mass[p] += pi_p;
+          pass_group_mass[p * pass_group_count + group] += pi_p;
         }
       }
     }
@@ -590,8 +614,8 @@ SoftCostResult SoftForwardBackwardManyPassImpl(const JPEGOptData& d,
   result.num_cp_slots = touched_slots;
   if (optimize_pass_count) {
     overhead_bits += SmoothPassOccupancyOverheadBits(
-        pass_mass, pass_group_mass, num_passes, pass_group_count, tau_pass,
-        tau_group, grad == nullptr ? nullptr : &work.pass_mass_grad,
+        pass_mass, pass_group_mass, num_passes, pass_group_count, total_blocks,
+        group_blocks, grad == nullptr ? nullptr : &work.pass_mass_grad,
         grad == nullptr ? nullptr : &work.pass_group_mass_grad);
   } else {
     overhead_bits += FlatPassOverheadBits(d) * num_passes;

@@ -746,7 +746,7 @@ GradientState InitGradientStateFromFactorization(
     // for every block at once. The tiny descending bias breaks exact symmetry;
     // the per-block logits above still provide spatial variety when extra
     // passes pay for themselves.
-    constexpr double kPassGateSymmetryBreak = 0.05;
+    constexpr double kPassGateSymmetryBreak = 0.20;
     state.pass_gates.resize(num_passes);
     for (uint32_t p = 0; p < num_passes; ++p) {
       state.pass_gates[p] = -kPassGateSymmetryBreak * p;
@@ -1231,7 +1231,7 @@ StatusOr<PassSearchResult> SearchGradientContextModel(
 
   auto start_sweep = PlannerClock::now();
   JXL_RETURN_IF_ERROR(RunOnPool(
-      pool, 0, total_workers, ThreadPool::NoInit,
+      /*pool*/nullptr, 0, total_workers, ThreadPool::NoInit,
       [&](uint32_t idx, size_t /*thread_id*/) -> Status {
         const uint32_t num_passes = optimize_pass_count
                                         ? max_passes
