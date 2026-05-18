@@ -355,15 +355,14 @@ struct CompressArgs {
         &jpeg_reconstruction_cfl, &ParseOverride, 3);
 
     cmdline->AddOptionValue(
-        '\0', "jpeg_optimize_passes", "0|1",
-        "Disable/enable pass-aware optimization for lossless JPEG "
-        "recompression.\n"
-        "    When enabled, the encoder uses spatial passes with zero shifts\n"
-        "    driven by the pass-aware context model search.\n"
-        "    Incompatible with --progressive, --qprogressive_ac, and "
-        "--responsive.\n"
-        "    0 = disable. 1 = enable. EXPERIMENTAL.",
-        &jpeg_optimize_passes, &ParseOverride, 3);
+        '\0', "jpeg_optimize_passes_num", "PASSES",
+        "Configure pass-aware optimization for lossless JPEG recompression.\n"
+        "    -1 = disable (default).\n"
+        "    0 = let the planner choose automatically.\n"
+        "    1..11 = force exactly that many passes.\n"
+        "    Incompatible with --progressive, --qprogressive_ac, and\n"
+        "    --responsive. EXPERIMENTAL.",
+        &jpeg_optimize_passes_num, &ParseInt64, 3);
 
     cmdline->AddOptionValue('\0', "num_reps", "REPS",
                             "How many times to compress, for benchmarking.",
@@ -529,7 +528,7 @@ struct CompressArgs {
   int32_t premultiply = -1;
   bool already_downsampled = false;
   jxl::Override jpeg_reconstruction_cfl = jxl::Override::kDefault;
-  jxl::Override jpeg_optimize_passes = jxl::Override::kDefault;
+  int64_t jpeg_optimize_passes_num = -1;
   jxl::Override modular = jxl::Override::kDefault;
   jxl::Override keep_invisible = jxl::Override::kDefault;
   jxl::Override dots = jxl::Override::kDefault;
@@ -903,16 +902,19 @@ void ProcessFlags(const jxl::extras::Codec codec,
                     JXL_ENC_FRAME_SETTING_JPEG_RECON_CFL, params);
     ProcessBoolFlag(args->compress_boxes,
                     JXL_ENC_FRAME_SETTING_JPEG_COMPRESS_BOXES, params);
-    if (args->jpeg_optimize_passes == jxl::Override::kOn) {
+    if (args->jpeg_optimize_passes_num >= 0) {
       if (args->progressive || args->qprogressive_ac ||
           args->responsive == 1) {
-        std::cerr << "--jpeg_optimize_passes=1 is incompatible with "
+        std::cerr << "--jpeg_optimize_passes_num >= 0 is incompatible with "
                      "--progressive, --qprogressive_ac, and --responsive.\n";
         exit(EXIT_FAILURE);
       }
     }
-    ProcessBoolFlag(args->jpeg_optimize_passes,
-                    JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES, params);
+    ProcessFlag<int64_t>(
+        "jpeg_optimize_passes_num", args->jpeg_optimize_passes_num,
+        JXL_ENC_FRAME_SETTING_JPEG_OPTIMIZE_PASSES_NUM, params,
+        [](int64_t x) { return -1 <= x && x <= 11; },
+        "Valid range is {-1, ..., 11}. Use -1 to disable and 0 for auto.");
   }
   // Set per-frame options.
   for (size_t num_frame = 0; num_frame < ppf.num_frames(); ++num_frame) {
@@ -1213,13 +1215,13 @@ int main(int argc, char** argv) {
     }
   }
   if (!args.quiet) {
-    if (compressed_size < 100000) {
-      cmdline.VerbosePrintf(0, "Compressed to %" PRIuS " bytes ",
-                            compressed_size);
-    } else {
-      cmdline.VerbosePrintf(0, "Compressed to %.1f kB ",
-                            compressed_size * 0.001);
-    }
+    // if (compressed_size < 100000) {
+    cmdline.VerbosePrintf(0, "Compressed to %" PRIuS " bytes ",
+                          compressed_size);
+    // } else {
+    //   cmdline.VerbosePrintf(0, "Compressed to %.1f kB ",
+    //                         compressed_size * 0.001);
+    // }
     // For lossless jpeg-reconstruction, we don't print some stats, since we
     // don't have easy access to the image dimensions.
     if (args.container == jxl::Override::kOn) {
