@@ -202,7 +202,7 @@ namespace {
 constexpr uint32_t kGradientRaceWarmupIters = 10;
 constexpr uint32_t kGradientRaceCheckPeriod = 5;
 constexpr uint32_t kGradientRaceConsecutiveChecks = 2;
-constexpr uint32_t kGradientRaceGlobalKeep = 4;
+constexpr uint32_t kGradientRaceGlobalKeep = 4000;
 constexpr uint32_t kGradientRacePerPassKeepDuringHot = 2;
 constexpr double kGradientRaceAbandonRatio = 1.01;
 
@@ -438,6 +438,44 @@ void DumpFinalClusterLogits(const JPEGOptData& d, const GradientState& state,
   fflush(stderr);
 }
 
+void NormalizeGlobalGradients(const JPEGOptData& d, GradientGrad* grad) {
+  size_t N_total = 0;
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    N_total += d.num_blocks[c];
+  }
+  if (N_total == 0) return;
+
+  const double inv_N = 1.0 / static_cast<double>(N_total);
+
+  // 1. Thresholds
+  for (uint32_t a = 0; a < kNumCh; ++a) {
+    for (double& g : grad->thresholds[a]) {
+      g *= inv_N;
+    }
+  }
+
+  // 2. Global Pass Gates
+  for (double& g : grad->pass_gates) {
+    g *= inv_N;
+  }
+
+  // 3. Cluster Logits
+  for (uint32_t c = 0; c < d.channels; ++c) {
+    const double Nc = static_cast<double>(d.num_blocks[c]);
+    if (Nc > 0.0) {
+      const double inv_Nc = 1.0 / Nc;
+      for (double& g : grad->cluster_logits[c]) {
+        g *= inv_Nc;
+      }
+    }
+  }
+
+  // 4. Context Map Logits
+  for (double& g : grad->ctx_logits) {
+    g *= inv_N;
+  }
+}
+
 }  // namespace
 
 OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
@@ -487,6 +525,7 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
     grad.Reset(*state);
     auto start_fwd = PlannerClock::now();
     r = SoftForwardBackward(d, aux, *state, &grad, &scratch);
+    NormalizeGlobalGradients(d, &grad);
     auto end_fwd = PlannerClock::now();
     total_fwd_ns += ElapsedNanos(start_fwd, end_fwd);
 
@@ -506,6 +545,7 @@ OptimizeResult RunGradientSolve(const JPEGOptData& d, const GradientAux& aux,
         state->ApplyAnnealing(schedule, t + 1);
         grad.Reset(*state);
         r = SoftForwardBackward(d, aux, *state, &grad, &scratch);
+        NormalizeGlobalGradients(d, &grad);
       } else {
         r = ComputeSoftTotalCost(d, aux, *state, &scratch);
       }
