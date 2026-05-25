@@ -596,6 +596,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
     }
     MajoritySequentialImproved(&states, seq_stats);
     ++iter;
+    ++out.shared_timings.seq_iters;
     PrintMoveTableRow("seq-1", states, seq_drop_pct, kPctColumnWidth, seq_ns);
   }
 
@@ -628,6 +629,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
       }
       MajorityBatchImproved(&states, applied, new_costs);
       ++iter;
+      ++out.shared_timings.batch_iters;
       char label[32];
       std::snprintf(label, sizeof(label), "b-batch-%u", iter);
       PrintMoveTableRow(label, states, batch_drop_pct, kPctColumnWidth, batch_ns);
@@ -656,6 +658,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
       }
       const bool good_batch = MajorityBatchImproved(&states, applied, new_costs);
       ++iter;
+      ++out.shared_timings.batch_iters;
       char batch_label[32];
       std::snprintf(batch_label, sizeof(batch_label), "b-batch-%u", iter);
       PrintMoveTableRow(batch_label, states, batch_drop_pct, kPctColumnWidth, batch_ns);
@@ -679,6 +682,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
       }
       MajoritySequentialImproved(&states, seq_stats);
       ++iter;
+      ++out.shared_timings.seq_iters;
       char seq_label[32];
       std::snprintf(seq_label, sizeof(seq_label), "b-seq-%u", iter);
       PrintMoveTableRow(seq_label, states, seq_drop_pct, kPctColumnWidth, seq_ns);
@@ -700,6 +704,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
     }
     const bool good_seq = MajoritySequentialImproved(&states, seq_stats);
     ++iter;
+    ++out.shared_timings.seq_iters;
     char seq_label[32];
     std::snprintf(seq_label, sizeof(seq_label), "s-seq-%u", iter);
     PrintMoveTableRow(seq_label, states, seq_drop_pct, kPctColumnWidth, seq_ns);
@@ -736,6 +741,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
       }
       MajorityBatchImproved(&states, applied, new_costs);
       ++iter;
+      ++out.shared_timings.batch_iters;
       char batch_label[32];
       std::snprintf(batch_label, sizeof(batch_label), "s-batch-%u", iter);
       PrintMoveTableRow(batch_label, states, batch_drop_pct, kPctColumnWidth, batch_ns);
