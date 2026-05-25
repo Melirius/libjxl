@@ -51,6 +51,8 @@ struct PassAssignmentTimings {
   int64_t batch_ns = 0;
   int64_t sequential_ns = 0;
   int64_t total_ns = 0;
+  int32_t seq_iters = 0;
+  int32_t batch_iters = 0;
 };
 
 // Result of greedy pass assignment plus phase timings.

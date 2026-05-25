@@ -1803,9 +1803,11 @@ StatusOr<PassSearchResult> SearchPassAwareContextModel(
         AssignPassesGreedyAllK(d, active, min_passes, max_passes, pool));
     fprintf(stderr,
             "PLANNER: AssignPassesGreedyAllK took %.2f ms total "
-            "(batch %.2f ms, sequential %.2f ms)\n",
+            "(%i batch %.2f ms, %i sequential %.2f ms)\n",
             NanosToMs(assign_range_result->shared_timings.total_ns),
+            assign_range_result->shared_timings.batch_iters,
             NanosToMs(assign_range_result->shared_timings.batch_ns),
+            assign_range_result->shared_timings.seq_iters,
             NanosToMs(assign_range_result->shared_timings.sequential_ns));
     fflush(stderr);
   }
