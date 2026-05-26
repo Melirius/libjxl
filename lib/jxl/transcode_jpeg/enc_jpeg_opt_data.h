@@ -133,6 +133,7 @@ struct CompactACHistogramData {
 // AC coefficient entry in the packed event stream.
 using ACEntry = uint32_t;
 // Compact per-coefficient bin id stored in `block_bins`.
+// Max value is `3 * kMaxACSymbolCount` and does not fit into 16 bits.
 using ACBin = uint32_t;
 static_assert(kMaxACBinCount <=
                   static_cast<size_t>(std::numeric_limits<ACBin>::max()) + 1,

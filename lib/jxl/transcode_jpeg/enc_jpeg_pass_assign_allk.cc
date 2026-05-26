@@ -158,7 +158,7 @@ void PrintMoveTableRow(const char* label, const std::vector<MultiKState>& states
   for (size_t i = 0; i < states.size(); ++i) {
     fprintf(stderr, " %*.3f%%", column_width - 1, drop_pct[i]);
   }
-  fprintf(stderr, " %.3fms\n", NanosToMs(elapsed_ns));
+  fprintf(stderr, "  %gms\n", NanosToMs(elapsed_ns));
   fflush(stderr);
 }
 
@@ -390,21 +390,30 @@ std::vector<SequentialSweepResult> FusedSequentialIter(
 
 std::vector<uint32_t> FusedScoreBatchMoves(
     std::vector<MultiKState>* states, const std::vector<BlockRef>& active_blocks,
-    ThreadPool* pool) {
+    std::vector<std::vector<AssignScratch>>* scratch_pool, ThreadPool* pool) {
   const uint32_t num_chunks = static_cast<uint32_t>(
       (active_blocks.size() + kBatchChunkSize - 1) / kBatchChunkSize);
   std::vector<std::vector<uint32_t>> thread_moves;
-  std::vector<std::vector<AssignScratch>> scratch_pool;
   if (!RunOnPool(
           pool, 0, num_chunks,
           [&](size_t num_threads) -> Status {
             thread_moves.assign(num_threads,
                                 std::vector<uint32_t>(states->size(), 0));
-            scratch_pool.resize(num_threads);
-            for (size_t t = 0; t < num_threads; ++t) {
-              scratch_pool[t].reserve(states->size());
-              for (size_t k = 0; k < states->size(); ++k) {
-                scratch_pool[t].push_back((*states)[k].ctx.MakeScratch());
+            if (scratch_pool->size() < num_threads) {
+              scratch_pool->resize(num_threads);
+              for (size_t t = 0; t < num_threads; ++t) {
+                (*scratch_pool)[t].reserve(states->size());
+                for (auto & state : *states) {
+                  (*scratch_pool)[t].push_back(state.ctx.MakeScratch());
+                }
+              }
+            } else {
+              for (size_t t = 0; t < num_threads; ++t) {
+                for (size_t k = 0; k < states->size(); ++k) {
+                  std::fill((*scratch_pool)[t][k].czdc_counts.begin(),
+                            (*scratch_pool)[t][k].czdc_counts.end(), 0);
+                  (*scratch_pool)[t][k].touched_czdc.clear();
+                }
               }
             }
             return true;
@@ -416,12 +425,26 @@ std::vector<uint32_t> FusedScoreBatchMoves(
                 std::min(begin + kBatchChunkSize, active_blocks.size());
             for (size_t i = begin; i < end; ++i) {
               const BlockRef& ref = active_blocks[i];
+              const JPEGOptData& d = (*states)[0].ctx.d;
+              const ActiveRawBins& active = (*states)[0].ctx.active;
+              std::array<PreDigestedBin, 64> local_bins;
+              size_t num_bins = 0;
+              ForEachBlockBin(d, ref.c, ref.b, [&](ACBin bin) {
+                if (num_bins < 64) {
+                  const uint32_t compact_id = active.raw_to_compact[bin];
+                  local_bins[num_bins++] = {
+                      compact_id,
+                      active.compact_to_czdc[compact_id]
+                  };
+                }
+              });
               for (size_t k = 0; k < states->size(); ++k) {
                 MultiKState& state = (*states)[k];
                 if (state.finished) continue;
                 const uint32_t cur = state.ctx.pass_assignment[ref.c][ref.b];
-                const uint32_t best = state.ctx.FindBestPass(
-                    ref, cur, &scratch_pool[thread_id][k]);
+                const uint32_t best = state.ctx.FindBestPassCached(
+                    ref, cur, local_bins.data(), num_bins,
+                    &(*scratch_pool)[thread_id][k]);
                 state.new_passes[i] = static_cast<uint8_t>(best);
                 if (best != cur) ++local_moves[k];
               }
@@ -448,13 +471,26 @@ std::vector<uint32_t> FusedApplyBatchMoves(
   for (size_t i = 0; i < active_blocks.size(); ++i) {
     if (i % stride != iter % stride) continue;
     const BlockRef& ref = active_blocks[i];
+    const JPEGOptData& d = (*states)[0].ctx.d;
+    const ActiveRawBins& active = (*states)[0].ctx.active;
+    std::array<PreDigestedBin, 64> local_bins;
+    size_t num_bins = 0;
+    ForEachBlockBin(d, ref.c, ref.b, [&](ACBin bin) {
+      if (num_bins < 64) {
+        const uint32_t compact_id = active.raw_to_compact[bin];
+        local_bins[num_bins++] = {
+            compact_id,
+            active.compact_to_czdc[compact_id]
+        };
+      }
+    });
     for (size_t k = 0; k < states->size(); ++k) {
       MultiKState& state = (*states)[k];
       if (state.finished) continue;
       const uint32_t cur = state.ctx.pass_assignment[ref.c][ref.b];
       const uint32_t next = state.new_passes[i];
       if (next == cur) continue;
-      state.ctx.ApplyMove(ref, cur, next);
+      state.ctx.ApplyMoveCached(ref, cur, next, local_bins.data(), num_bins);
       ++applied[k];
     }
   }
@@ -560,9 +596,20 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
   }
 
   const auto start_init = PlannerClock::now();
-  for (MultiKState& state : states) {
-    state.ctx.InitPassAssignmentSimple();
-    state.ctx.InitNZPredictorState();
+  if (pool != nullptr && states.size() > 1) {
+    (void)RunOnPool(
+        pool, 0, static_cast<uint32_t>(states.size()), ThreadPool::NoInit,
+        [&](uint32_t ki, size_t /*thread*/) -> Status {
+          states[ki].ctx.InitPassAssignmentSimple();
+          states[ki].ctx.InitNZPredictorState();
+          return true;
+        },
+        "InitAllKStates");
+  } else {
+    for (MultiKState& state : states) {
+      state.ctx.InitPassAssignmentSimple();
+      state.ctx.InitNZPredictorState();
+    }
   }
   {
     const std::vector<FixedPointCost> initial_costs =
@@ -576,6 +623,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
           NanosToMs(ElapsedNanos(start_init, PlannerClock::now())));
   fflush(stderr);
 
+  std::vector<std::vector<AssignScratch>> scratch_pool;
   constexpr int kPctColumnWidth = 7;
   const bool use_batch =
       (pool != nullptr && active_blocks.size() > kLargeImageThreshold);
@@ -611,7 +659,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
          ++n) {
       const auto start_batch = PlannerClock::now();
       const std::vector<uint32_t> batch_moves =
-          FusedScoreBatchMoves(&states, active_blocks, pool);
+          FusedScoreBatchMoves(&states, active_blocks, &scratch_pool, pool);
       if (std::all_of(batch_moves.begin(), batch_moves.end(),
                       [](uint32_t v) { return v == 0; })) {
         break;
@@ -640,7 +688,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
            batch_stale_count < kBatchPatience) {
       const auto start_batch = PlannerClock::now();
       const std::vector<uint32_t> batch_moves =
-          FusedScoreBatchMoves(&states, active_blocks, pool);
+          FusedScoreBatchMoves(&states, active_blocks, &scratch_pool, pool);
       if (std::all_of(batch_moves.begin(), batch_moves.end(),
                       [](uint32_t v) { return v == 0; })) {
         break;
@@ -723,7 +771,7 @@ AssignPassesRangeResult AssignPassesGreedyAllK(
     if (use_batch && seq_bad_streak >= 2) {
       const auto start_batch = PlannerClock::now();
       const std::vector<uint32_t> batch_moves =
-          FusedScoreBatchMoves(&states, active_blocks, pool);
+          FusedScoreBatchMoves(&states, active_blocks, &scratch_pool, pool);
       if (std::all_of(batch_moves.begin(), batch_moves.end(),
                       [](uint32_t v) { return v == 0; })) {
         break;

@@ -83,7 +83,37 @@ double NanosToMs(int64_t ns) {
       .count();
 }
 
-using SparseHistogram = std::vector<std::unordered_map<uint32_t, uint32_t>>;
+struct DenseACHistogram {
+  std::vector<uint32_t> counts;
+
+  DenseACHistogram() = default;
+  explicit DenseACHistogram(size_t size) : counts(size, 0) {}
+
+  void Clear() {
+    std::fill(counts.begin(), counts.end(), 0);
+  }
+
+  bool empty() const {
+    for (uint32_t val : counts) {
+      if (val != 0) return false;
+    }
+    return true;
+  }
+
+  uint32_t Get(uint32_t id) const { return counts[id]; }
+  void Add(uint32_t id, uint32_t value = 1) { counts[id] += value; }
+
+  void AddHistogram(const DenseACHistogram& other) {
+    for (size_t i = 0; i < counts.size(); ++i) {
+      counts[i] += other.counts[i];
+    }
+  }
+
+  size_t size() const { return counts.size(); }
+  uint32_t operator[](size_t idx) const { return counts[idx]; }
+  uint32_t& operator[](size_t idx) { return counts[idx]; }
+};
+using DenseACHistogramSet = std::vector<DenseACHistogram>;
 
 // Result of clustering pass-aware `(cell, pass)` contexts.
 struct ClusterResult {
@@ -606,29 +636,48 @@ StatusOr<ClusterResult> ClusterRowsBiclustered(
     return delta;
   };
 
+  std::vector<FixedPointCost> min_delta(total_rows, std::numeric_limits<FixedPointCost>::max());
+  std::vector<uint32_t> min_target(total_rows, std::numeric_limits<uint32_t>::max());
+
+  auto update_min_delta = [&](uint32_t i) {
+    FixedPointCost best_d = std::numeric_limits<FixedPointCost>::max();
+    uint32_t best_t = std::numeric_limits<uint32_t>::max();
+    for (uint32_t other : active) {
+      if (other == i) continue;
+      const FixedPointCost dist = delta_ref(i, other);
+      if (dist < best_d) {
+        best_d = dist;
+        best_t = other;
+      }
+    }
+    min_delta[i] = best_d;
+    min_target[i] = best_t;
+  };
+
   for (size_t i = 0; i + 1 < active.size(); ++i) {
     for (size_t j = i + 1; j < active.size(); ++j) {
       delta_ref(active[i], active[j]) = merge_delta(active[i], active[j]);
     }
   }
 
+  for (uint32_t i : active) {
+    update_min_delta(i);
+  }
+
   while (active.size() > row_budget && active.size() > 1) {
-    size_t best_i = 0;
-    size_t best_j = 1;
-    FixedPointCost best_delta = delta_ref(active[0], active[1]);
-    for (size_t i = 0; i + 1 < active.size(); ++i) {
-      for (size_t j = i + 1; j < active.size(); ++j) {
-        const FixedPointCost delta = delta_ref(active[i], active[j]);
-        if (delta < best_delta) {
-          best_delta = delta;
-          best_i = i;
-          best_j = j;
-        }
+    uint32_t keep = active[0];
+    uint32_t drop = min_target[keep];
+    FixedPointCost best_delta = min_delta[keep];
+    for (size_t i = 1; i < active.size(); ++i) {
+      const uint32_t node = active[i];
+      if (min_delta[node] < best_delta) {
+        best_delta = min_delta[node];
+        keep = node;
+        drop = min_target[node];
       }
     }
+    if (keep > drop) std::swap(keep, drop);
 
-    const uint32_t keep = active[best_i];
-    const uint32_t drop = active[best_j];
     for (uint16_t slice : active_ac_slices[drop]) {
       const size_t ik = static_cast<size_t>(keep) * ac_slices_per_row + slice;
       const size_t id = static_cast<size_t>(drop) * ac_slices_per_row + slice;
@@ -646,11 +695,25 @@ StatusOr<ClusterResult> ClusterRowsBiclustered(
     active_ac_slices[drop].clear();
     active_nz_slices[drop].clear();
     parent[drop] = keep;
-    active.erase(active.begin() + best_j);
+    active.erase(std::remove(active.begin(), active.end(), drop), active.end());
     for (uint32_t other : active) {
       if (other == keep) continue;
       delta_ref(keep, other) = merge_delta(keep, other);
     }
+
+    for (uint32_t other : active) {
+      if (other == keep) continue;
+      if (min_target[other] == keep || min_target[other] == drop) {
+        update_min_delta(other);
+      } else {
+        const FixedPointCost dist = delta_ref(other, keep);
+        if (dist < min_delta[other]) {
+          min_delta[other] = dist;
+          min_target[other] = keep;
+        }
+      }
+    }
+    update_min_delta(keep);
   }
 
   out.num_clusters = static_cast<uint32_t>(active.size());
@@ -1406,8 +1469,9 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
   // AC stream. `hist_h` tracks per-symbol counts, `hist_N` tracks per-zdc
   // counts; both are indexed by `(channel * num_cells + cell) * num_passes +
   // pass`.
-  SparseHistogram hist_h(static_cast<size_t>(total_ctxs) * num_passes);
-  SparseHistogram hist_N(static_cast<size_t>(total_ctxs) * num_passes);
+  const uint32_t alphabet_size = d.ACHistogramSize();
+  DenseACHistogramSet hist_h(static_cast<size_t>(total_ctxs) * num_passes, DenseACHistogram(alphabet_size));
+  DenseNHistogramSet hist_N(static_cast<size_t>(total_ctxs) * num_passes);
 
   for (uint32_t pass = 0; pass < num_passes; ++pass) {
     SweepACStreamRange(
@@ -1421,8 +1485,8 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
                                 axis_maps.ax0_to_k[dc0_idx];
           const uint32_t idx = (c * num_cells + cell) * num_passes + pass;
           const CompactACEvent ac_event = d.FromBin(bin_state);
-          hist_h[idx][ac_event.hist_bin] += run;
-          hist_N[idx][ac_event.zdc] += run;
+          hist_h[idx].Add(ac_event.hist_bin, run);
+          hist_N[idx].Add(ac_event.zdc, run);
         });
   }
 
@@ -1452,8 +1516,12 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
     FixedPointCost ctx_cost = 0;
     for (uint32_t pass = 0; pass < num_passes; ++pass) {
       const size_t idx = static_cast<size_t>(ctx) * num_passes + pass;
-      for (const auto& entry : hist_N[idx]) ctx_cost += d.ftab[entry.second];
-      for (const auto& entry : hist_h[idx]) ctx_cost -= d.ftab[entry.second];
+      for (size_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
+        ctx_cost += d.ftab[hist_N[idx][zdc]];
+      }
+      for (size_t k = 0; k < alphabet_size; ++k) {
+        ctx_cost -= d.ftab[hist_h[idx][k]];
+      }
     }
     cost[ctx] = ctx_cost;
   }
@@ -1487,16 +1555,36 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
     for (uint32_t pass = 0; pass < num_passes; ++pass) {
       const size_t ia = static_cast<size_t>(a) * num_passes + pass;
       const size_t ib = static_cast<size_t>(b) * num_passes + pass;
-      ForEachIntersection(hist_N[ia], hist_N[ib],
-                          [&](uint32_t, uint32_t ca, uint32_t cb) {
-                            delta += d.ftab[ca + cb] - d.ftab[ca] - d.ftab[cb];
-                          });
-      ForEachIntersection(hist_h[ia], hist_h[ib],
-                          [&](uint32_t, uint32_t ca, uint32_t cb) {
-                            delta -= d.ftab[ca + cb] - d.ftab[ca] - d.ftab[cb];
-                          });
+      for (size_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
+        uint32_t ca = hist_N[ia][zdc];
+        uint32_t cb = hist_N[ib][zdc];
+        delta += d.ftab[ca + cb] - d.ftab[ca] - d.ftab[cb];
+      }
+      for (size_t k = 0; k < alphabet_size; ++k) {
+        uint32_t ca = hist_h[ia][k];
+        uint32_t cb = hist_h[ib][k];
+        delta -= d.ftab[ca + cb] - d.ftab[ca] - d.ftab[cb];
+      }
     }
     return delta;
+  };
+
+  std::vector<FixedPointCost> min_delta(total_ctxs, std::numeric_limits<FixedPointCost>::max());
+  std::vector<uint32_t> min_target(total_ctxs, std::numeric_limits<uint32_t>::max());
+
+  auto update_min_delta = [&](uint32_t i) {
+    FixedPointCost best_d = std::numeric_limits<FixedPointCost>::max();
+    uint32_t best_t = std::numeric_limits<uint32_t>::max();
+    for (uint32_t other : active) {
+      if (other == i) continue;
+      const FixedPointCost dist = delta_ref(i, other);
+      if (dist < best_d) {
+        best_d = dist;
+        best_t = other;
+      }
+    }
+    min_delta[i] = best_d;
+    min_target[i] = best_t;
   };
 
   for (size_t i = 0; i + 1 < active.size(); ++i) {
@@ -1505,36 +1593,51 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
     }
   }
 
+  for (uint32_t i : active) {
+    update_min_delta(i);
+  }
+
   while (active.size() > target_clusters && active.size() > 1) {
-    size_t best_i = 0;
-    size_t best_j = 1;
-    FixedPointCost best_delta = delta_ref(active[0], active[1]);
-    for (size_t i = 0; i + 1 < active.size(); ++i) {
-      for (size_t j = i + 1; j < active.size(); ++j) {
-        const FixedPointCost delta = delta_ref(active[i], active[j]);
-        if (delta < best_delta) {
-          best_delta = delta;
-          best_i = i;
-          best_j = j;
-        }
+    uint32_t keep = active[0];
+    uint32_t drop = min_target[keep];
+    FixedPointCost best_delta = min_delta[keep];
+    for (size_t i = 1; i < active.size(); ++i) {
+      const uint32_t node = active[i];
+      if (min_delta[node] < best_delta) {
+        best_delta = min_delta[node];
+        keep = node;
+        drop = min_target[node];
       }
     }
+    if (keep > drop) std::swap(keep, drop);
 
-    const uint32_t keep = active[best_i];
-    const uint32_t drop = active[best_j];
     cost[keep] += cost[drop] + best_delta;
     for (uint32_t pass = 0; pass < num_passes; ++pass) {
       const size_t ik = static_cast<size_t>(keep) * num_passes + pass;
       const size_t id = static_cast<size_t>(drop) * num_passes + pass;
-      for (const auto& entry : hist_N[id]) hist_N[ik][entry.first] += entry.second;
-      for (const auto& entry : hist_h[id]) hist_h[ik][entry.first] += entry.second;
+      hist_N[ik].AddHistogram(hist_N[id]);
+      hist_h[ik].AddHistogram(hist_h[id]);
     }
     parent[drop] = keep;
-    active.erase(active.begin() + best_j);
+    active.erase(std::remove(active.begin(), active.end(), drop), active.end());
     for (uint32_t other : active) {
       if (other == keep) continue;
       delta_ref(keep, other) = merge_delta(keep, other);
     }
+
+    for (uint32_t other : active) {
+      if (other == keep) continue;
+      if (min_target[other] == keep || min_target[other] == drop) {
+        update_min_delta(other);
+      } else {
+        const FixedPointCost dist = delta_ref(other, keep);
+        if (dist < min_delta[other]) {
+          min_delta[other] = dist;
+          min_target[other] = keep;
+        }
+      }
+    }
+    update_min_delta(keep);
   }
 
   ClusterResult out;
@@ -1557,18 +1660,20 @@ StatusOr<ClusterResult> ClusterContextsPassAware(
   return out;
 }
 
-// Estimates histogram-header cost for one sparse AC histogram by regrouping its
+// Estimates histogram-header cost for one AC histogram by regrouping its
 // symbols into signalling-token histograms split by `zdc`.
 StatusOr<FixedPointCost> SignalOverheadFromHist(
     const JPEGOptData& d,
-    const std::unordered_map<uint32_t, uint32_t>& hist_h) {
+    const DenseACHistogram& hist_h) {
   std::array<std::array<uint32_t, kACTokenCount>, kZeroDensityContextCount>
       signalling_hist = {};
   const auto& dense_to_symbol = d.ACHistogram().dense_to_zdcvalue;
-  for (const auto& entry : hist_h) {
+  for (size_t i = 0; i < hist_h.size(); ++i) {
+    uint32_t count = hist_h[i];
+    if (count == 0) continue;
     const SignallingHistSymbol sym =
-        d.SignallingHistSymbolFromSymbol(dense_to_symbol[entry.first]);
-    signalling_hist[sym.zdc][sym.token] += entry.second;
+        d.SignallingHistSymbolFromSymbol(dense_to_symbol[i]);
+    signalling_hist[sym.zdc][sym.token] += count;
   }
 
   FixedPointCost overhead = 0;
@@ -1597,29 +1702,25 @@ StatusOr<FixedPointCost> SignalOverheadFromHist(
   return overhead;
 }
 
-// Estimates histogram-header cost for one sparse nz histogram by splitting it
+// Estimates histogram-header cost for one nz histogram by splitting it
 // into one histogram per predictor bucket.
 StatusOr<FixedPointCost> SignalOverheadFromNZHist(
-    const std::unordered_map<uint32_t, uint32_t>& nz_hist) {
+    const DenseNZHistogram& nz_hist) {
   FixedPointCost overhead = 0;
   for (uint32_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
     uint32_t max_nz = 0;
     size_t total = 0;
-    for (const auto& entry : nz_hist) {
-      const uint32_t cur_pb = entry.first / kJPEGNonZeroRange;
-      if (cur_pb != pb) continue;
-      const uint32_t nz = entry.first % kJPEGNonZeroRange;
+    for (uint32_t nz = 0; nz < kJPEGNonZeroRange; ++nz) {
+      uint32_t count = nz_hist[pb * kJPEGNonZeroRange + nz];
+      if (count == 0) continue;
       max_nz = std::max(max_nz, nz);
-      total += entry.second;
+      total += count;
     }
     if (total == 0) continue;
 
     Histogram h(max_nz + 1);
-    for (const auto& entry : nz_hist) {
-      const uint32_t cur_pb = entry.first / kJPEGNonZeroRange;
-      if (cur_pb != pb) continue;
-      const uint32_t nz = entry.first % kJPEGNonZeroRange;
-      h.counts[nz] = static_cast<ANSHistBin>(entry.second);
+    for (uint32_t nz = 0; nz <= max_nz; ++nz) {
+      h.counts[nz] = static_cast<ANSHistBin>(nz_hist[pb * kJPEGNonZeroRange + nz]);
     }
     h.total_count = total;
     JXL_ASSIGN_OR_RETURN(float ans_cost, h.ANSPopulationCost());
@@ -1648,10 +1749,11 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
       static_cast<uint32_t>(thresholds.TCr().size() + 1);
   uint32_t cp_count = num_clusters * num_passes;
 
-  SparseHistogram ac_hist_h(cp_count);
-  SparseHistogram ac_hist_N(cp_count);
-  SparseHistogram nz_hist_h(cp_count);
-  SparseHistogram nz_hist_N(cp_count);
+  const uint32_t alphabet_size = d.ACHistogramSize();
+  DenseACHistogramSet ac_hist_h(cp_count, DenseACHistogram(alphabet_size));
+  DenseNHistogramSet ac_hist_N(cp_count);
+  DenseNZHistogramSet nz_hist_h(cp_count);
+  DenseNZPredHistogramSet nz_hist_N(cp_count);
 
   for (uint32_t pass = 0; pass < num_passes; ++pass) {
     SweepACStreamRange(
@@ -1666,8 +1768,8 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
           const uint32_t cluster = ctx_map[c * num_cells + cell];
           const uint32_t cp = cluster * num_passes + pass;
           const CompactACEvent ac_event = d.FromBin(bin_state);
-          ac_hist_h[cp][ac_event.hist_bin] += run;
-          ac_hist_N[cp][ac_event.zdc] += run;
+          ac_hist_h[cp].Add(ac_event.hist_bin, run);
+          ac_hist_N[cp].Add(ac_event.zdc, run);
         });
   }
 
@@ -1713,8 +1815,8 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
               (predicted_nz < 8) ? predicted_nz : (4 + predicted_nz / 2);
           // Nonzero count is only non-zero for the block's assigned pass.
           uint32_t nz = pass == p ? d.block_nonzeros[c][b] : 0u;
-          ++nz_hist_h[cp][NZHistogramIndex(pb, nz)];
-          ++nz_hist_N[cp][pb];
+          nz_hist_h[cp].Add(NZHistogramIndex(pb, nz));
+          nz_hist_N[cp].Add(pb);
         }
       }
     }
@@ -1725,11 +1827,19 @@ StatusOr<ModelEvaluation> EvaluatePassAwareModel(
   ModelEvaluation eval;
   for (uint32_t cp = 0; cp < cp_count; ++cp) {
     // AC entropy: Σ ftab[N] - Σ ftab[h] (same formula as `TotalCost`).
-    for (const auto& entry : ac_hist_N[cp]) eval.ac_cost += d.ftab[entry.second];
-    for (const auto& entry : ac_hist_h[cp]) eval.ac_cost -= d.ftab[entry.second];
+    for (size_t zdc = 0; zdc < kZeroDensityContextCount; ++zdc) {
+      eval.ac_cost += d.ftab[ac_hist_N[cp][zdc]];
+    }
+    for (size_t k = 0; k < alphabet_size; ++k) {
+      eval.ac_cost -= d.ftab[ac_hist_h[cp][k]];
+    }
     // NZ entropy: Σ NZFTab[N] - Σ NZFTab[h].
-    for (const auto& entry : nz_hist_N[cp]) eval.nz_cost += d.NZFTab(entry.second);
-    for (const auto& entry : nz_hist_h[cp]) eval.nz_cost -= d.NZFTab(entry.second);
+    for (size_t pb = 0; pb < kJPEGNonZeroBuckets; ++pb) {
+      eval.nz_cost += d.NZFTab(nz_hist_N[cp][pb]);
+    }
+    for (size_t k = 0; k < kNZHistogramsSize; ++k) {
+      eval.nz_cost -= d.NZFTab(nz_hist_h[cp][k]);
+    }
     JXL_ASSIGN_OR_RETURN(FixedPointCost ac_overhead,
                          SignalOverheadFromHist(d, ac_hist_h[cp]));
     JXL_ASSIGN_OR_RETURN(FixedPointCost nz_overhead,
@@ -2083,9 +2193,11 @@ StatusOr<BiclusterSearchResult> SearchBiclusteredContextModel(
                                pool));
     fprintf(stderr,
             "PLANNER: [bicluster] AssignPassesGreedyAllK took %.2f ms total "
-            "(batch %.2f ms, sequential %.2f ms)\n",
+            "(%i batch %.2f ms, %i sequential %.2f ms)\n",
             NanosToMs(assign_range_result->shared_timings.total_ns),
+            assign_range_result->shared_timings.batch_iters,
             NanosToMs(assign_range_result->shared_timings.batch_ns),
+            assign_range_result->shared_timings.seq_iters,
             NanosToMs(assign_range_result->shared_timings.sequential_ns));
     fflush(stderr);
   }
