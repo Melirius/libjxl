@@ -209,8 +209,9 @@ FixedPointCost ClusteredHistogramProxyCost(const PassAssignmentCtx& ctx) {
           ctx.hist_h[static_cast<size_t>(compact_id) * ctx.num_passes + pass];
       if (freq == 0) continue;
       const uint16_t czdc = ctx.active.compact_to_czdc[compact_id];
+      const uint32_t hist_bin = ctx.d.FromBin(ctx.active.active_bins[compact_id]).hist_bin;
       const SignallingHistSymbol sym = ctx.d.SignallingHistSymbolFromSymbol(
-          dense_to_symbol[ctx.active.active_bins[compact_id]]);
+          dense_to_symbol[hist_bin]);
       token_counts[czdc][sym.token] += freq;
     }
 
